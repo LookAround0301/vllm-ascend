@@ -40,11 +40,10 @@ from vllm.model_executor.layers.quantization.base_config import \
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import FusedMoEState
-from vllm_ascend.distributed.communication_op import \
-    data_parallel_reduce_scatter
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
 from vllm_ascend.ops.sequence_parallel import MetadataForPadding
+from vllm_ascend.quantization.quant_config import AscendFusedMoEMethod
 from vllm_ascend.torchair.utils import npu_stream_switch, npu_wait_tensor
 from vllm_ascend.utils import (AscendSocVersion, dispose_tensor,
                                get_all_reduce_merge_state,
@@ -1055,7 +1054,13 @@ class TorchairAscendFusedMoE(FusedMoE):
             self.quant_method = TorchairAscendUnquantizedFusedMoEMethod(
                 self.moe)
         else:
-            self.quant_method = quant_config.get_quant_method(self, prefix)
+            if quant_config.is_layer_skipped_ascend(
+                    prefix, quant_config.packed_modules_mapping):
+                self.quant_method = TorchairAscendUnquantizedFusedMoEMethod(
+                    self.moe)
+            else:
+                self.quant_method = AscendFusedMoEMethod(
+                    quant_config, prefix, quant_config.packed_modules_mapping)
 
         assert self.quant_method is not None
 
@@ -1262,8 +1267,8 @@ class TorchairAscendFusedMoE(FusedMoE):
                 final_hidden_states = final_hidden_states[start:end, :]
                 dispose_tensor(e_hidden_states)
             elif fused_moe_state == FusedMoEState.AllGather:
-                final_hidden_states = data_parallel_reduce_scatter(
-                    e_hidden_states, dim=0)
+                final_hidden_states = get_dp_group().reduce_scatter(
+                    e_hidden_states, 0)
                 final_hidden_states = final_hidden_states[:num_tokens]
                 dispose_tensor(e_hidden_states)
             else:

@@ -74,7 +74,7 @@ class AscendScheduler(Scheduler):
         preempted_reqs: list[Request] = []
 
         if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
-            req_to_new_block_ids: dict[str, list[int]] = {}
+            req_to_new_block_ids: dict[str, list[list[int]]] = {}
         else:
             req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -264,7 +264,9 @@ class AscendScheduler(Scheduler):
                 req_to_new_block_ids[request.request_id] = (
                     self.kv_cache_manager.get_block_ids(request.request_id))
             else:
-                req_to_new_blocks[request.request_id] = new_blocks
+                req_to_new_blocks[
+                    request.request_id] = self.kv_cache_manager.get_blocks(
+                        request.request_id)
             # Update request info.
             token_budget -= num_new_tokens   # token_budget只减切过的序列长度，减去非block对齐的切分长度更符合设计初衷，这里先按减去block对齐后的长度走
             if self.cp_size * self.sp_size > 1:
@@ -421,7 +423,8 @@ class AscendScheduler(Scheduler):
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
-        num_common_prefix_blocks = 0
+        num_common_prefix_blocks = [0] * len(
+            self.kv_cache_config.kv_cache_groups)
         if self.running:
             any_request = self.running[0]
             num_common_prefix_blocks = (
@@ -532,7 +535,7 @@ class AscendScheduler(Scheduler):
                                    self.block_size)
         req_blocks = self.kv_cache_manager.coordinator.get_blocks(
             request.request_id)
-        num_new_blocks = (num_required_blocks - len(req_blocks) -
+        num_new_blocks = (num_required_blocks - len(req_blocks[0]) -
                           len(computed_blocks))
         num_evictable_computed_blocks = sum(1 for blk in computed_blocks
                                             if blk.ref_cnt == 0)

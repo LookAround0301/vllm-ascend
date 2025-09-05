@@ -35,7 +35,7 @@ from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.layers.experts_selector import select_experts
 from vllm_ascend.ops.moe_dispatcher.token_dispatcher import \
     setup_token_dispatchers
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, is_310p
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, is_310p, vllm_version_is
 
 original_unquantized_fused_moe_init_func = UnquantizedFusedMoEMethod.__init__
 
@@ -170,15 +170,6 @@ def fused_experts_moge(
     local_num_experts = global_num_experts // ep_size
     local_num_group = top_k // ep_size
 
-    if apply_router_weight_on_input:
-        assert (topk_weights.dim() == 2
-                ), "`topk_weights` should be in shape (num_tokens, topk)"
-        _, topk = topk_weights.shape
-        assert (
-            topk == 1
-        ), "Only support topk=1 when `apply_router_weight_on_input` is True"
-        hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
-
     bsz, _ = hidden_states.shape
     flatten_topk_ids = topk_ids.view(-1)
     sorted_topk_ids = torch.argsort(flatten_topk_ids.float())
@@ -246,7 +237,7 @@ def unquantized_fused_moe_init_func(self, *args, **kwargs):
                              and not vllm_config.model_config.enforce_eager)
 
 
-def forward_oot(
+def forward_oot_v01011(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
@@ -278,6 +269,69 @@ def forward_oot(
         num_expert_group=num_expert_group,
         custom_routing_function=custom_routing_function,
         scoring_func=scoring_func,
+        routed_scaling_factor=1.0,
+        e_score_correction_bias=e_score_correction_bias,
+        global_num_experts=global_num_experts)
+
+    if topk_ids.shape[1] < top_k or is_310p():
+        assert global_num_experts is not None
+        return fused_experts_moge(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            moe_parallel_config=self.moe.moe_parallel_config,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=top_k,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input)
+
+    return fused_experts(
+        hidden_states=x,
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        global_num_experts=global_num_experts,
+        expert_map=expert_map,
+    )
+
+
+def forward_oot(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
+        activation: str = "silu",
+        enable_eplb: bool = False,
+        expert_load_view: Optional[torch.Tensor] = None,
+        logical_to_physical_map: Optional[torch.Tensor] = None,
+        logical_replica_count: Optional[torch.Tensor] = None) -> torch.Tensor:
+
+    topk_weights, topk_ids, _ = select_experts(
+        hidden_states=x,
+        router_logits=router_logits,
+        top_k=top_k,
+        use_grouped_topk=use_grouped_topk,
+        renormalize=renormalize,
+        topk_group=topk_group,
+        num_expert_group=num_expert_group,
+        custom_routing_function=custom_routing_function,
+        scoring_func=scoring_func,
+        routed_scaling_factor=routed_scaling_factor,
         e_score_correction_bias=e_score_correction_bias,
         global_num_experts=global_num_experts)
 
@@ -344,6 +398,7 @@ class AscendFusedMoE(FusedMoE):
         prefix="",
         custom_routing_function=None,
         scoring_func="softmax",
+        routed_scaling_fator: float = 1.0,
         e_score_correction_bias=None,
         apply_router_weight_on_input=False,
         activation="silu",
@@ -351,31 +406,59 @@ class AscendFusedMoE(FusedMoE):
         num_redundant_experts=0,
         has_bias=False,
     ):
-        super().__init__(
-            num_experts,
-            top_k,
-            hidden_size,
-            intermediate_size,
-            params_dtype,
-            reduce_results,
-            renormalize,
-            use_grouped_topk,
-            num_expert_group,
-            topk_group,
-            quant_config,
-            tp_size,
-            ep_size,
-            dp_size,
-            prefix,
-            custom_routing_function,
-            scoring_func,
-            e_score_correction_bias,
-            apply_router_weight_on_input,
-            activation,
-            enable_eplb,
-            num_redundant_experts,
-            has_bias,
-        )
+        if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
+            super().__init__(
+                num_experts,
+                top_k,
+                hidden_size,
+                intermediate_size,
+                params_dtype,
+                reduce_results,
+                renormalize,
+                use_grouped_topk,
+                num_expert_group,
+                topk_group,
+                quant_config,
+                tp_size,
+                ep_size,
+                dp_size,
+                prefix,
+                custom_routing_function,
+                scoring_func,
+                e_score_correction_bias,
+                apply_router_weight_on_input,
+                activation,
+                enable_eplb,
+                num_redundant_experts,
+                has_bias,
+            )
+        else:
+            super().__init__(
+                num_experts,
+                top_k,
+                hidden_size,
+                intermediate_size,
+                params_dtype,
+                reduce_results,
+                renormalize,
+                use_grouped_topk,
+                num_expert_group,
+                topk_group,
+                quant_config,
+                tp_size,
+                ep_size,
+                dp_size,
+                prefix,
+                custom_routing_function,
+                scoring_func,
+                routed_scaling_fator,
+                e_score_correction_bias,
+                apply_router_weight_on_input,
+                activation,
+                enable_eplb,
+                num_redundant_experts,
+                has_bias,
+            )
 
         setup_token_dispatchers(self.moe_config.ep_size,
                                 top_k=self.top_k,
@@ -398,11 +481,6 @@ class AscendFusedMoE(FusedMoE):
 
         forward_context = get_forward_context()
         moe_comm_method_name = forward_context.moe_comm_method_name
-
-        # TODO: Can we refactor this logic to model_runner?
-        # TODO: Adjusted logic to differentiate between A2 and A3, we check ep_size here since mc2 only support ep_size >= 16 on A3 now
-        if self.moe_config.ep_size < 16:
-            moe_comm_method_name = "allgathercommimpl"
 
         forward_context.moe_comm_method = getattr(self, moe_comm_method_name)
 
@@ -441,4 +519,8 @@ class AscendFusedMoE(FusedMoE):
 
 UnquantizedFusedMoEMethod.__init__ = unquantized_fused_moe_init_func
 UnquantizedFusedMoEMethod.process_weights_after_loading = process_weights_after_loading
-UnquantizedFusedMoEMethod.forward_oot = forward_oot
+
+if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
+    UnquantizedFusedMoEMethod.forward_oot = forward_oot_v01011
+else:
+    UnquantizedFusedMoEMethod.forward_oot = forward_oot
