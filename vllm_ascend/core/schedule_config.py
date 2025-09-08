@@ -59,16 +59,16 @@ class AscendSchedulerConfig(SchedulerConfig):
             model_len_per_sp_cp = self.max_model_len // self.context_parallel_size // self.tensor_parallel_size
         else:
             model_len_per_sp_cp = self.max_model_len // self.context_parallel_size
-        if (self.max_num_batched_tokens < model_len_per_sp_cp
-                and not self.chunked_prefill_enabled):
-            raise ValueError(
-                "Ascend scheduler is enabled without chunked prefill feature. "
-                f"Argument max_num_batched_tokens ({self.max_num_batched_tokens}) is "
-                f"smaller than max_model_len ({self.max_model_len}). "
-                "This effectively limits the maximum sequence length to "
-                "max_num_batched_tokens and makes vLLM reject longer "
-                "sequences. Please increase max_num_batched_tokens or "
-                "decrease max_model_len.")
+        # if (self.max_num_batched_tokens < model_len_per_sp_cp
+        #         and not self.chunked_prefill_enabled):
+        #     raise ValueError(
+        #         "Ascend scheduler is enabled without chunked prefill feature. "
+        #         f"Argument max_num_batched_tokens ({self.max_num_batched_tokens}) is "
+        #         f"smaller than max_model_len ({self.max_model_len}). "
+        #         "This effectively limits the maximum sequence length to "
+        #         "max_num_batched_tokens and makes vLLM reject longer "
+        #         "sequences. Please increase max_num_batched_tokens or "
+        #         "decrease max_model_len.")
         if self.policy != "fcfs":
             raise NotImplementedError(
                 f"currently AscendScheduler only supports fcfs policy, got {self.policy}"

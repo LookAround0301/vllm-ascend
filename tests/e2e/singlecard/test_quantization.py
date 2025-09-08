@@ -1,5 +1,6 @@
 #
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright 2023 The vLLM team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,12 +15,21 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+from modelscope import snapshot_download  # type: ignore[import-untyped]
 
-import torch
-from vllm.distributed.parallel_state import get_dp_group
+from tests.e2e.conftest import VllmRunner
 
 
-def data_parallel_reduce_scatter(input_: torch.Tensor,
-                                 dim: int = -1) -> torch.Tensor:
-    """Reduce-Scatter the input tensor across data parallel group."""
-    return get_dp_group().reduce_scatter(input_, dim)
+def test_quant_W8A8():
+    max_tokens = 5
+    example_prompts = [
+        "vLLM is a high-throughput and memory-efficient inference and serving engine for LLMs."
+    ]
+    with VllmRunner(
+            snapshot_download("vllm-ascend/Qwen2.5-0.5B-Instruct-W8A8"),
+            max_model_len=8192,
+            enforce_eager=True,
+            gpu_memory_utilization=0.7,
+            quantization="ascend",
+    ) as vllm_model:
+        vllm_model.generate_greedy(example_prompts, max_tokens)
