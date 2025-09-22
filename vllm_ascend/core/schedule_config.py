@@ -41,7 +41,7 @@ class AscendSchedulerConfig(SchedulerConfig):
             for field in fields(vllm_scheduler_config) if field.init
         }
         # Override default values into original SchedulerConfig
-        scheduler_config["enable_chunked_prefill"] = False
+        scheduler_config["enable_chunked_prefill"] = True
         scheduler_config["policy"] = "fcfs"
         scheduler_config["scheduler_cls"] = (
             "vllm_ascend.core.scheduler.AscendScheduler")
