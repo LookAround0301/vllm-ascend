@@ -512,6 +512,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens_of_cp_sp_single,
                 num_computed_tokens_of_cp_sp_current=new_req_data.
                 num_computed_tokens_of_cp_sp_current,
+                num_computed_tokens_of_cp_sp_accum=new_req_data.
+                num_computed_tokens_of_cp_sp_accum,
             )
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -563,8 +565,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             req_state.kv_rank = req_data.kv_rank[i]
             req_state.num_computed_tokens_of_cp_sp = req_data.num_computed_tokens_of_cp_sp[
                 i]
-            req_state.num_computed_tokens_of_cp_sp_single = req_data.num_computed_tokens_of_cp_sp_single[i]
-            req_state.num_computed_tokens_of_cp_sp_current = req_data.num_computed_tokens_of_cp_sp_current[i]
+            req_state.num_computed_tokens_of_cp_sp_single = \
+                req_data.num_computed_tokens_of_cp_sp_single[i]
+            req_state.num_computed_tokens_of_cp_sp_current = \
+                req_data.num_computed_tokens_of_cp_sp_current[i]
+            req_state.num_computed_tokens_of_cp_sp_current = \
+                req_data.num_computed_tokens_of_cp_sp_current[i]
+            req_state.num_computed_tokens_of_cp_sp_accum = \
+                req_data.num_computed_tokens_of_cp_sp_accum[i]
+
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_data.resumed_from_preemption[i]
@@ -617,6 +626,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     req_index] = req_state.num_computed_tokens_of_cp_sp_single
             self.input_batch.num_computed_tokens_of_cp_sp_current[
                     req_index] = req_state.num_computed_tokens_of_cp_sp_current
+            self.input_batch.num_computed_tokens_of_cp_sp_accum[
+                    req_index] = req_state.num_computed_tokens_of_cp_sp_accum
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = (
@@ -1360,7 +1371,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 logger.info(
                     f"=====> [MR-PREFILL-CP] req={req_id} sched_tokens={scheduler_output.num_scheduled_tokens[req_id]} "
                     f"cum_before={self.input_batch.num_computed_tokens_cpu[i]} pos_cp.len={len(req_position_cp)} "
-                    f"cp_pad_sched={num_cp_padded_scheduled_tokens}")
+                    f"cp_pad_sched={num_cp_padded_scheduled_tokens},{total_tokens_after_step=},{self.input_batch.num_computed_tokens_cpu[i]=},{self.cp_kv_recover_idx=},{num_tokens=},{num_cp_pads[i]=}")
             else:
                 num_scheduled_tokens_for_slot[i] = num_tokens
             num_scheduled_tokens[i] = num_tokens
@@ -1501,7 +1512,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         #TODO(wzliu):seq_lens = self.seq_lens_cpu[:num_reqs]
         logger.info(
             f"=====> [MR-PREFILL] cp={self.cp_rank} sp={self.sp_rank} num_reqs={num_reqs} "
-            f"query_lens.shape={self.query_lens.shape} seq_lens.shape={seq_lens.shape}, {seq_lens_cpu=},{seq_lens=}")
+            f"query_lens={self.query_lens} seq_lens={seq_lens}, {seq_lens_cpu=},{seq_lens=}")
 
         if self.cp_size * self.sp_size > 1:
             if is_prefill:
@@ -1667,6 +1678,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens_of_cp_sp_single[:self.input_batch.num_reqs],
                 num_computed_tokens_of_cp_sp_current=self.input_batch.
                 num_computed_tokens_of_cp_sp_current[:self.input_batch.num_reqs],
+                num_computed_tokens_of_cp_sp_accum=self.input_batch.
+                num_computed_tokens_of_cp_sp_accum[:self.input_batch.num_reqs],
                 q_head_idx_tensor=self.q_head_idx_tensor,
                 q_tail_idx_tensor=self.q_tail_idx_tensor,
                 q_full_idx=self.q_full_idx,
@@ -1693,7 +1706,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens_of_cp_sp_single=self.input_batch.
                 num_computed_tokens_of_cp_sp_single[:self.input_batch.num_reqs],
                 num_computed_tokens_of_cp_sp_current=self.input_batch.
-                num_computed_tokens_of_cp_sp_current[:self.input_batch.num_reqs]
+                num_computed_tokens_of_cp_sp_current[:self.input_batch.num_reqs],
+                num_computed_tokens_of_cp_sp_accum=self.input_batch.
+                num_computed_tokens_of_cp_sp_accum[:self.input_batch.num_reqs]
             )
 
         self.query_start_loc_np[0] = 0

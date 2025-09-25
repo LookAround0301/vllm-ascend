@@ -109,6 +109,10 @@ class AscendMLAPrefillMetadata:
     tail_attn_nomask_seqlens: torch.Tensor = None
     q_full_idx: torch.Tensor = None
     cp_prefill_mask: torch.Tensor = None
+    num_computed_tokens_of_cp_sp_single: Optional[list[Optional[list[Optional[
+        list[int]]]]]] = None
+    num_computed_tokens_of_cp_sp_accum: Optional[list[Optional[list[Optional[
+        list[int]]]]]] = None
 
 
 @dataclass
@@ -129,6 +133,8 @@ class AscendMLADecodeMetadata:
     num_computed_tokens_of_cp_sp_single: Optional[list[Optional[list[Optional[
         list[int]]]]]] = None
     num_computed_tokens_of_cp_sp_current: Optional[list[Optional[list[Optional[
+        list[int]]]]]] = None
+    num_computed_tokens_of_cp_sp_accum: Optional[list[Optional[list[Optional[
         list[int]]]]]] = None
 
 
@@ -312,6 +318,7 @@ class AscendMLAMetadataBuilder:
         num_computed_tokens_of_cp_sp = long_seq_metadata.num_computed_tokens_of_cp_sp if long_seq_metadata else None
         num_computed_tokens_of_cp_sp_single = long_seq_metadata.num_computed_tokens_of_cp_sp_single if long_seq_metadata else None
         num_computed_tokens_of_cp_sp_current = long_seq_metadata.num_computed_tokens_of_cp_sp_current if long_seq_metadata else None
+        num_computed_tokens_of_cp_sp_accum = long_seq_metadata.num_computed_tokens_of_cp_sp_accum if long_seq_metadata else None
         q_head_idx_tensor = long_seq_metadata.q_head_idx_tensor if long_seq_metadata else None
         q_tail_idx_tensor = long_seq_metadata.q_tail_idx_tensor if long_seq_metadata else None
         kv_with_q_head_nomask_idx_tensor = long_seq_metadata.kv_with_q_head_nomask_idx_tensor if long_seq_metadata else None
@@ -441,7 +448,10 @@ class AscendMLAMetadataBuilder:
                 head_attn_nomask_seqlens=head_attn_nomask_seqlens,
                 tail_attn_nomask_seqlens=tail_attn_nomask_seqlens,
                 q_full_idx=q_full_idx,
-                cp_prefill_mask=cp_prefill_mask)
+                cp_prefill_mask=cp_prefill_mask,
+                num_computed_tokens_of_cp_sp_single=num_computed_tokens_of_cp_sp_single,
+                num_computed_tokens_of_cp_sp_accum=num_computed_tokens_of_cp_sp_accum
+                )
 
         decode_metadata = None
         if num_decodes > 0:
@@ -470,6 +480,7 @@ class AscendMLAMetadataBuilder:
                 num_computed_tokens_of_cp_sp=num_computed_tokens_of_cp_sp,
                 num_computed_tokens_of_cp_sp_single=num_computed_tokens_of_cp_sp_single,
                 num_computed_tokens_of_cp_sp_current=num_computed_tokens_of_cp_sp_current,
+                num_computed_tokens_of_cp_sp_accum=num_computed_tokens_of_cp_sp_accum,
             )
 
         return self.metadata_cls(  # type: ignore
@@ -799,32 +810,39 @@ class AscendMLAImpl(MLAAttentionImpl):
             logger.info(f"+++++++====> mask shape:{mask_local.shape}, mask_local: \n{mask_local}")
 
         # Keep the causal mask; do not override to all-ones.
-
+        num_computed_tokens_of_cp_sp_accum = attn_metadata.prefill.num_computed_tokens_of_cp_sp_accum
 
         for i in range(iters):
             if self.cp_size * self.sp_size > 1:
-                # SP模式下：每个rank按request维度处理自己(cp,sp)对应的历史context切片
+                ## SP模式下：每个rank按request维度处理自己(cp,sp)对应的历史context切片
                 seq_len2_all = prefill_metadata.chunked_context.chunk_seq_lens[i]
                 num_requests = len(seq_len2_all)
 
-                # 按请求分别计算每个rank应处理的token数
+                ## 按请求分别计算每个rank应处理的token数
                 seq_len2_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
                 context_starts_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
                 total_toks = 0
 
                 for req_idx in range(num_requests):
-                    req_context_len = seq_len2_all[req_idx].item()
-                    if req_context_len > 0:
-                        # 每个请求按CP×SP切分
-                        toks_per_rank = req_context_len // (self.cp_size * self.sp_size)
-                        rank_linear_id = self.cp_rank * self.sp_size + self.sp_rank
-                        start_offset = rank_linear_id * toks_per_rank
-                        rank_toks = min(toks_per_rank, max(0, req_context_len - start_offset))
+                    n_computed_acc = num_computed_tokens_of_cp_sp_accum[req_idx][i]
+                    total_toks += n_computed_acc[self.cp_rank][self.sp_rank]
+                    seq_len2_rank[req_idx] = n_computed_acc[self.cp_rank][self.sp_rank]
 
-                        seq_len2_rank[req_idx] = rank_toks
-                        context_starts_rank[req_idx] = prefill_metadata.chunked_context.starts[i] + \
-                                                      sum(seq_len2_all[:req_idx].tolist()) + start_offset
-                        total_toks += rank_toks
+                    #req_context_len = seq_len2_all[req_idx].item()
+                    #logger.info(f"===========>{i}/{iters}, seq_len2_all:{seq_len2_all}, {num_requests=}, {req_idx=}, {req_context_len=}")
+                    #if req_context_len > 0:
+                    #    # 每个请求按CP×SP切分
+                    #    toks_per_rank = req_context_len // (self.cp_size * self.sp_size)
+                    #    rank_linear_id = self.cp_rank * self.sp_size + self.sp_rank
+                    #    start_offset = rank_linear_id * toks_per_rank
+                    #    rank_toks = min(toks_per_rank, max(0, req_context_len - start_offset))
+
+                    #    seq_len2_rank[req_idx] = rank_toks
+                    #    context_starts_rank[req_idx] = prefill_metadata.chunked_context.starts[i] + \
+                    #                                  sum(seq_len2_all[:req_idx].tolist()) + start_offset
+                    #    total_toks += rank_toks
+
+                    
 
                 if total_toks > 0:
                     kv_c_normed = torch.empty(total_toks,
@@ -881,12 +899,12 @@ class AscendMLAImpl(MLAAttentionImpl):
                 )
 
             seq_len = torch.stack([seq_len1.cpu(), seq_len2.cpu()])
-            logger.info("--->here")
+            logger.info(f'----> cp={self.cp_rank},sp={self.sp_rank},{seq_len2_all=},{total_toks=},{num_computed_tokens_of_cp_sp_accum=}')
 
             kv_c_normed = kv_c_normed.squeeze()
             if self.sp_size > 1:
                 # SP模式下：先在SP组内all_gather，让每个CP组内的rank共享完整sequence块
-                # 步骤1: SP内all_gather潜表示
+                # 步骤1: SP内all_gather latent
                 kv_c_k_pe_local = torch.cat([kv_c_normed, k_pe.squeeze()], dim=-1)  # [local_toks, latent_dim + rope_dim]
                 kv_c_k_pe_gather_list = [torch.empty_like(kv_c_k_pe_local) for _ in range(self.sp_size)]
                 dist.all_gather(kv_c_k_pe_gather_list, kv_c_k_pe_local, group=get_tp_group().device_group)
@@ -915,7 +933,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 block_lse_local = torch.empty(
                     self.num_heads, num_tokens_all,
                     dtype=torch.float32, device=q_nope.device)
-                logger.info(f"--->here, cache_kv_c.shape:{cache_kv_c.shape},cache_k_pe.shape:{cache_k_pe.shape}, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
+                logger.info(f"--->here---,cp={self.cp_rank},sp={self.sp_rank}, cache_kv_c.shape:{cache_kv_c.shape},cache_k_pe.shape:{cache_k_pe.shape}, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
                             f"value:{v.shape}, seq_len:{seq_len.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
                             f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}")
 

@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
+import copy
 
 
 class AscendScheduler(Scheduler):
@@ -196,6 +197,7 @@ class AscendScheduler(Scheduler):
                     # 初始化单独累加的token数（如果是第一次）
                     request.num_computed_tokens_of_cp_sp_single = [[0] * self.sp_size for _ in range(self.cp_size)]
                     request.num_computed_tokens_of_cp_sp_current = [[0] * self.sp_size for _ in range(self.cp_size)]
+                    request.num_computed_tokens_of_cp_sp_accum = []
                     for i in range(self.cp_size):
                         for j in range(self.sp_size):
                             length = int(num_blocks_of_cp_sp[i][j]) * self.block_size
@@ -204,8 +206,9 @@ class AscendScheduler(Scheduler):
                             # 只累加该rank自己的token数
                             request.num_computed_tokens_of_cp_sp_single[i][j] += len(request.token_ids_of_cp_sp[i][j])
                             request.num_computed_tokens_of_cp_sp_current[i][j] = len(request.token_ids_of_cp_sp[i][j])
-                            logger.info(f"cp:{i},sp{j}, num_computed_tokens_of_cp_sp_single:{request.num_computed_tokens_of_cp_sp_single[i][j]}, request.num_computed_tokens_of_cp_sp[i][j]:{request.num_computed_tokens_of_cp_sp[i][j]}")
+                            logger.info(f"cp:{i},sp{j}, num_computed_tokens_of_cp_sp_single:{request.num_computed_tokens_of_cp_sp_single[i][j]}, {request.num_computed_tokens_of_cp_sp[i][j]=},request.num_computed_tokens_of_cp_sp[i][j]:{request.num_computed_tokens_of_cp_sp[i][j]}, {length=}, {start_id=}, {num_computed_tokens=}, {request.num_computed_tokens_of_cp_sp_current[i][j]=}, {self.block_size=}")
                             start_id += length
+                    request.num_computed_tokens_of_cp_sp_accum.append(copy.deepcopy(request.num_computed_tokens_of_cp_sp_current))
                     logger.info(
                         f"======> [SCH-PREFILL] req={request.request_id} chunk step_tokens={num_new_tokens} "
                         f"cp={self.cp_size} sp={self.sp_size} num_blocks_of_cp_sp.shape={num_blocks_of_cp_sp.shape} "
@@ -235,6 +238,7 @@ class AscendScheduler(Scheduler):
                         [0] * self.sp_size for _ in range(self.cp_size)]
                     request.num_computed_tokens_of_cp_sp_current = [
                         [0] * self.sp_size for _ in range(self.cp_size)]
+                    request.num_computed_tokens_of_cp_sp_accum = []
                     for i in range(self.cp_size):
                         for j in range(self.sp_size):
                             request.token_ids_of_cp_sp[i][
@@ -253,6 +257,7 @@ class AscendScheduler(Scheduler):
                             )  #  实际处理当前chunk时，每个rank存的kv cache 数量
                             start_id += request.num_blocks_of_cp_sp[i][
                                 j] * self.block_size
+                    request.num_computed_tokens_of_cp_sp_accum.append(copy.deepcopy(request.num_computed_tokens_of_cp_sp_current))
 
             # P/D: loading remote KV, do not allocate for new work.
             if load_kv_async:
@@ -443,8 +448,10 @@ class AscendScheduler(Scheduler):
                             # 只累加该rank自己的token数
                             request.num_computed_tokens_of_cp_sp_single[i][j] += len(request.token_ids_of_cp_sp[i][j])
                             request.num_computed_tokens_of_cp_sp_current[i][j] = len(request.token_ids_of_cp_sp[i][j])
-                            logger.info(f"cp:{i},sp{j}, num_computed_tokens_of_cp_sp_single:{request.num_computed_tokens_of_cp_sp_single[i][j]}, request.num_computed_tokens_of_cp_sp[i][j]:{request.num_computed_tokens_of_cp_sp[i][j]}")
+                            logger.info(f"cp:{i},sp{j}, num_computed_tokens_of_cp_sp_single:{request.num_computed_tokens_of_cp_sp_single[i][j]}, request.num_computed_tokens_of_cp_sp[i][j]:{request.num_computed_tokens_of_cp_sp[i][j]}, {request.num_computed_tokens_of_cp_sp_current[i][j]=}")
                             start_id += length
+                    request.num_computed_tokens_of_cp_sp_accum.append(copy.deepcopy(request.num_computed_tokens_of_cp_sp_current))
+
                     logger.info(
                         f"======> [SCH-RUNNING] req={request.request_id} chunk step_tokens={num_new_tokens} "
                         f"cp={self.cp_size} sp={self.sp_size} num_blocks_of_cp_sp.shape={num_blocks_of_cp_sp.shape} "
@@ -458,6 +465,7 @@ class AscendScheduler(Scheduler):
                         request.num_computed_tokens_of_cp_sp_current = [[0]]
                     request.num_computed_tokens_of_cp_sp_single[0][0] += num_new_tokens
                     request.num_computed_tokens_of_cp_sp_current[0][0] = num_new_tokens
+                    request.num_computed_tokens_of_cp_sp_accum.append(copy.deepcopy(request.num_computed_tokens_of_cp_sp_current))
 
                 # 分配 KV slots
                 while True:
