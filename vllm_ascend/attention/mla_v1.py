@@ -481,20 +481,26 @@ class AscendMLAMetadataBuilder:
             input_positions = input_positions[:num_decode_tokens]
             block_table = block_table[:num_decodes, ...]
             seq_lens_list = seq_lens.tolist()
-            num_computed_tokens_of_cp_dcp_array = np.array(num_computed_tokens_of_cp_dcp)  # [bs, cp_size, sp_size]
-            seq_mask_cp = torch.where(
-                torch.tensor(num_computed_tokens_of_cp_dcp_array.sum(2)) == 0, 0,
-                1).to(torch.uint8)
-            self.seq_mask_cp_buf[:seq_mask_cp.shape[0], :seq_mask_cp.shape[1]].copy_(seq_mask_cp, non_blocking=True)
+            if num_computed_tokens_of_cp_dcp is not None:
+                num_computed_tokens_of_cp_dcp_array = np.array(num_computed_tokens_of_cp_dcp)  # [bs, cp_size, sp_size]
+                tmp_seq_mask_cp = torch.where(
+                    torch.tensor(num_computed_tokens_of_cp_dcp_array.sum(2)) == 0, 0,
+                    1).to(torch.uint8)
+                self.seq_mask_cp_buf[:tmp_seq_mask_cp.shape[0], :tmp_seq_mask_cp.shape[1]].copy_(tmp_seq_mask_cp, non_blocking=True)
+                seq_mask_cp = self.seq_mask_cp_buf[:seq_mask_cp.shape[0], :seq_mask_cp.shape[1]]
 
-            seq_mask_dcp = torch.where(
-                torch.tensor(num_computed_tokens_of_cp_dcp_array[:,
-                                                        self.cp_rank, :]) == 0,
-                0, 1).to(torch.uint8)
-            self.seq_mask_dcp_buf[:seq_mask_dcp.shape[0], :seq_mask_dcp.shape[1]].copy_(seq_mask_dcp, non_blocking=True)
-
-            cp_seq_len = num_computed_tokens_of_cp_dcp_array[:, self.cp_rank, self.dcp_rank]
-            cp_seq_len = torch.tensor(cp_seq_len, dtype=torch.int32)
+                tpm_seq_mask_dcp = torch.where(
+                    torch.tensor(num_computed_tokens_of_cp_dcp_array[:,
+                                                            self.cp_rank, :]) == 0,
+                    0, 1).to(torch.uint8)
+                self.seq_mask_dcp_buf[:tpm_seq_mask_dcp.shape[0], :tpm_seq_mask_dcp.shape[1]].copy_(tpm_seq_mask_dcp, non_blocking=True)
+                seq_mask_dcp = self.seq_mask_dcp_buf[:seq_mask_dcp.shape[0], :seq_mask_dcp.shape[1]]
+                cp_seq_len = num_computed_tokens_of_cp_dcp_array[:, self.cp_rank, self.dcp_rank]
+                cp_seq_len = torch.tensor(cp_seq_len, dtype=torch.int32)
+            else:
+                seq_mask_cp = None
+                seq_mask_dcp = None
+                cp_seq_len = None
 
             # TODO: After the fullgraph supports MTP, the if branch needs to deleted
             assert self.cos_cache is not None
