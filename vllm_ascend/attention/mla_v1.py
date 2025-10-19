@@ -487,14 +487,14 @@ class AscendMLAMetadataBuilder:
                     torch.tensor(num_computed_tokens_of_cp_dcp_array.sum(2)) == 0, 0,
                     1).to(torch.uint8)
                 self.seq_mask_cp_buf[:tmp_seq_mask_cp.shape[0], :tmp_seq_mask_cp.shape[1]].copy_(tmp_seq_mask_cp, non_blocking=True)
-                seq_mask_cp = self.seq_mask_cp_buf[:seq_mask_cp.shape[0], :seq_mask_cp.shape[1]]
+                seq_mask_cp = self.seq_mask_cp_buf[:tmp_seq_mask_cp.shape[0], :tmp_seq_mask_cp.shape[1]]
 
-                tpm_seq_mask_dcp = torch.where(
+                tmp_seq_mask_dcp = torch.where(
                     torch.tensor(num_computed_tokens_of_cp_dcp_array[:,
                                                             self.cp_rank, :]) == 0,
                     0, 1).to(torch.uint8)
-                self.seq_mask_dcp_buf[:tpm_seq_mask_dcp.shape[0], :tpm_seq_mask_dcp.shape[1]].copy_(tpm_seq_mask_dcp, non_blocking=True)
-                seq_mask_dcp = self.seq_mask_dcp_buf[:seq_mask_dcp.shape[0], :seq_mask_dcp.shape[1]]
+                self.seq_mask_dcp_buf[:tmp_seq_mask_dcp.shape[0], :tmp_seq_mask_dcp.shape[1]].copy_(tmp_seq_mask_dcp, non_blocking=True)
+                seq_mask_dcp = self.seq_mask_dcp_buf[:tmp_seq_mask_dcp.shape[0], :tmp_seq_mask_dcp.shape[1]]
                 cp_seq_len = num_computed_tokens_of_cp_dcp_array[:, self.cp_rank, self.dcp_rank]
                 cp_seq_len = torch.tensor(cp_seq_len, dtype=torch.int32)
             else:
@@ -524,8 +524,8 @@ class AscendMLAMetadataBuilder:
                     sin=sin,
                     cos=cos,
                     num_computed_tokens_of_cp_dcp=num_computed_tokens_of_cp_dcp,
-                    seq_mask_cp=self.seq_mask_cp_buf[:seq_mask_cp.shape[0], :seq_mask_cp.shape[1]],
-                    seq_mask_dcp=self.seq_mask_dcp_buf[:seq_mask_dcp.shape[0], :seq_mask_dcp.shape[1]],
+                    seq_mask_cp=seq_mask_cp,
+                    seq_mask_dcp=seq_mask_dcp,
                     cp_seq_len=cp_seq_len,)
             else:
                 cos[:num_decode_tokens,
@@ -546,8 +546,8 @@ class AscendMLAMetadataBuilder:
                     sin=sin[:num_decode_tokens, ...],
                     cos=cos[:num_decode_tokens, ...],
                     num_computed_tokens_of_cp_dcp=num_computed_tokens_of_cp_dcp,
-                    seq_mask_cp=self.seq_mask_cp_buf[:seq_mask_cp.shape[0], :seq_mask_cp.shape[1]],
-                    seq_mask_dcp=self.seq_mask_dcp_buf[:seq_mask_dcp.shape[0], :seq_mask_dcp.shape[1]],
+                    seq_mask_cp=seq_mask_cp,
+                    seq_mask_dcp=seq_mask_dcp,
                     cp_seq_len=cp_seq_len,)
 
         return self.metadata_cls(  # type: ignore
