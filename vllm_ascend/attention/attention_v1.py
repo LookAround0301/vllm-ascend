@@ -163,7 +163,7 @@ class AscendMetadataForPrefill:
 @dataclass
 class AscendMetadataForDecode:
     """ Decode Specific Metadata for Ascend"""
-    num_computed_tokens_of_cp_dcp: Optional[list[Optional[list[Optional[
+    num_computed_tokens_of_cp_sp: Optional[list[Optional[list[Optional[
         list[int]]]]]] = None
 
 
@@ -349,9 +349,9 @@ class AscendAttentionMetadataBuilder:
         if num_decodes > 0:
             common_long_seq_metadata = common_attn_metadata.common_long_seq_metadata
             if common_long_seq_metadata is not None:
-                num_computed_tokens_of_cp_dcp = common_long_seq_metadata.num_computed_tokens_of_cp_dcp
-                num_computed_tokens_of_cp_dcp = np.array(num_computed_tokens_of_cp_dcp)
-                decode_metadata = AscendMetadataForDecode(num_computed_tokens_of_cp_dcp=num_computed_tokens_of_cp_dcp)
+                num_computed_tokens_of_cp_sp = common_long_seq_metadata.num_computed_tokens_of_cp_sp
+                num_computed_tokens_of_cp_sp = np.array(num_computed_tokens_of_cp_sp)
+                decode_metadata = AscendMetadataForDecode(num_computed_tokens_of_cp_sp=num_computed_tokens_of_cp_sp)
 
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -860,64 +860,26 @@ class AscendAttentionBackendImpl(AttentionImpl):
         else:
             num_heads = self.num_heads
 
-        q_nope = query.view(query.shape[0], 1, query.shape[1], query.shape[2])
-        # [b,num_heads,head_size] -> [b,1,num_heads,head_size]
-        k_nope = self.key_cache.view(self.key_cache.shape[0],
-                                self.key_cache.shape[1], -1)
-        value = self.value_cache.view(self.key_cache.shape[0],
-                                  self.key_cache.shape[1], -1)
-        common_kwargs = {
-            'num_heads': num_heads,
-            'num_key_value_heads': self.num_kv_heads,
-            'input_layout': "BSND",
-            'atten_mask': None,
-            'scale': self.scale,
-            'antiquant_mode': 0,
-            'antiquant_scale': None,
-            'softmax_lse_flag': True,
-            'block_table': attn_metadata.block_tables,
-            'block_size': self.key_cache.shape[1],
-            "actual_seq_lengths_kv": attn_metadata.decode.num_computed_tokens_of_cp_dcp[:, self.cp_rank, self.dcp_rank],
-        }
-        graph_params = get_graph_params()
-        forward_context: ForwardContext = get_forward_context()
-        num_tokens = query.shape[0]
-        if forward_context.capturing:
-            stream = torch_npu.npu.current_stream()
-            
-            event = torch.npu.ExternalEvent()
-            event.wait(stream)
-            event.reset(stream)
-            graph_params.events[num_tokens].append(event)
-
-            workspace = graph_params.workspaces.get(num_tokens)
-            if workspace is None:
-                workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                    q_nope, k_nope, value, **common_kwargs)
-                graph_params.workspaces[num_tokens] = workspace
-            attn_out = torch.empty_like(q_nope)
-            attn_lse = torch.empty((num_tokens, num_heads, 1, 1),
-                                      dtype=torch.float,
-                                      device=q_nope.device)
-
-            graph_params.attn_params[num_tokens].append(
-                (q_nope, k_nope, value, self.num_heads, self.num_kv_heads,
-                 self.scale, attn_metadata.block_tables, self.key_cache.shape[1],
-                 attn_metadata.decode.num_computed_tokens_of_cp_dcp[:, self.cp_rank, self.dcp_rank], workspace,
-                 attn_out, attn_lse, self.cp_rank, self.dcp_rank, self.dcp_size))
-            torch.npu.graph_task_group_begin(stream)
-            torch_npu.npu_fused_infer_attention_score.out(
-                q_nope,
-                k_nope,
-                value,
-                **common_kwargs,
-                workspace=workspace,
-                out=[attn_out, attn_lse])
-            handle = torch.npu.graph_task_group_end(stream)
-            graph_params.handles[num_tokens].append(handle)
-        else:
-            attn_out, attn_lse = torch_npu.npu_fused_infer_attention_score(
-                q_nope, k_nope, value, **common_kwargs)
+        # 1. Compute out&lse by "npu_fused_infer_attention_score"
+        attn_out, attn_lse = torch.ops.npu.npu_fused_infer_attention_score(
+            query.view(query.shape[0], 1, query.shape[1], query.shape[2]),
+            # [b,num_heads,head_size] -> [b,1,num_heads,head_size]
+            self.key_cache.view(self.key_cache.shape[0],
+                                self.key_cache.shape[1], -1),
+            self.value_cache.view(self.key_cache.shape[0],
+                                  self.key_cache.shape[1], -1),
+            num_heads=num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="BSND",
+            atten_mask=None,
+            scale=self.scale,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            softmax_lse_flag=True,
+            block_table=attn_metadata.block_tables,
+            block_size=self.key_cache.shape[1],
+            actual_seq_lengths_kv=attn_metadata.decode.num_computed_tokens_of_cp_sp[:, self.cp_rank, self.dcp_rank],
+        )
 
         attn_out = attn_out.view(attn_out.shape[0], attn_out.shape[2], attn_out.shape[3])
         attn_lse = attn_lse.view(attn_lse.shape[0], attn_lse.shape[1], 1)

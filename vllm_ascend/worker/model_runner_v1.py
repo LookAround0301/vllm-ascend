@@ -111,9 +111,7 @@ from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
 from vllm_ascend.compilation.acl_graph import (ACLGraphWrapper,
                                                set_graph_params,
                                                update_attn_params,
-                                               update_mla_attn_params,
-                                               update_attn_dcp_cp_params,
-                                               update_mla_attn_dcp_cp_params)
+                                               update_mla_attn_params)
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import \
     D2DExpertWeightLoader
@@ -1628,22 +1626,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             # TODO: maybe_padded_num_tokens will be removed, use num_input_tokens instead
             if self.vllm_config.model_config.use_mla:
-                if self.cp_size * self.dcp_size > 1:
-                    # FIXME: Try using `auto_dispatch_capture=True`
-                    update_mla_attn_dcp_cp_params(self.update_stream, forward_context,
-                                        maybe_padded_num_tokens)
-                else:
-                    # FIXME: Try using `auto_dispatch_capture=True`
-                    update_mla_attn_params(self.update_stream, forward_context,
-                                        maybe_padded_num_tokens,
-                                        self.speculative_config)
+                # FIXME: Try using `auto_dispatch_capture=True`
+                update_mla_attn_params(self.update_stream, forward_context,
+                                       maybe_padded_num_tokens,
+                                       self.speculative_config)
             else:
-                if self.cp_size * self.dcp_size > 1:
-                    update_attn_dcp_cp_params(self.update_stream, forward_context,
+                update_attn_params(self.update_stream, forward_context,
                                    maybe_padded_num_tokens)
-                else:
-                    update_attn_params(self.update_stream, forward_context,
-                                    maybe_padded_num_tokens)
 
         if self.cp_size > 1:
             hidden_states = get_cp_group().all_gather(hidden_states, 0)
@@ -2339,16 +2328,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     self.kv_cache_config.kv_cache_groups):
                 block_table_tensor = self.input_batch.block_table[
                     kv_cache_group_id].get_device_tensor()
-                self.cp_kv_recover_idx = torch.zeros(self.max_num_tokens,
-                                            dtype=torch.int32,
-                                            device=self.device)
-                long_seq_metadata = self._generate_cp_metadata(num_tokens, self.seq_lens_cpu)
-                cp_world_size = get_cp_group().world_size if context_parallel_enable() else 1
-                dcp_world_size = get_dcp_group().world_size
-                num_computed_tokens_of_cp_dcp = [[
-                    [0] * dcp_world_size for _ in range(cp_world_size)
-                ] for _ in range(num_tokens)]
-                long_seq_metadata.num_computed_tokens_of_cp_dcp = num_computed_tokens_of_cp_dcp
                 common_attn_metadata = AscendCommonAttentionMetadata(
                     query_start_loc=torch.tensor(
                         [0] + self.actual_seq_lengths_q[:num_reqs],
@@ -2372,7 +2351,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     decode_token_per_req=self.decode_token_per_req,
                     cos=self.cos,
                     sin=self.sin,
-                    common_long_seq_metadata=long_seq_metadata,
                 )
                 attn_state = AscendAttentionState.DecodeOnly
                 if self.speculative_config and \
@@ -2401,22 +2379,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and \
             not forward_context.capturing:
             if self.vllm_config.model_config.use_mla:
-                if self.cp_size * self.dcp_size > 1:
-                    # FIXME: Try using `auto_dispatch_capture=True`
-                    update_mla_attn_dcp_cp_params(self.update_stream, forward_context,
-                                        positions.shape[0])
-                else:
-                    # FIXME: Try using `auto_dispatch_capture=True`
-                    update_mla_attn_params(self.update_stream, forward_context,
-                                        positions.shape[0],
-                                        self.speculative_config)
+                # FIXME: Try using `auto_dispatch_capture=True`
+                update_mla_attn_params(self.update_stream, forward_context,
+                                       positions.shape[0],
+                                       self.speculative_config)
             else:
-                if self.cp_size * self.dcp_size > 1:
-                    update_attn_dcp_cp_params(self.update_stream, forward_context,
+                update_attn_params(self.update_stream, forward_context,
                                    positions.shape[0])
-                else:
-                    update_attn_params(self.update_stream, forward_context,
-                                    positions.shape[0])
 
         if self.drafter and self.drafter.name == SpecDcodeType.EAGLE3:
             hidden_states, _ = hidden_states
@@ -3740,6 +3709,43 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     def _build_drafter_prepare_inputs_torchair_param(self):
         return False
 
+    def _num_scheduled_tokens_prefill_cp(self, num_tokens,
+                                         num_computed_tokens,
+                                         cp_kv_recover_idx):
+        num_scheduled_tokens = num_tokens - num_computed_tokens
+        num_cp_padded_scheduled_tokens = cdiv(
+            num_scheduled_tokens, 2 * self.cp_size) * (2 * self.cp_size
+                                                       )
+        cp_pad = num_cp_padded_scheduled_tokens - num_scheduled_tokens
+        full_indices = list(
+            range(self.max_num_tokens * self.cp_size * self.dcp_size +
+                  self.cp_size * self.dcp_size * self.max_num_reqs))
+        chunk_size = num_cp_padded_scheduled_tokens // (2 * self.cp_size)
+
+        # split position_ids (and use split position_ids to split input_ids afterwards)
+        req_position_cp = []
+        req_position_cp.extend(
+            full_indices[self.cp_rank * chunk_size:(self.cp_rank + 1) *
+                                                   chunk_size])
+        req_position_cp.extend(
+            full_indices[num_cp_padded_scheduled_tokens - (self.cp_rank + 1) *
+                         chunk_size:num_cp_padded_scheduled_tokens -
+                                    self.cp_rank * chunk_size])
+
+        # used to recover kv order in cp prefill (after all-gather kv and before storing kv_cache)
+        num_added_recover_tokens = len(cp_kv_recover_idx[0]) * self.cp_size
+        for rank in range(self.cp_size):
+            cp_kv_recover_idx[rank].extend(
+                full_indices[rank * chunk_size +
+                             num_added_recover_tokens:(rank + 1) * chunk_size +
+                                                      num_added_recover_tokens])
+            cp_kv_recover_idx[rank].extend(full_indices[
+                                           num_cp_padded_scheduled_tokens - (rank + 1) * chunk_size +
+                                           num_added_recover_tokens:num_cp_padded_scheduled_tokens -
+                                                                    rank * chunk_size + num_added_recover_tokens])
+
+        return req_position_cp, cp_pad
+
     def _update_tokens_for_cp(self, tokens):
         num_reqs = self.input_batch.num_reqs
         self.num_cp_pads = torch.zeros(num_reqs, dtype=torch.int32)
@@ -3810,7 +3816,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if self.cp_size * self.dcp_size > 1:
             long_seq_metadata = AscendCommonLongSequenceMetadata(
                 num_actual_tokens_cp_full=num_actual_tokens_cp_full,
-                num_computed_tokens_of_cp_dcp=get_cp_local_seq_lens(
+                num_computed_tokens_of_cp_sp=get_cp_local_seq_lens(
                     seq_lens,
                     self.cp_size,
                     self.dcp_size,

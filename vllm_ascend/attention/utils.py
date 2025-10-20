@@ -14,7 +14,7 @@ class AscendCommonLongSequenceMetadata:
 
     num_actual_tokens_cp_full: Optional[int] = None
 
-    num_computed_tokens_of_cp_dcp: Optional[list[Optional[list[Optional[
+    num_computed_tokens_of_cp_sp: Optional[list[Optional[list[Optional[
         list[int]]]]]] = None
 
     q_head_idx_tensor: torch.Tensor = None
