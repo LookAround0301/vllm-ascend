@@ -31,9 +31,9 @@ from vllm.v1.request import Request, RequestStatus
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.utils import AscendSocVersion, get_ascend_soc_version
-from vllm_ascend.utils import context_parallel_enable
-if context_parallel_enable():
-    from vllm.distributed.parallel_state import get_context_model_parallel_rank
+from vllm_ascend.utils import prefill_context_parallel_enable
+if prefill_context_parallel_enable():
+    from vllm.distributed.parallel_state import get_prefill_context_model_parallel_rank
 
 TORCH_DTYPE_TO_NPU_DTYPE = {
     torch.half: llm_datadist.DataType.DT_FLOAT16,
@@ -192,10 +192,10 @@ class LLMDataDistCMgrConnectorScheduler():
         else:
             dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        self.cp_size = self.vllm_config.parallel_config.context_parallel_size if context_parallel_enable() else 1
+        self.pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size if prefill_context_parallel_enable() else 1
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
 
-        self.port = dp_rank_local * self.cp_size * tp_size + envs_ascend.VLLM_ASCEND_LLMDD_RPC_PORT if dp_rank_local is not None else tp_size + envs_ascend.VLLM_ASCEND_LLMDD_RPC_PORT
+        self.port = dp_rank_local * self.pcp_size * tp_size + envs_ascend.VLLM_ASCEND_LLMDD_RPC_PORT if dp_rank_local is not None else tp_size + envs_ascend.VLLM_ASCEND_LLMDD_RPC_PORT
 
         self._reqs_need_recv: dict[str, tuple[Request, list[int]]] = {}
         self._reqs_need_send: dict[str, float] = {}
@@ -307,7 +307,7 @@ class LLMDataDistCMgrConnectorScheduler():
             remote_port=self.port,
             remote_tp_size=str(
                 self.vllm_config.parallel_config.tensor_parallel_size),
-            remote_cp_size=str(self.cp_size),
+            remote_cp_size=str(self.pcp_size),
             remote_dcp_size=str(self.dcp_size),
         )
 
@@ -333,8 +333,8 @@ class LLMDataDistCMgrConnectorWorker():
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.tp_rank = get_tp_group().rank_in_group
         self.rank = get_world_group().rank
-        self.cp_size = vllm_config.parallel_config.context_parallel_size if context_parallel_enable() else 1
-        self.cp_rank = get_context_model_parallel_rank() if context_parallel_enable() else 0
+        self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size if prefill_context_parallel_enable() else 1
+        self.pcp_rank = get_prefill_context_model_parallel_rank() if prefill_context_parallel_enable() else 0
         self.dcp_size = get_dcp_group().world_size
         self.local_ip = get_ip()
         self.kv_transfer_config: KVTransferConfig = vllm_config.kv_transfer_config
@@ -376,7 +376,7 @@ class LLMDataDistCMgrConnectorWorker():
 
     def listen_for_agent_metadata_req(self, event: threading.Event):
         assert self.local_agent_metadata is not None
-        port = envs_ascend.VLLM_ASCEND_LLMDD_RPC_PORT + self.local_dp_rank * self.cp_size * self.tp_size + self.cp_rank * self.tp_size + self.tp_rank \
+        port = envs_ascend.VLLM_ASCEND_LLMDD_RPC_PORT + self.local_dp_rank * self.pcp_size * self.tp_size + self.pcp_rank * self.tp_size + self.tp_rank \
             if self.local_dp_rank is not None else envs_ascend.VLLM_ASCEND_LLMDD_RPC_PORT + self.tp_size + self.tp_rank
         url = f"tcp://{envs_ascend.VLLM_ASCEND_LLMDD_RPC_IP}:{port}"
         msg_encoder = msgspec.msgpack.Encoder()
@@ -487,9 +487,9 @@ class LLMDataDistCMgrConnectorWorker():
                 d for d in device_list if d.get("server_id") == self.local_ip
                 and device_filter(d.get("device_id", ""))
             ]
-            if len(device_list) <= self.cp_rank * self.tp_size + self.tp_rank:
+            if len(device_list) <= self.pcp_rank * self.tp_size + self.tp_rank:
                 continue
-            device_info = device_list[self.cp_rank * self.tp_size + self.tp_rank]
+            device_info = device_list[self.pcp_rank * self.tp_size + self.tp_rank]
             super_pod_id_ = device_info.get("super_pod_id", None)
             server_id_ = device_info["server_id"]
             device_id_ = device_info["device_id"]
@@ -869,14 +869,14 @@ class LLMDataDistCMgrConnectorWorker():
         In cp/dcp scenario, kv_cache may be split, so we need to pull multiple blocks from multiple remote P node.
         Use this function to calculate remote port and remote block number of each remote P node that we need to pull.
         """
-        if self.cp_size == remote_cp_size and self.dcp_size == remote_dcp_size:
+        if self.pcp_size == remote_cp_size and self.dcp_size == remote_dcp_size:
             # remote & local cp/dcp are equal, do kv transfer point-to-point
             remote_kv_num = 1
-            remote_ports = [remote_port + self.cp_rank * self.tp_size + tp_offset \
+            remote_ports = [remote_port + self.pcp_rank * self.tp_size + tp_offset \
                 for tp_offset in range(self.tp_rank, int(remote_tp_size), self.tp_size)]
             remote_block_nums = [len(remote_block_ids)]
-        elif (self.use_mla and self.cp_size == 1 and self.dcp_size == 1) \
-            or (not self.use_mla and self.cp_size == 1 and remote_tp_size == self.tp_size and remote_dcp_size == self.dcp_size):
+        elif (self.use_mla and self.pcp_size == 1 and self.dcp_size == 1) \
+            or (not self.use_mla and self.pcp_size == 1 and remote_tp_size == self.tp_size and remote_dcp_size == self.dcp_size):
             # remote & local cp/dcp are not equal, each D node needs to pull from cp(*dcp) P nodes
             # 1. for mla, support D cp_size = dcp_size = 1
             # 2. for gqa, support D tp_size = P tp_size, D dcp_size = P dcp_size
@@ -900,8 +900,8 @@ class LLMDataDistCMgrConnectorWorker():
         else:
             # Other cases are not supported now, maybe need to reshard kv_cache.
             raise NotImplementedError(f'Current case is not supported now: use_mla={self.use_mla}, '
-                f'P tp={remote_tp_size}, cp={remote_cp_size}, cp={remote_dcp_size}, '
-                f'D tp={self.tp_size}, cp={self.cp_size}, dcp={self.dcp_size}'
+                f'P tp={remote_tp_size}, pcp={remote_cp_size}, dcp={remote_dcp_size}, '
+                f'D tp={self.tp_size}, pcp={self.pcp_size}, dcp={self.dcp_size}'
             )
         return remote_kv_num, remote_ports, remote_block_nums
 

@@ -5,10 +5,10 @@ import torch
 from vllm.distributed import get_dcp_group
 from vllm.utils import cdiv
 
-from vllm_ascend.utils import context_parallel_enable
+from vllm_ascend.utils import prefill_context_parallel_enable
 
-if context_parallel_enable():
-    from vllm.distributed import get_cp_group
+if prefill_context_parallel_enable():
+    from vllm.distributed import get_pcp_group
 
 
 class BlockTable:
@@ -86,16 +86,16 @@ class BlockTable:
                                         dtype=torch.int64,
                                         device=self.device)
         try:
-            self.cp_world_size = get_cp_group().world_size if context_parallel_enable() else 1
-            self.cp_rank = get_cp_group().rank_in_group if self.cp_world_size > 1 else 0
+            self.pcp_world_size = get_pcp_group().world_size if prefill_context_parallel_enable() else 1
+            self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_world_size > 1 else 0
             self.dcp_world_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
         except AssertionError:
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
-            self.cp_world_size = 1
-            self.cp_rank = 0
+            self.pcp_world_size = 1
+            self.pcp_rank = 0
         self.kernel_sizes = kernel_sizes
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
@@ -143,14 +143,14 @@ class BlockTable:
         # here because M (max_model_len) is not necessarily divisible by
         # block_size.
 
-        if self.dcp_world_size * self.cp_world_size > 1:
+        if self.dcp_world_size * self.pcp_world_size > 1:
             # Note(hc): The DCP implement store kvcache with an interleave
             # style, the kvcache for the token whose token_idx is i is
             # always stored on the GPU whose dcp_rank equals i % cp_world_size:
 
             # Use a "virtual block" which equals to world_size * block_size
             # for block_table_indices calculation.
-            virtual_block_size = self.block_size * self.dcp_world_size * self.cp_world_size
+            virtual_block_size = self.block_size * self.dcp_world_size * self.pcp_world_size
 
             # IMPORTANT: In hybrid mode, positions are in logical block space,
             # but we need to map them to the correct logical block table indices
@@ -168,12 +168,12 @@ class BlockTable:
             # Use virtual_block_size for mask calculation, which marks local
             # tokens.
             virtual_block_offsets = positions % virtual_block_size
-            self.current_rank = self.dcp_world_size * self.cp_rank + self.dcp_rank
+            self.current_rank = self.dcp_world_size * self.pcp_rank + self.dcp_rank
             mask = (virtual_block_offsets // self.cp_kv_cache_interleave_size %
-                    (self.dcp_world_size * self.cp_world_size) == self.current_rank)
+                    (self.dcp_world_size * self.pcp_world_size) == self.current_rank)
             # Calculate local block_offsets
             block_offsets = virtual_block_offsets \
-                // (self.dcp_world_size * self.cp_world_size * self.cp_kv_cache_interleave_size) \
+                // (self.dcp_world_size * self.pcp_world_size * self.cp_kv_cache_interleave_size) \
                 * self.cp_kv_cache_interleave_size + virtual_block_offsets % self.cp_kv_cache_interleave_size
             # Calculate slot_mapping
             slot_mapping = block_numbers * self.block_size + block_offsets
@@ -265,7 +265,7 @@ class MultiGroupBlockTable:
         # must be multiplied by dcp_world_size.
         try:
             dcp_world_size = get_dcp_group().world_size
-            cp_world_size = get_cp_group().world_size if context_parallel_enable() else 1
+            cp_world_size = get_pcp_group().world_size if prefill_context_parallel_enable() else 1
         except AssertionError:
             # DCP might not be initialized in testing
             dcp_world_size = 1
@@ -320,29 +320,6 @@ class MultiGroupBlockTable:
     def commit_slot_mapping(self, num_tokens: int) -> None:
         for block_table in self.block_tables:
             block_table.commit_slot_mapping(num_tokens)
-
-    def get_split_computed_tokens(self, num_computed_tokens: np.ndarray) -> list[list[list[int]]]:
-        "Splits computed token counts across dcp and sp dimensions for distributed allocation."
-        self.cp_world_size = get_cp_group().world_size if context_parallel_enable() else 1
-        self.dcp_world_size = get_dcp_group().world_size
-        num_requests = len(num_computed_tokens)
-        num_computed_tokens_of_cp_dcp = [[
-            [0] * self.dcp_world_size for _ in range(self.cp_world_size)
-        ] for _ in range(num_requests)]
-        total_ranks = self.cp_world_size * self.dcp_world_size
-        for req_idx in range(num_requests):
-            total_tokens = num_computed_tokens[req_idx]
-            if total_tokens <= 0:
-                continue
-            base = int(total_tokens) // total_ranks
-            remainder = int(total_tokens) % total_ranks
-            for rank_idx in range(total_ranks):
-                cp_idx = rank_idx // self.dcp_world_size
-                sp_idx = rank_idx % self.dcp_world_size
-                num_computed_tokens_of_cp_dcp[req_idx][cp_idx][sp_idx] = base
-                if rank_idx < remainder:
-                    num_computed_tokens_of_cp_dcp[req_idx][cp_idx][sp_idx] += 1
-        return num_computed_tokens_of_cp_dcp
 
     def clear(self) -> None:
         for block_table in self.block_tables:

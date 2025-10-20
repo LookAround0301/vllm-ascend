@@ -9,8 +9,9 @@ from vllm.forward_context import ForwardContext, get_forward_context
 
 
 @dataclass
-class AscendCommonLongSequenceMetadata:
-    cp_kv_recover_idx: torch.Tensor = None
+# class AscendCommonLongSequenceMetadata:
+class AscendPrefillContextParallelMetadata:
+    pcp_allgather_restore_idx: torch.Tensor = None
 
     num_actual_tokens_cp_full: Optional[int] = None
 
@@ -103,7 +104,7 @@ class AscendCommonAttentionMetadata:
     cos: torch.Tensor = None
     sin: torch.Tensor = None
 
-    common_long_seq_metadata: Optional[AscendCommonLongSequenceMetadata] = None
+    prefill_context_parallel_metadata: Optional[AscendPrefillContextParallelMetadata] = None
 
 
 def split_decodes_and_prefills(

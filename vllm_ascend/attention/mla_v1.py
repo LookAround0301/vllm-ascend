@@ -36,16 +36,16 @@ from vllm_ascend.compilation.acl_graph import get_graph_params
 from vllm_ascend.multistream.base import MSAttentionMetadataSplitConfig
 from vllm_ascend.multistream.context import get_multistream_comm_context
 from vllm_ascend.multistream.ms_split import model_input_split_v1_mla_attn
-from vllm_ascend.utils import context_parallel_enable
+from vllm_ascend.utils import prefill_context_parallel_enable
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
                                is_enable_nz)
 from vllm_ascend.worker.npu_input_batch import InputBatch
 
-if context_parallel_enable():
-    from vllm.distributed import (get_context_model_parallel_rank,
-                                  get_context_model_parallel_world_size,
-                                  get_cp_group)
+if prefill_context_parallel_enable():
+    from vllm.distributed import (get_prefill_context_model_parallel_rank,
+                                  get_prefill_context_model_parallel_world_size,
+                                  get_pcp_group)
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -103,7 +103,7 @@ class AscendMLAPrefillMetadata:
     chunked_context: Optional[ChunkedContextMetadata] = None
     sin: torch.Tensor = None
     cos: torch.Tensor = None
-    cp_kv_recover_idx: Optional[list[int]] = None
+    pcp_allgather_restore_idx: Optional[list[int]] = None
     q_head_idx: torch.Tensor = None
     q_tail_idx: torch.Tensor = None
     kv_with_q_head_nomask_idx: torch.Tensor = None
@@ -323,9 +323,9 @@ class AscendMLAMetadataBuilder:
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        long_seq_metadata = common_attn_metadata.common_long_seq_metadata
+        long_seq_metadata = common_attn_metadata.prefill_context_parallel_metadata
 
-        cp_kv_recover_idx = long_seq_metadata.cp_kv_recover_idx if long_seq_metadata else None
+        pcp_allgather_restore_idx = long_seq_metadata.pcp_allgather_restore_idx if long_seq_metadata else None
         num_actual_tokens_cp_full = long_seq_metadata.num_actual_tokens_cp_full if long_seq_metadata else None
         num_computed_tokens_of_cp_sp = long_seq_metadata.num_computed_tokens_of_cp_sp if long_seq_metadata else None
         q_head_idx_tensor = long_seq_metadata.q_head_idx_tensor if long_seq_metadata else None
@@ -438,7 +438,7 @@ class AscendMLAMetadataBuilder:
                 chunked_context=chunked_context_metadata,
                 sin=sin,
                 cos=cos,
-                cp_kv_recover_idx=cp_kv_recover_idx,
+                pcp_allgather_restore_idx=pcp_allgather_restore_idx,
                 q_head_idx=q_head_idx_tensor,
                 q_tail_idx=q_tail_idx_tensor,
                 kv_with_q_head_nomask_idx=kv_with_q_head_nomask_idx_tensor,
@@ -621,12 +621,12 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         self.speculative_config = vllm_config.speculative_config
 
-        self.cp_size = get_context_model_parallel_world_size(
-        ) if context_parallel_enable() else 1
-        self.cp_rank = get_context_model_parallel_rank(
-        ) if self.cp_size > 1 else 0
-        self.cp_group = get_cp_group(
-        ).device_group if self.cp_size > 1 else None
+        self.pcp_size = get_prefill_context_model_parallel_world_size(
+        ) if prefill_context_parallel_enable() else 1
+        self.pcp_rank = get_prefill_context_model_parallel_rank(
+        ) if self.pcp_size > 1 else 0
+        self.pcp_group = get_pcp_group(
+        ).device_group if self.pcp_size > 1 else None
 
         self.dcp_size = get_decode_context_model_parallel_world_size()
         self.dcp_rank = get_decode_context_model_parallel_rank(
@@ -1238,7 +1238,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 decode_ql_nope, decode_q_pe = decode_q_no_split.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
             decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
-            decode_slots = attn_metadata.slot_mapping[:num_decode_tokens*self.cp_size:self.cp_size]
+            decode_slots = attn_metadata.slot_mapping[:num_decode_tokens*self.pcp_size:self.pcp_size]
             decode_kv_no_split = kv_no_split[:num_decode_tokens]
             decode_k_pe, decode_k_nope = self.exec_kv_decode(
                 decode_kv_no_split, cos, sin, kv_cache, decode_slots)
@@ -1246,8 +1246,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe)
         # Preprocess for prefill tokens
         if has_prefill:
-            if self.cp_size > 1:
-                num_actual_tokens = (attn_metadata.num_actual_tokens_cp_full -  self.cp_size * num_decode_tokens) // self.cp_size + num_decode_tokens
+            if self.pcp_size > 1:
+                num_actual_tokens = (attn_metadata.num_actual_tokens_cp_full -  self.pcp_size * num_decode_tokens) // self.pcp_size + num_decode_tokens
             prefill_kv_no_split = kv_no_split[
                 num_decode_tokens:num_actual_tokens]
             prefill_q_c = q_c[num_decode_tokens:num_actual_tokens]
@@ -1255,7 +1255,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 .view(-1, self.num_heads, self.qk_head_dim)
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim:]
             prefill_q_nope = prefill_q[..., :self.qk_nope_head_dim]
-            if self.cp_size > 1:
+            if self.pcp_size > 1:
                 cos = attn_metadata.prefill.cos[:num_actual_tokens - num_decode_tokens]
                 sin = attn_metadata.prefill.sin[:num_actual_tokens - num_decode_tokens]
             else:
@@ -1264,7 +1264,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             prefill_slots = attn_metadata.slot_mapping[
                 num_decode_tokens:num_actual_tokens]
             prefill_q_pe = self.rope_single(prefill_q_pe, cos, sin)
-            if self.cp_size > 1:
+            if self.pcp_size > 1:
                 prefill_kv_no_split = kv_no_split[:num_actual_tokens]
                 kv_c, k_pe = prefill_kv_no_split.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -1282,17 +1282,17 @@ class AscendMLAImpl(MLAAttentionImpl):
                 prefill_k_c_normed = kv_c_normed[:num_actual_tokens]
                 prefill_kv_c_k_pe = torch.cat(
                     [prefill_k_c_normed, prefill_k_pe], dim=-1)
-                prefill_kv_c_k_pe = get_cp_group().all_gather(
+                prefill_kv_c_k_pe = get_pcp_group().all_gather(
                     prefill_kv_c_k_pe, 0)
                 prefill_kv_c_k_pe = torch.index_select(
                     prefill_kv_c_k_pe, 0,
-                    attn_metadata.prefill.cp_kv_recover_idx)
-                prefill_kv_c_k_pe = prefill_kv_c_k_pe[num_decode_tokens * self.cp_size:]
+                    attn_metadata.prefill.pcp_allgather_restore_idx)
+                prefill_kv_c_k_pe = prefill_kv_c_k_pe[num_decode_tokens * self.pcp_size:]
                 prefill_k_c_normed, prefill_k_pe = prefill_kv_c_k_pe.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
                 kv_c_normed, k_pe = prefill_k_c_normed, prefill_k_pe
                 prefill_k_c_normed = prefill_k_c_normed.squeeze()
-                slot_mapping = attn_metadata.slot_mapping[self.cp_size * num_decode_tokens :]
+                slot_mapping = attn_metadata.slot_mapping[self.pcp_size * num_decode_tokens :]
                 torch_npu._npu_reshape_and_cache(
                     key=kv_c_normed,
                     value=k_pe,
@@ -1307,7 +1307,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     -1, self.num_heads,
                     self.qk_nope_head_dim + self.v_head_dim).split(
                         [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            if not self.cp_size > 1:
+            if not self.pcp_size > 1:
                 prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0],
                                                  self.num_kv_heads, -1)
             prefill_k_pe = prefill_k_pe.expand(
@@ -1330,8 +1330,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         if attn_metadata is None:
             # Profiling run.
             return output
-        if self.cp_size > 1:
-            num_actual_tokens = attn_metadata.num_actual_tokens_cp_full // self.cp_size
+        if self.pcp_size > 1:
+            num_actual_tokens = attn_metadata.num_actual_tokens_cp_full // self.pcp_size
         else:
             num_actual_tokens = attn_metadata.num_actual_tokens
         assert attn_metadata.num_decodes is not None and \
@@ -1359,7 +1359,7 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
-            if self.cp_size * self.dcp_size > 1:
+            if self.pcp_size * self.dcp_size > 1:
                 output_decode = self._forward_decode_sp(
                     decode_preprocess_res.ql_nope,
                     decode_preprocess_res.q_pe,
@@ -1385,7 +1385,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             # FIX: aicore move should be also placed on the comm stream in dbo,
             # otherwise it may affect the accuracy
             # TODO: use an elegant way to overlap
-            if self.cp_size > 1:
+            if self.pcp_size > 1:
                 output_prefill = self._forward_prefill_cp(
                     prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
                     prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
@@ -1584,9 +1584,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             1).to(torch.uint8).to(q_pe.device)
         seq_mask_sp = torch.where(
             torch.tensor(num_computed_tokens_of_cp_sp[:,
-                                                      self.cp_rank, :]) == 0,
+                                                      self.pcp_rank, :]) == 0,
             0, 1).to(torch.uint8).to(q_pe.device)
-        seq_len = num_computed_tokens_of_cp_sp[:, self.cp_rank, self.dcp_rank]
+        seq_len = num_computed_tokens_of_cp_sp[:, self.pcp_rank, self.dcp_rank]
         seq_len = torch.tensor(seq_len, dtype=torch.int32)
         # npu_multi_head_latent_attention does not support seq_len = 0,
         # update where seq_len == 0 to 1.
@@ -1643,16 +1643,16 @@ class AscendMLAImpl(MLAAttentionImpl):
             attn_output = attn_out_g
             softmax_lse = attn_lse_g
 
-        if self.cp_size > 1:
+        if self.pcp_size > 1:
             # Concat out&lse: [bs,num_heads,v_head_dim] + [bs,num_heads,1] -> [bs,num_heads,v_head_dim+1]
             attn_out_lse = torch.cat([attn_output, softmax_lse], dim=-1)
             # AllGather out&lse within CP group
             attn_out_lse_list = [
-                torch.empty_like(attn_out_lse) for _ in range(self.cp_size)
+                torch.empty_like(attn_out_lse) for _ in range(self.pcp_size)
             ]
             dist.all_gather(attn_out_lse_list,
                             attn_out_lse,
-                            group=self.cp_group)
+                            group=self.pcp_group)
             # Update out&lse
             attn_out_g = None
             attn_lse_g = None
