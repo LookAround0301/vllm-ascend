@@ -535,7 +535,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 self.vllm_config.model_config.logits_processors),
             is_pooling_model=self.is_pooling_model,
             kernel_block_sizes=[[self.vllm_config.cache_config.block_size]],
-            cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+            cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size if prefill_context_parallel_enable() else 1,
         )
         self.num_accepted_tokens = self._make_buffer(self.max_num_reqs,
                                                      dtype=torch.int64)

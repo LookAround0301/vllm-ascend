@@ -30,12 +30,9 @@ import numpy as np
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer, AttentionType)
 from vllm.config import VllmConfig
-from vllm.distributed import (get_prefill_context_model_parallel_rank,
-                              get_prefill_context_model_parallel_world_size,
-                              get_pcp_group,
+from vllm.distributed import (get_dcp_group, 
                               get_decode_context_model_parallel_rank,
-                              get_decode_context_model_parallel_world_size,
-                              get_dcp_group)
+                              get_decode_context_model_parallel_world_size)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.utils import cdiv, direct_register_custom_op
 from vllm.v1.attention.backends.utils import AttentionCGSupport
@@ -49,11 +46,18 @@ from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
 from vllm_ascend.compilation.acl_graph import (get_graph_params,
                                                update_graph_params_workspaces)
 from vllm_ascend.ops.attention import vanilla_chunked_prefill
-from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, aligned_16, is_310p,
-                               nd_to_nz_2d, nd_to_nz_spec, version_check)
-
+from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ,
+                               aligned_16, 
+                               is_310p,
+                               nd_to_nz_2d,
+                               nd_to_nz_spec, 
+                               version_check,
+                               prefill_context_parallel_enable)
 from ..utils import weak_ref_tensors
-
+if prefill_context_parallel_enable():
+    from vllm.distributed import (get_prefill_context_model_parallel_rank,
+                                  get_prefill_context_model_parallel_world_size,
+                                  get_pcp_group)
 
 class AscendAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
@@ -319,7 +323,7 @@ class AscendAttentionMetadataBuilder:
         prefill_metadata = None
         if num_prefills > 0:
             cp_metadata = None
-            common_long_seq_metadata = common_attn_metadata.common_long_seq_metadata
+            common_long_seq_metadata = common_attn_metadata.prefill_context_parallel_metadata
             if common_long_seq_metadata is not None:
                 cp_metadata = AscendCpMetadata(
                     q_head_idx=common_long_seq_metadata.q_head_idx_tensor,
@@ -347,7 +351,7 @@ class AscendAttentionMetadataBuilder:
         # TODO
         decode_metadata = None
         if num_decodes > 0:
-            common_long_seq_metadata = common_attn_metadata.common_long_seq_metadata
+            common_long_seq_metadata = common_attn_metadata.prefill_context_parallel_metadata
             if common_long_seq_metadata is not None:
                 num_computed_tokens_of_cp_sp = common_long_seq_metadata.num_computed_tokens_of_cp_sp
                 num_computed_tokens_of_cp_sp = np.array(num_computed_tokens_of_cp_sp)
@@ -429,10 +433,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.key_cache = None
         self.value_cache = None
         self.torch_npu_check = version_check()
-
-        self.pcp_size = get_prefill_context_model_parallel_world_size()
-        self.pcp_rank = get_prefill_context_model_parallel_rank() if self.pcp_size > 1 else 0
-        self.pcp_group = get_pcp_group().device_group if self.pcp_size > 1 else None
+        self.pcp_size = get_prefill_context_model_parallel_world_size(
+        ) if prefill_context_parallel_enable() else 1
+        self.pcp_rank = get_prefill_context_model_parallel_rank(
+        ) if self.pcp_size > 1 else 0
+        self.pcp_group = get_pcp_group(
+        ).device_group if self.pcp_size > 1 else None
 
         self.dcp_size = get_decode_context_model_parallel_world_size()
         self.dcp_rank = get_decode_context_model_parallel_rank() if self.dcp_size > 1 else 0
