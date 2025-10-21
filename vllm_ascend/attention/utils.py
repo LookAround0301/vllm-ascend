@@ -13,9 +13,9 @@ from vllm.forward_context import ForwardContext, get_forward_context
 class AscendPrefillContextParallelMetadata:
     pcp_allgather_restore_idx: torch.Tensor = None
 
-    num_actual_tokens_cp_full: Optional[int] = None
+    num_actual_tokens_pcp_padded: Optional[int] = None
 
-    num_computed_tokens_of_cp_sp: Optional[list[Optional[list[Optional[
+    num_computed_tokens_of_pcp_dcp: Optional[list[Optional[list[Optional[
         list[int]]]]]] = None
 
     q_head_idx_tensor: torch.Tensor = None
@@ -38,7 +38,7 @@ class AscendPrefillContextParallelMetadata:
 
     q_full_idx: torch.Tensor = None
 
-    cp_prefill_mask: torch.Tensor = None
+    pcp_prefill_mask: torch.Tensor = None
 
 
 @dataclass
