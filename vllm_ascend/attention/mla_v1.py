@@ -114,7 +114,7 @@ class AscendMLAPrefillMetadata:
     head_attn_nomask_seqlens: torch.Tensor = None
     tail_attn_nomask_seqlens: torch.Tensor = None
     q_full_idx: torch.Tensor = None
-    cp_prefill_mask: torch.Tensor = None
+    pcp_prefill_mask: torch.Tensor = None
 
 
 @dataclass
@@ -130,7 +130,7 @@ class AscendMLADecodeMetadata:
     attn_mask: Optional[torch.Tensor] = None
     sin: torch.Tensor = None
     cos: torch.Tensor = None
-    num_computed_tokens_of_cp_sp: Optional[list[Optional[list[Optional[
+    num_computed_tokens_of_pcp_dcp: Optional[list[Optional[list[Optional[
         list[int]]]]]] = None
 
 
@@ -149,7 +149,7 @@ class AscendMLAMetadata:
     # |-------------------- seq_len ---------------------|
     #                                   |-- query_len ---|
 
-    num_actual_tokens_cp_full: int
+    num_actual_tokens_pcp_padded: int
     num_actual_tokens: int  # Number of tokens excluding padding.
     slot_mapping: torch.Tensor
     query_start_loc: torch.Tensor
@@ -326,8 +326,8 @@ class AscendMLAMetadataBuilder:
         long_seq_metadata = common_attn_metadata.prefill_context_parallel_metadata
 
         pcp_allgather_restore_idx = long_seq_metadata.pcp_allgather_restore_idx if long_seq_metadata else None
-        num_actual_tokens_cp_full = long_seq_metadata.num_actual_tokens_cp_full if long_seq_metadata else None
-        num_computed_tokens_of_cp_sp = long_seq_metadata.num_computed_tokens_of_cp_sp if long_seq_metadata else None
+        num_actual_tokens_pcp_padded = long_seq_metadata.num_actual_tokens_pcp_padded if long_seq_metadata else None
+        num_computed_tokens_of_pcp_dcp = long_seq_metadata.num_computed_tokens_of_pcp_dcp if long_seq_metadata else None
         q_head_idx_tensor = long_seq_metadata.q_head_idx_tensor if long_seq_metadata else None
         q_tail_idx_tensor = long_seq_metadata.q_tail_idx_tensor if long_seq_metadata else None
         kv_with_q_head_nomask_idx_tensor = long_seq_metadata.kv_with_q_head_nomask_idx_tensor if long_seq_metadata else None
@@ -338,7 +338,7 @@ class AscendMLAMetadataBuilder:
         head_attn_nomask_seqlens = long_seq_metadata.head_attn_nomask_seqlens if long_seq_metadata else None
         tail_attn_nomask_seqlens = long_seq_metadata.tail_attn_nomask_seqlens if long_seq_metadata else None
         q_full_idx = long_seq_metadata.q_full_idx if long_seq_metadata else None
-        cp_prefill_mask = long_seq_metadata.cp_prefill_mask if long_seq_metadata else None
+        pcp_prefill_mask = long_seq_metadata.pcp_prefill_mask if long_seq_metadata else None
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = \
             split_decodes_and_prefills(common_attn_metadata, decode_threshold=self.decode_threshold)
@@ -354,10 +354,10 @@ class AscendMLAMetadataBuilder:
         input_positions = common_attn_metadata.positions[:
                                                          num_actual_tokens].long(
         )
-        if num_actual_tokens_cp_full is None:
-            num_actual_tokens_cp_full = num_actual_tokens
+        if num_actual_tokens_pcp_padded is None:
+            num_actual_tokens_pcp_padded = num_actual_tokens
 
-        slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens_cp_full]
+        slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens_pcp_padded]
 
         if self.cos_cache is None:
             self.cos_cache = model.model.layers[
@@ -449,7 +449,7 @@ class AscendMLAMetadataBuilder:
                 head_attn_nomask_seqlens=head_attn_nomask_seqlens,
                 tail_attn_nomask_seqlens=tail_attn_nomask_seqlens,
                 q_full_idx=q_full_idx,
-                cp_prefill_mask=cp_prefill_mask
+                pcp_prefill_mask=pcp_prefill_mask
             )
 
         decode_metadata = None
@@ -485,7 +485,7 @@ class AscendMLAMetadataBuilder:
                     actual_seq_lengths_q=actual_seq_lengths_q,
                     sin=sin,
                     cos=cos,
-                    num_computed_tokens_of_cp_sp=num_computed_tokens_of_cp_sp)
+                    num_computed_tokens_of_pcp_dcp=num_computed_tokens_of_pcp_dcp)
             else:
                 cos[:num_decode_tokens,
                     ...] = self.cos_cache[input_positions].unsqueeze(
@@ -504,10 +504,10 @@ class AscendMLAMetadataBuilder:
                     actual_seq_lengths_q=actual_seq_lengths_q,
                     sin=sin[:num_decode_tokens, ...],
                     cos=cos[:num_decode_tokens, ...],
-                    num_computed_tokens_of_cp_sp=num_computed_tokens_of_cp_sp)
+                    num_computed_tokens_of_pcp_dcp=num_computed_tokens_of_pcp_dcp)
 
         return self.metadata_cls(  # type: ignore
-            num_actual_tokens_cp_full=num_actual_tokens_cp_full,
+            num_actual_tokens_pcp_padded=num_actual_tokens_pcp_padded,
             num_input_tokens=common_attn_metadata.num_input_tokens,
             num_actual_tokens=num_actual_tokens,
             query_lens=query_lens.tolist(),
@@ -1247,7 +1247,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         # Preprocess for prefill tokens
         if has_prefill:
             if self.pcp_size > 1:
-                num_actual_tokens = (attn_metadata.num_actual_tokens_cp_full -  self.pcp_size * num_decode_tokens) // self.pcp_size + num_decode_tokens
+                num_actual_tokens = (attn_metadata.num_actual_tokens_pcp_padded -  self.pcp_size * num_decode_tokens) // self.pcp_size + num_decode_tokens
             prefill_kv_no_split = kv_no_split[
                 num_decode_tokens:num_actual_tokens]
             prefill_q_c = q_c[num_decode_tokens:num_actual_tokens]
@@ -1331,7 +1331,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             # Profiling run.
             return output
         if self.pcp_size > 1:
-            num_actual_tokens = attn_metadata.num_actual_tokens_cp_full // self.pcp_size
+            num_actual_tokens = attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size
         else:
             num_actual_tokens = attn_metadata.num_actual_tokens
         assert attn_metadata.num_decodes is not None and \
@@ -1360,7 +1360,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
             if self.pcp_size * self.dcp_size > 1:
-                output_decode = self._forward_decode_sp(
+                output_decode = self._forward_decode_pcp_dcp(
                     decode_preprocess_res.ql_nope,
                     decode_preprocess_res.q_pe,
                     decode_preprocess_res.k_nope,
@@ -1451,7 +1451,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_mask_seqlens = attn_metadata.prefill.attn_mask_seqlens
         head_attn_nomask_seqlens = attn_metadata.prefill.head_attn_nomask_seqlens
         tail_attn_nomask_seqlens = attn_metadata.prefill.tail_attn_nomask_seqlens
-        mask = attn_metadata.prefill.cp_prefill_mask
+        mask = attn_metadata.prefill.pcp_prefill_mask
 
         output_head = self._attention_with_mask_and_nomask(
             q_nope=torch.index_select(q_nope, 0, q_head_idx),
@@ -1551,7 +1551,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                    softmax_lse=attn_lse)
         return attn_output
 
-    def _forward_decode_sp(
+    def _forward_decode_pcp_dcp(
         self,
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
@@ -1576,17 +1576,17 @@ class AscendMLAImpl(MLAAttentionImpl):
                          self.qk_rope_head_dim)
         q_nope = q_nope.view(num_tokens, num_heads, -1)
         q_pe = q_pe.view(num_tokens, num_heads, -1)
-        # use cp & sp split computed token nums from scheduler to compute actual seq_len and seq_mask
-        num_computed_tokens_of_cp_sp = np.array(
-            decode_meta.num_computed_tokens_of_cp_sp)[:attn_metadata.num_decodes]  # [bs, cp_size, sp_size]
-        seq_mask_cp = torch.where(
-            torch.tensor(num_computed_tokens_of_cp_sp.sum(2)) == 0, 0,
+        # use pcp & dcp split computed token nums from scheduler to compute actual seq_len and seq_mask
+        num_computed_tokens_of_pcp_dcp = np.array(
+            decode_meta.num_computed_tokens_of_pcp_dcp)[:attn_metadata.num_decodes]  # [bs, pcp_size, dcp_size]
+        seq_mask_pcp = torch.where(
+            torch.tensor(num_computed_tokens_of_pcp_dcp.sum(2)) == 0, 0,
             1).to(torch.uint8).to(q_pe.device)
-        seq_mask_sp = torch.where(
-            torch.tensor(num_computed_tokens_of_cp_sp[:,
+        seq_mask_dcp = torch.where(
+            torch.tensor(num_computed_tokens_of_pcp_dcp[:,
                                                       self.pcp_rank, :]) == 0,
             0, 1).to(torch.uint8).to(q_pe.device)
-        seq_len = num_computed_tokens_of_cp_sp[:, self.pcp_rank, self.dcp_rank]
+        seq_len = num_computed_tokens_of_pcp_dcp[:, self.pcp_rank, self.dcp_rank]
         seq_len = torch.tensor(seq_len, dtype=torch.int32)
         # npu_multi_head_latent_attention does not support seq_len = 0,
         # update where seq_len == 0 to 1.
@@ -1639,14 +1639,14 @@ class AscendMLAImpl(MLAAttentionImpl):
                                                      dim=-1)
                 attn_out_g, attn_lse_g = self._update_out_and_lse(
                     attn_out_g, attn_lse_g, attn_out_l, attn_lse_l,
-                    seq_mask_sp[:, i])
+                    seq_mask_dcp[:, i])
             attn_output = attn_out_g
             softmax_lse = attn_lse_g
 
         if self.pcp_size > 1:
             # Concat out&lse: [bs,num_heads,v_head_dim] + [bs,num_heads,1] -> [bs,num_heads,v_head_dim+1]
             attn_out_lse = torch.cat([attn_output, softmax_lse], dim=-1)
-            # AllGather out&lse within CP group
+            # AllGather out&lse within PCP group
             attn_out_lse_list = [
                 torch.empty_like(attn_out_lse) for _ in range(self.pcp_size)
             ]
@@ -1662,7 +1662,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                                      dim=-1)
                 attn_out_g, attn_lse_g = self._update_out_and_lse(
                     attn_out_g, attn_lse_g, attn_out_l, attn_lse_l,
-                    seq_mask_cp[:, i])
+                    seq_mask_pcp[:, i])
             attn_output = attn_out_g
         attn_output = attn_output.reshape(
             [num_tokens, self.num_heads * self.kv_lora_rank])
