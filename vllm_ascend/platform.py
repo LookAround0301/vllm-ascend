@@ -325,8 +325,9 @@ class NPUPlatform(Platform):
             vllm_config.scheduler_config.SLO_limits_for_dynamic_batch = ascend_config.SLO_limits_for_dynamic_batch
 
         if vllm_config.kv_transfer_config is not None and \
+            prefill_context_parallel_enable() and \
             cache_config.block_size != parallel_config.cp_kv_cache_interleave_size and \
-            parallel_config.decode_context_parallel_size * parallel_config.context_parallel_size > 1:
+            parallel_config.decode_context_parallel_size * parallel_config.prefill_context_parallel_size > 1:
             raise AssertionError(
                 f"cp_kv_cache_interleave_size({parallel_config.cp_kv_cache_interleave_size}) "
                 f"and block_size({cache_config.block_size}) "
