@@ -77,6 +77,20 @@ class AscendMLABackend(AttentionBackend):
     def get_impl_cls() -> Type["MLAAttentionImpl"]:
         return AscendMLAImpl
 
+@dataclass
+class AscendPCPMetadata:
+    q_head_idx: torch.Tensor = None
+    q_tail_idx: torch.Tensor = None
+    kv_with_q_head_nomask_idx: torch.Tensor = None
+    kv_with_q_head_mask_idx: torch.Tensor = None
+    kv_with_q_tail_nomask_idx: torch.Tensor = None
+    kv_with_q_tail_mask_idx: torch.Tensor = None
+    attn_mask_seqlens: torch.Tensor = None
+    head_attn_nomask_seqlens: torch.Tensor = None
+    tail_attn_nomask_seqlens: torch.Tensor = None
+    q_full_idx: torch.Tensor = None
+    pcp_prefill_mask: torch.Tensor = None
+    pcp_allgather_restore_idx: Optional[list[int]] = None
 
 @dataclass
 class AscendMLAPrefillMetadata:
@@ -105,18 +119,7 @@ class AscendMLAPrefillMetadata:
     chunked_context: Optional[ChunkedContextMetadata] = None
     sin: torch.Tensor = None
     cos: torch.Tensor = None
-    pcp_allgather_restore_idx: Optional[list[int]] = None
-    q_head_idx: torch.Tensor = None
-    q_tail_idx: torch.Tensor = None
-    kv_with_q_head_nomask_idx: torch.Tensor = None
-    kv_with_q_head_mask_idx: torch.Tensor = None
-    kv_with_q_tail_nomask_idx: torch.Tensor = None
-    kv_with_q_tail_mask_idx: torch.Tensor = None
-    attn_mask_seqlens: torch.Tensor = None
-    head_attn_nomask_seqlens: torch.Tensor = None
-    tail_attn_nomask_seqlens: torch.Tensor = None
-    q_full_idx: torch.Tensor = None
-    pcp_prefill_mask: torch.Tensor = None
+    pcp_metadata: Optional[AscendPCPMetadata] = None
 
 
 @dataclass
@@ -327,20 +330,8 @@ class AscendMLAMetadataBuilder:
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         long_seq_metadata = common_attn_metadata.prefill_context_parallel_metadata
 
-        pcp_allgather_restore_idx = long_seq_metadata.pcp_allgather_restore_idx if long_seq_metadata else None
         num_actual_tokens_pcp_padded = long_seq_metadata.num_actual_tokens_pcp_padded if long_seq_metadata else None
         num_computed_tokens_of_pcp_dcp = long_seq_metadata.num_computed_tokens_of_pcp_dcp if long_seq_metadata else None
-        q_head_idx_tensor = long_seq_metadata.q_head_idx_tensor if long_seq_metadata else None
-        q_tail_idx_tensor = long_seq_metadata.q_tail_idx_tensor if long_seq_metadata else None
-        kv_with_q_head_nomask_idx_tensor = long_seq_metadata.kv_with_q_head_nomask_idx_tensor if long_seq_metadata else None
-        kv_with_q_head_mask_idx_tensor = long_seq_metadata.kv_with_q_head_mask_idx_tensor if long_seq_metadata else None
-        kv_with_q_tail_nomask_idx_tensor = long_seq_metadata.kv_with_q_tail_nomask_idx_tensor if long_seq_metadata else None
-        kv_with_q_tail_mask_idx_tensor = long_seq_metadata.kv_with_q_tail_mask_idx_tensor if long_seq_metadata else None
-        attn_mask_seqlens = long_seq_metadata.attn_mask_seqlens if long_seq_metadata else None
-        head_attn_nomask_seqlens = long_seq_metadata.head_attn_nomask_seqlens if long_seq_metadata else None
-        tail_attn_nomask_seqlens = long_seq_metadata.tail_attn_nomask_seqlens if long_seq_metadata else None
-        q_full_idx = long_seq_metadata.q_full_idx if long_seq_metadata else None
-        pcp_prefill_mask = long_seq_metadata.pcp_prefill_mask if long_seq_metadata else None
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = \
             split_decodes_and_prefills(common_attn_metadata, decode_threshold=self.decode_threshold)
@@ -380,6 +371,30 @@ class AscendMLAMetadataBuilder:
         prefill_metadata = None
         chunked_context_metadata = None
         if num_prefills > 0:
+            pcp_metadata = None
+            common_long_seq_metadata = common_attn_metadata.prefill_context_parallel_metadata
+            if common_long_seq_metadata is not None:
+                pcp_metadata = AscendPCPMetadata(
+                    q_head_idx=common_long_seq_metadata.q_head_idx_tensor,
+                    q_tail_idx=common_long_seq_metadata.q_tail_idx_tensor,
+                    kv_with_q_head_nomask_idx=common_long_seq_metadata.
+                    kv_with_q_head_nomask_idx_tensor,
+                    kv_with_q_head_mask_idx=common_long_seq_metadata.
+                    kv_with_q_head_mask_idx_tensor,
+                    kv_with_q_tail_nomask_idx=common_long_seq_metadata.
+                    kv_with_q_tail_nomask_idx_tensor,
+                    kv_with_q_tail_mask_idx=common_long_seq_metadata.
+                    kv_with_q_tail_mask_idx_tensor,
+                    attn_mask_seqlens=common_long_seq_metadata.
+                    attn_mask_seqlens,
+                    head_attn_nomask_seqlens=common_long_seq_metadata.
+                    head_attn_nomask_seqlens,
+                    tail_attn_nomask_seqlens=common_long_seq_metadata.
+                    tail_attn_nomask_seqlens,
+                    q_full_idx=common_long_seq_metadata.q_full_idx,
+                    pcp_prefill_mask=common_long_seq_metadata.pcp_prefill_mask,
+                    pcp_allgather_restore_idx=long_seq_metadata.pcp_allgather_restore_idx)
+
             reqs_start = num_decodes  # prefill_start
             tokens_start = num_decode_tokens
             max_query_len = query_lens[reqs_start:].max().item()
@@ -440,18 +455,7 @@ class AscendMLAMetadataBuilder:
                 chunked_context=chunked_context_metadata,
                 sin=sin,
                 cos=cos,
-                pcp_allgather_restore_idx=pcp_allgather_restore_idx,
-                q_head_idx=q_head_idx_tensor,
-                q_tail_idx=q_tail_idx_tensor,
-                kv_with_q_head_nomask_idx=kv_with_q_head_nomask_idx_tensor,
-                kv_with_q_head_mask_idx=kv_with_q_head_mask_idx_tensor,
-                kv_with_q_tail_nomask_idx=kv_with_q_tail_nomask_idx_tensor,
-                kv_with_q_tail_mask_idx=kv_with_q_tail_mask_idx_tensor,
-                attn_mask_seqlens=attn_mask_seqlens,
-                head_attn_nomask_seqlens=head_attn_nomask_seqlens,
-                tail_attn_nomask_seqlens=tail_attn_nomask_seqlens,
-                q_full_idx=q_full_idx,
-                pcp_prefill_mask=pcp_prefill_mask
+                pcp_metadata=pcp_metadata,
             )
 
         decode_metadata = None
@@ -644,7 +648,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         ).device_group if self.tp_size > 1 else None
 
     def _v_up_proj(self, x):
-        if self.W_UV.shape[0] * self.W_UV.shape[1] < 65536:
+        if self.W_UV.shape[0] * self.W_UV.shape[1] < 65536 and not self.dcp_size * self.pcp_size > 1:
             x = x.view(-1, self.num_heads, self.kv_lora_rank)
             x = torch_npu.npu_transpose_batchmatmul(x,
                                                     self.W_UV,
@@ -1144,7 +1148,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         else:
             attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                 q_nope, k_nope, k_nope, **common_kwargs)
-
         current_ms_metadata = get_multistream_comm_context()
         if current_ms_metadata is None:
             return self._v_up_proj(attn_output)
@@ -1315,7 +1318,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     prefill_kv_c_k_pe, 0)
                 prefill_kv_c_k_pe = torch.index_select(
                     prefill_kv_c_k_pe, 0,
-                    attn_metadata.prefill.pcp_allgather_restore_idx)
+                    attn_metadata.prefill.pcp_metadata.pcp_allgather_restore_idx)
                 prefill_kv_c_k_pe = prefill_kv_c_k_pe[num_decode_tokens * self.pcp_size:]
                 prefill_k_c_normed, prefill_k_pe = prefill_kv_c_k_pe.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -1473,18 +1476,19 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_metadata: AscendMLAMetadata,
     ) -> torch.Tensor:
         assert attn_metadata.prefill is not None
+        assert attn_metadata.prefill.pcp_metadata is not None
         num_tokens = q_nope.size(0)
         # Use precomputed indices from the metadata (already converted to tensors and on device)
-        q_head_idx = attn_metadata.prefill.q_head_idx
-        q_tail_idx = attn_metadata.prefill.q_tail_idx
-        kv_with_q_head_nomask_idx = attn_metadata.prefill.kv_with_q_head_nomask_idx
-        kv_with_q_head_mask_idx = attn_metadata.prefill.kv_with_q_head_mask_idx
-        kv_with_q_tail_nomask_idx = attn_metadata.prefill.kv_with_q_tail_nomask_idx
-        kv_with_q_tail_mask_idx = attn_metadata.prefill.kv_with_q_tail_mask_idx
-        attn_mask_seqlens = attn_metadata.prefill.attn_mask_seqlens
-        head_attn_nomask_seqlens = attn_metadata.prefill.head_attn_nomask_seqlens
-        tail_attn_nomask_seqlens = attn_metadata.prefill.tail_attn_nomask_seqlens
-        mask = attn_metadata.prefill.pcp_prefill_mask
+        q_head_idx = attn_metadata.prefill.pcp_metadata.q_head_idx
+        q_tail_idx = attn_metadata.prefill.pcp_metadata.q_tail_idx
+        kv_with_q_head_nomask_idx = attn_metadata.prefill.pcp_metadata.kv_with_q_head_nomask_idx
+        kv_with_q_head_mask_idx = attn_metadata.prefill.pcp_metadata.kv_with_q_head_mask_idx
+        kv_with_q_tail_nomask_idx = attn_metadata.prefill.pcp_metadata.kv_with_q_tail_nomask_idx
+        kv_with_q_tail_mask_idx = attn_metadata.prefill.pcp_metadata.kv_with_q_tail_mask_idx
+        attn_mask_seqlens = attn_metadata.prefill.pcp_metadata.attn_mask_seqlens
+        head_attn_nomask_seqlens = attn_metadata.prefill.pcp_metadata.head_attn_nomask_seqlens
+        tail_attn_nomask_seqlens = attn_metadata.prefill.pcp_metadata.tail_attn_nomask_seqlens
+        mask = attn_metadata.prefill.pcp_metadata.pcp_prefill_mask
 
         output_head = self._attention_with_mask_and_nomask(
             q_nope=torch.index_select(q_nope, 0, q_head_idx),
@@ -1510,7 +1514,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             attn_nomask_seqlens=tail_attn_nomask_seqlens,
             mask=mask)
 
-        q_full_idx = attn_metadata.prefill.q_full_idx
+        q_full_idx = attn_metadata.prefill.pcp_metadata.q_full_idx
         output = torch.index_select(
             torch.cat([output_head, output_tail], dim=0), 0, q_full_idx)
 
@@ -1697,9 +1701,6 @@ class AscendMLAImpl(MLAAttentionImpl):
                     attn_out_g, attn_lse_g, attn_out_l, attn_lse_l,
                     seq_mask_pcp[:, i])
             attn_output = attn_out_g
-        attn_output = attn_output.reshape(
-            [num_tokens, self.num_heads * self.kv_lora_rank])
-        # out = self.o_proj(attn_output, is_prefill=False)[0]
         current_ms_metadata = get_multistream_comm_context()
         if current_ms_metadata is None:
             return self._v_up_proj(attn_output)
