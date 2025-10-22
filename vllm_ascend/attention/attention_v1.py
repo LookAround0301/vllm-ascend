@@ -214,7 +214,7 @@ class AscendMetadata:
 
     prefill: Optional[AscendMetadataForPrefill] = None
 
-    decode: Optional[AscendMetadataForDecode] = None
+    decode_meta: Optional[AscendMetadataForDecode] = None
 
 
 class AscendAttentionMetadataBuilder:
@@ -374,7 +374,7 @@ class AscendAttentionMetadataBuilder:
             num_prefills=num_prefills,
             num_decodes=num_decodes,
             prefill=prefill_metadata,
-            decode=decode_metadata)
+            decode_meta=decode_metadata)
         return attn_metadata
 
     def build_for_graph_capture(
@@ -854,7 +854,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             softmax_lse_flag=True,
             block_table=attn_metadata.block_tables,
             block_size=self.key_cache.shape[1],
-            actual_seq_lengths_kv=attn_metadata.decode.
+            actual_seq_lengths_kv=attn_metadata.decode_meta.
             num_computed_tokens_of_pcp_dcp[:, self.pcp_rank, self.dcp_rank],
         )
 
