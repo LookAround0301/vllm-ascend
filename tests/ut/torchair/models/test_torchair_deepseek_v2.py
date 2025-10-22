@@ -131,6 +131,7 @@ def mock_distributed():
             patch.dict("vllm_ascend.distributed.parallel_state.__dict__", _MC2=ep_group):
         yield
 
+
 @pytest.fixture
 def mock_forward_context():
     forward_context = Mock(in_profile_run=False, with_prefill=False)
