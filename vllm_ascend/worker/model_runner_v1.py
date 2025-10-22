@@ -3846,6 +3846,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         num_decodes = sum(self.input_batch.num_computed_tokens_cpu[:num_reqs]
                           >= self.input_batch.num_prompt_tokens[:num_reqs])
         num_actual_tokens_pcp_padded = total_num_scheduled_tokens * self.pcp_size
+        num_prefills = num_reqs - num_decodes
         long_seq_metadata = None
         if self.pcp_size * self.dcp_size > 1:
             long_seq_metadata = AscendPrefillContextParallelMetadata(
@@ -3953,8 +3954,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                    device=self.device,
                                    dtype=self.dtype), 1)
                 else:
+                    max_seq_len = max(seq_lens, default=0)
                     pcp_prefill_mask = torch.triu(
-                        torch.full((2048, 2048),
+                        torch.full((num_prefills, max_seq_len, max_seq_len),
                                    True,
                                    device=self.device,
                                    dtype=torch.bool), 1)
