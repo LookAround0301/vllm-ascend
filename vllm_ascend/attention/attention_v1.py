@@ -23,9 +23,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 import torch_npu
-
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer, AttentionType)
 from vllm.config import VllmConfig
@@ -41,15 +39,14 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          maybe_save_kv_layer_to_connector,
                                          split_decodes_and_prefills,
-                                         wait_for_kv_layer_from_connector
-                                         )
+                                         wait_for_kv_layer_from_connector)
 from vllm_ascend.compilation.acl_graph import (get_graph_params,
                                                update_graph_params_workspaces)
 from vllm_ascend.ops.attention import vanilla_chunked_prefill
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, aligned_16, is_310p,
                                nd_to_nz_2d, nd_to_nz_spec,
-                               prefill_context_parallel_enable, version_check
-                               )
+                               prefill_context_parallel_enable, version_check)
+
 from ..utils import weak_ref_tensors
 
 if prefill_context_parallel_enable():
@@ -293,7 +290,7 @@ class AscendAttentionMetadataBuilder:
                            device=seq_lens.device)
             ])
             block_table_padding = torch.zeros(
-                (padded_num_tokens,) + block_table.shape[1:],
+                (padded_num_tokens, ) + block_table.shape[1:],
                 dtype=block_table.dtype,
                 device=block_table.device)
             block_table = torch.cat([block_table, block_table_padding], dim=0)
@@ -885,7 +882,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_out_split_dcp, attn_lse_split_dcp = torch.split(
                 attn_out_lse_split_dcp, [self.head_size, 1], dim=-1)
             attn_out, attn_lse = self._update_out_and_lse(
-                attn_out_split_dcp,attn_lse_split_dcp)
+                attn_out_split_dcp, attn_lse_split_dcp)
         if self.pcp_size > 1:
             # 2. Concat out&lse: [bs,num_heads,head_size] + [bs,num_heads,1] -> [bs,num_heads,head_size+1]
             attn_out_lse = torch.cat([attn_out, attn_lse], dim=-1)
@@ -1010,14 +1007,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         key_cache=self.key_cache,
                         value_cache=self.value_cache,
                         slot_indices=attn_metadata.
-                                     slot_mapping[self.pcp_size *
-                                                  num_decode_tokens:attn_metadata.
-                                                  num_actual_tokens_pcp_padded])
+                        slot_mapping[self.pcp_size *
+                                     num_decode_tokens:attn_metadata.
+                                     num_actual_tokens_pcp_padded])
 
             if self.pcp_size * self.dcp_size > 1:
                 output = self._forward_pcp_dcp(query, key, value,
                                                attn_metadata, output)
-
 
             elif attn_type == AttentionType.ENCODER_ONLY:
                 cum_seq_len = attn_metadata.query_start_loc[1:].tolist()
@@ -1063,8 +1059,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         return output.view(num_tokens, self.hidden_size)
 
     def _forward_pcp_dcp(self, query: torch.Tensor, key: torch.Tensor,
-        value: torch.Tensor, attn_metadata: AscendMetadata,
-        output: Optional[torch.Tensor]) -> torch.Tensor:
+                         value: torch.Tensor, attn_metadata: AscendMetadata,
+                         output: Optional[torch.Tensor]) -> torch.Tensor:
         assert attn_metadata is not None
         has_decode = attn_metadata.num_decodes > 0
         has_prefill = attn_metadata.num_prefills > 0
@@ -1072,7 +1068,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if output is None: raise ValueError("Output buffer is required")
         if has_decode:
             decode_query = query[:num_decode_tokens]
-            output_decode = self._forward_decode_pcp_dcp(decode_query, attn_metadata)
+            output_decode = self._forward_decode_pcp_dcp(
+                decode_query, attn_metadata)
             output[:num_decode_tokens] = output_decode
         if has_prefill:
             prefill_query = query[num_decode_tokens:]
@@ -1082,7 +1079,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 output_prefill = self._forward_prefill_cp(
                     prefill_query, key, value, attn_metadata)
             else:
-                max_prefill_seq_len = attn_metadata.seq_lens[attn_metadata.num_decode_tokens:].max().item()
+                max_prefill_seq_len = attn_metadata.seq_lens[
+                    attn_metadata.num_decode_tokens:].max().item()
                 if attn_metadata.attn_mask is not None:
                     attn_metadata.attn_mask = attn_metadata.attn_mask[:
                                                                       max_prefill_seq_len, :
