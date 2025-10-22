@@ -175,6 +175,7 @@ class TestAscendAttentionMetadataBuilder(TestBase):
 
 
 class TestAscendAttentionBackendImpl(TestBase):
+
     @patch('vllm.distributed.parallel_state.get_dcp_group')
     @patch('vllm.distributed.parallel_state._DCP',
            new_callable=lambda: MagicMock(spec=GroupCoordinator))
@@ -608,8 +609,8 @@ class TestAscendAttentionBackendImpl(TestBase):
     @patch('torch_npu._npu_reshape_and_cache')
     @patch('vllm_ascend.attention.attention_v1.vanilla_chunked_prefill')
     def test_forward_head_size_192(self, mock_vanilla_prefill,
-                                   mock_npu_reshape_and_cache, 
-                                   mock_is_310p, mock_version):
+                                   mock_npu_reshape_and_cache, mock_is_310p,
+                                   mock_version):
         """Test forward pass when head_size is 192"""
 
         self.impl.head_size = 192
@@ -645,7 +646,7 @@ class TestAscendAttentionBackendImpl(TestBase):
     @patch('torch_npu._npu_reshape_and_cache')
     @patch('torch_npu._npu_paged_attention_splitfuse')
     def test_forward_normal_v1_situation(self, mock_paged_attention,
-                                         mock_npu_reshape_and_cache, 
+                                         mock_npu_reshape_and_cache,
                                          mock_version):
         """Test forward pass in normal V1 situation"""
         query = torch.randn(10, 8 * 64)
@@ -676,7 +677,6 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_paged_attention.assert_called_once()
         assert output.shape == (10, 8 * 64)
 
-
     @patch('torch.version')
     @patch('torch_npu.npu_format_cast')
     @patch('torch_npu._npu_reshape_and_cache')
@@ -684,8 +684,7 @@ class TestAscendAttentionBackendImpl(TestBase):
     @patch('vllm_ascend.attention.attention_v1.is_310p', return_value=True)
     def test_forward_310p_device(self, mock_is_310p, mock_paged_attention,
                                  mock_npu_reshape_and_cache,
-                                 mock_npu_format_cast, mock_version
-                                 ):
+                                 mock_npu_format_cast, mock_version):
         """Test forward pass on 310P device"""
         query = torch.randn(10, 8 * 64)
         key = torch.randn(10, 8 * 64)
