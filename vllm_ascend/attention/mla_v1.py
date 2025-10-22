@@ -396,8 +396,7 @@ class AscendMLAMetadataBuilder:
                     q_full_idx=common_long_seq_metadata.q_full_idx,
                     pcp_prefill_mask=common_long_seq_metadata.pcp_prefill_mask,
                     pcp_allgather_restore_idx=long_seq_metadata.
-                    pcp_allgather_restore_idx
-                    if long_seq_metadata else None)
+                    pcp_allgather_restore_idx if long_seq_metadata else None)
 
             reqs_start = num_decodes  # prefill_start
             tokens_start = num_decode_tokens
