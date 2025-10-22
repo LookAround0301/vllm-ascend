@@ -4,20 +4,20 @@ from typing import (TYPE_CHECKING, ClassVar, NamedTuple, Optional, Tuple, Type,
 
 import numpy as np
 import torch
-import torch_npu
-from torch import nn
 import torch.distributed as dist
 import torch.nn.functional as F
+import torch_npu
+from torch import nn
 from vllm.attention.backends.abstract import (AttentionBackend,
                                               AttentionMetadata,
                                               MLAAttentionImpl)
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size,
-                              get_tp_group,
+from vllm.distributed import (get_dcp_group,
                               get_decode_context_model_parallel_rank,
                               get_decode_context_model_parallel_world_size,
-                              get_dcp_group)
+                              get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              get_tp_group)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.linear import (LinearBase,
@@ -37,17 +37,16 @@ from vllm_ascend.compilation.acl_graph import get_graph_params
 from vllm_ascend.multistream.base import MSAttentionMetadataSplitConfig
 from vllm_ascend.multistream.context import get_multistream_comm_context
 from vllm_ascend.multistream.ms_split import model_input_split_v1_mla_attn
-from vllm_ascend.utils import prefill_context_parallel_enable
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
-                               is_enable_nz)
+                               is_enable_nz, prefill_context_parallel_enable)
 from vllm_ascend.worker.npu_input_batch import InputBatch
 
 if prefill_context_parallel_enable():
-    from vllm.distributed import (get_prefill_context_model_parallel_rank,
-                                  get_prefill_context_model_parallel_world_size,
-                                  get_pcp_group)
+    from vllm.distributed import (
+        get_pcp_group, get_prefill_context_model_parallel_rank,
+        get_prefill_context_model_parallel_world_size)
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -77,6 +76,7 @@ class AscendMLABackend(AttentionBackend):
     def get_impl_cls() -> Type["MLAAttentionImpl"]:
         return AscendMLAImpl
 
+
 @dataclass
 class AscendPCPMetadata:
     q_head_idx: torch.Tensor = None
@@ -91,6 +91,7 @@ class AscendPCPMetadata:
     q_full_idx: torch.Tensor = None
     pcp_prefill_mask: torch.Tensor = None
     pcp_allgather_restore_idx: Optional[list[int]] = None
+
 
 @dataclass
 class AscendMLAPrefillMetadata:
@@ -346,11 +347,12 @@ class AscendMLAMetadataBuilder:
         block_table = (common_attn_metadata.block_table_tensor[:num_reqs])
         input_positions = common_attn_metadata.positions[:
                                                          num_actual_tokens].long(
-        )
+                                                         )
         if num_actual_tokens_pcp_padded is None:
             num_actual_tokens_pcp_padded = num_actual_tokens
 
-        slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens_pcp_padded]
+        slot_mapping = common_attn_metadata.slot_mapping[:
+                                                         num_actual_tokens_pcp_padded]
 
         if self.cos_cache is None:
             self.cos_cache = model.model.layers[
@@ -393,7 +395,8 @@ class AscendMLAMetadataBuilder:
                     tail_attn_nomask_seqlens,
                     q_full_idx=common_long_seq_metadata.q_full_idx,
                     pcp_prefill_mask=common_long_seq_metadata.pcp_prefill_mask,
-                    pcp_allgather_restore_idx=long_seq_metadata.pcp_allgather_restore_idx)
+                    pcp_allgather_restore_idx=long_seq_metadata.
+                    pcp_allgather_restore_idx)
 
             reqs_start = num_decodes  # prefill_start
             tokens_start = num_decode_tokens
@@ -491,7 +494,8 @@ class AscendMLAMetadataBuilder:
                     actual_seq_lengths_q=actual_seq_lengths_q,
                     sin=sin,
                     cos=cos,
-                    num_computed_tokens_of_pcp_dcp=num_computed_tokens_of_pcp_dcp)
+                    num_computed_tokens_of_pcp_dcp=
+                    num_computed_tokens_of_pcp_dcp)
             else:
                 cos[:num_decode_tokens,
                     ...] = self.cos_cache[input_positions].unsqueeze(
@@ -510,7 +514,8 @@ class AscendMLAMetadataBuilder:
                     actual_seq_lengths_q=actual_seq_lengths_q,
                     sin=sin[:num_decode_tokens, ...],
                     cos=cos[:num_decode_tokens, ...],
-                    num_computed_tokens_of_pcp_dcp=num_computed_tokens_of_pcp_dcp)
+                    num_computed_tokens_of_pcp_dcp=
+                    num_computed_tokens_of_pcp_dcp)
 
         return self.metadata_cls(  # type: ignore
             num_actual_tokens_pcp_padded=num_actual_tokens_pcp_padded,
@@ -648,7 +653,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         ).device_group if self.tp_size > 1 else None
 
     def _v_up_proj(self, x):
-        if self.W_UV.shape[0] * self.W_UV.shape[1] < 65536 and not self.dcp_size * self.pcp_size > 1:
+        if self.W_UV.shape[0] * self.W_UV.shape[
+                1] < 65536 and not self.dcp_size * self.pcp_size > 1:
             x = x.view(-1, self.num_heads, self.kv_lora_rank)
             x = torch_npu.npu_transpose_batchmatmul(x,
                                                     self.W_UV,
@@ -1270,7 +1276,9 @@ class AscendMLAImpl(MLAAttentionImpl):
                 decode_ql_nope, decode_q_pe = decode_q_no_split.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
             decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
-            decode_slots = attn_metadata.slot_mapping[:num_decode_tokens*self.pcp_size:self.pcp_size]
+            decode_slots = attn_metadata.slot_mapping[:num_decode_tokens *
+                                                      self.pcp_size:self.
+                                                      pcp_size]
             decode_kv_no_split = kv_no_split[:num_decode_tokens]
             decode_k_pe, decode_k_nope = self.exec_kv_decode(
                 decode_kv_no_split, cos, sin, kv_cache, decode_slots)
@@ -1279,7 +1287,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         # Preprocess for prefill tokens
         if has_prefill:
             if self.pcp_size > 1:
-                num_actual_tokens = (attn_metadata.num_actual_tokens_pcp_padded -  self.pcp_size * num_decode_tokens) // self.pcp_size + num_decode_tokens
+                num_actual_tokens = (attn_metadata.num_actual_tokens_pcp_padded
+                                     - self.pcp_size * num_decode_tokens
+                                     ) // self.pcp_size + num_decode_tokens
             prefill_kv_no_split = kv_no_split[
                 num_decode_tokens:num_actual_tokens]
             prefill_q_c = q_c[num_decode_tokens:num_actual_tokens]
@@ -1288,8 +1298,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim:]
             prefill_q_nope = prefill_q[..., :self.qk_nope_head_dim]
             if self.pcp_size > 1:
-                cos = attn_metadata.prefill.cos[:num_actual_tokens - num_decode_tokens]
-                sin = attn_metadata.prefill.sin[:num_actual_tokens - num_decode_tokens]
+                cos = attn_metadata.prefill.cos[:num_actual_tokens -
+                                                num_decode_tokens]
+                sin = attn_metadata.prefill.sin[:num_actual_tokens -
+                                                num_decode_tokens]
             else:
                 cos = attn_metadata.prefill.cos
                 sin = attn_metadata.prefill.sin
@@ -1309,28 +1321,30 @@ class AscendMLAImpl(MLAAttentionImpl):
                 k_pe = k_pe.unsqueeze(1)
                 prefill_k_pe = k_pe
                 prefill_k_pe[
-                num_decode_tokens:num_actual_tokens] = self.rope_single(prefill_k_pe[
-                num_decode_tokens:num_actual_tokens], cos, sin)
+                    num_decode_tokens:num_actual_tokens] = self.rope_single(
+                        prefill_k_pe[num_decode_tokens:num_actual_tokens], cos,
+                        sin)
                 prefill_k_c_normed = kv_c_normed[:num_actual_tokens]
                 prefill_kv_c_k_pe = torch.cat(
                     [prefill_k_c_normed, prefill_k_pe], dim=-1)
                 prefill_kv_c_k_pe = get_pcp_group().all_gather(
                     prefill_kv_c_k_pe, 0)
                 prefill_kv_c_k_pe = torch.index_select(
-                    prefill_kv_c_k_pe, 0,
-                    attn_metadata.prefill.pcp_metadata.pcp_allgather_restore_idx)
-                prefill_kv_c_k_pe = prefill_kv_c_k_pe[num_decode_tokens * self.pcp_size:]
+                    prefill_kv_c_k_pe, 0, attn_metadata.prefill.pcp_metadata.
+                    pcp_allgather_restore_idx)
+                prefill_kv_c_k_pe = prefill_kv_c_k_pe[num_decode_tokens *
+                                                      self.pcp_size:]
                 prefill_k_c_normed, prefill_k_pe = prefill_kv_c_k_pe.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
                 kv_c_normed, k_pe = prefill_k_c_normed, prefill_k_pe
                 prefill_k_c_normed = prefill_k_c_normed.squeeze()
-                slot_mapping = attn_metadata.slot_mapping[self.pcp_size * num_decode_tokens :]
-                torch_npu._npu_reshape_and_cache(
-                    key=kv_c_normed,
-                    value=k_pe,
-                    key_cache=kv_cache[0],
-                    value_cache=kv_cache[1],
-                    slot_indices=slot_mapping)
+                slot_mapping = attn_metadata.slot_mapping[self.pcp_size *
+                                                          num_decode_tokens:]
+                torch_npu._npu_reshape_and_cache(key=kv_c_normed,
+                                                 value=k_pe,
+                                                 key_cache=kv_cache[0],
+                                                 value_cache=kv_cache[1],
+                                                 slot_indices=slot_mapping)
             else:
                 prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(
                     prefill_kv_no_split, cos, sin, kv_cache, prefill_slots)
@@ -1528,12 +1542,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             kv_mask_idx: torch.Tensor, kv_nomask_idx: torch.Tensor,
             attn_mask_seqlens: torch.Tensor, attn_nomask_seqlens: torch.Tensor,
             mask: torch.Tensor):
-        attn_output = torch.empty(
-            q_nope.shape[0],
-            self.num_heads,
-            self.v_head_dim,
-            dtype=k_pe.dtype,
-            device=k_pe.device)
+        attn_output = torch.empty(q_nope.shape[0],
+                                  self.num_heads,
+                                  self.v_head_dim,
+                                  dtype=k_pe.dtype,
+                                  device=k_pe.device)
         attn_lse = torch.empty(self.num_heads,
                                q_pe.shape[0],
                                dtype=torch.float32,
@@ -1615,15 +1628,17 @@ class AscendMLAImpl(MLAAttentionImpl):
         q_pe = q_pe.view(num_tokens, num_heads, -1)
         # use pcp & dcp split computed token nums from scheduler to compute actual seq_len and seq_mask
         num_computed_tokens_of_pcp_dcp = np.array(
-            decode_meta.num_computed_tokens_of_pcp_dcp)[:attn_metadata.num_decodes]  # [bs, pcp_size, dcp_size]
+            decode_meta.num_computed_tokens_of_pcp_dcp
+        )[:attn_metadata.num_decodes]  # [bs, pcp_size, dcp_size]
         seq_mask_pcp = torch.where(
             torch.tensor(num_computed_tokens_of_pcp_dcp.sum(2)) == 0, 0,
             1).to(torch.uint8).to(q_pe.device)
         seq_mask_dcp = torch.where(
-            torch.tensor(num_computed_tokens_of_pcp_dcp[:,
-                                                      self.pcp_rank, :]) == 0,
-            0, 1).to(torch.uint8).to(q_pe.device)
-        seq_len = num_computed_tokens_of_pcp_dcp[:, self.pcp_rank, self.dcp_rank]
+            torch.tensor(
+                num_computed_tokens_of_pcp_dcp[:, self.pcp_rank, :]) == 0, 0,
+            1).to(torch.uint8).to(q_pe.device)
+        seq_len = num_computed_tokens_of_pcp_dcp[:, self.pcp_rank,
+                                                 self.dcp_rank]
         seq_len = torch.tensor(seq_len, dtype=torch.int32)
         # npu_multi_head_latent_attention does not support seq_len = 0,
         # update where seq_len == 0 to 1.
@@ -1710,7 +1725,9 @@ class AscendMLAImpl(MLAAttentionImpl):
                 current_ms_metadata.before_comm_event.wait()
                 return self._v_up_proj(attn_output)
 
+
 # TODO use update op to replace this
+
     def _update_out_and_lse(
         self,
         out: torch.Tensor,

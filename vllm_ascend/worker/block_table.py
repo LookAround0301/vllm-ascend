@@ -86,8 +86,10 @@ class BlockTable:
                                         dtype=torch.int64,
                                         device=self.device)
         try:
-            self.pcp_world_size = get_pcp_group().world_size if prefill_context_parallel_enable() else 1
-            self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_world_size > 1 else 0
+            self.pcp_world_size = get_pcp_group(
+            ).world_size if prefill_context_parallel_enable() else 1
+            self.pcp_rank = get_pcp_group(
+            ).rank_in_group if self.pcp_world_size > 1 else 0
             self.dcp_world_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
         except AssertionError:
@@ -170,7 +172,8 @@ class BlockTable:
             virtual_block_offsets = positions % virtual_block_size
             self.current_rank = self.dcp_world_size * self.pcp_rank + self.dcp_rank
             mask = (virtual_block_offsets // self.cp_kv_cache_interleave_size %
-                    (self.dcp_world_size * self.pcp_world_size) == self.current_rank)
+                    (self.dcp_world_size *
+                     self.pcp_world_size) == self.current_rank)
             # Calculate local block_offsets
             block_offsets = virtual_block_offsets \
                 // (self.dcp_world_size * self.pcp_world_size * self.cp_kv_cache_interleave_size) \
@@ -265,7 +268,8 @@ class MultiGroupBlockTable:
         # must be multiplied by dcp_world_size.
         try:
             dcp_world_size = get_dcp_group().world_size
-            cp_world_size = get_pcp_group().world_size if prefill_context_parallel_enable() else 1
+            cp_world_size = get_pcp_group(
+            ).world_size if prefill_context_parallel_enable() else 1
         except AssertionError:
             # DCP might not be initialized in testing
             dcp_world_size = 1
@@ -285,9 +289,12 @@ class MultiGroupBlockTable:
         self.block_tables = [
             BlockTable(
                 block_size, max_num_reqs,
-                max(cdiv(max_model_len, block_size * dcp_world_size * cp_world_size),
+                max(
+                    cdiv(max_model_len,
+                         block_size * dcp_world_size * cp_world_size),
                     1 + num_speculative_tokens), max_num_batched_tokens,
-                pin_memory, device, kernel_size_list, cp_kv_cache_interleave_size)
+                pin_memory, device, kernel_size_list,
+                cp_kv_cache_interleave_size)
             for block_size, kernel_size_list in zip(block_sizes, kernel_sizes)
         ]
 
