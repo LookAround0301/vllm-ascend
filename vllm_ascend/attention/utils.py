@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Any, List, Optional
+
 import torch
 import torch.nn.functional as F
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
@@ -104,7 +105,8 @@ class AscendCommonAttentionMetadata:
     cos: torch.Tensor = None
     sin: torch.Tensor = None
 
-    prefill_context_parallel_metadata: Optional[AscendPrefillContextParallelMetadata] = None
+    prefill_context_parallel_metadata: Optional[
+        AscendPrefillContextParallelMetadata] = None
 
 
 def split_decodes_and_prefills(

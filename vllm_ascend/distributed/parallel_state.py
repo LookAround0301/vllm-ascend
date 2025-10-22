@@ -62,12 +62,12 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
     if prefill_context_parallel_enable():
         all_ranks = torch.arange(world_size).reshape(
             -1, parallel_config.data_parallel_size *
-                parallel_config.prefill_context_parallel_size *
-                parallel_config.tensor_parallel_size)
+            parallel_config.prefill_context_parallel_size *
+            parallel_config.tensor_parallel_size)
     else:
         all_ranks = torch.arange(world_size).reshape(
             -1, parallel_config.data_parallel_size *
-                parallel_config.tensor_parallel_size)
+            parallel_config.tensor_parallel_size)
 
     pd_tp_ratio = get_ascend_config().pd_tp_ratio
     pd_head_ratio = get_ascend_config().pd_head_ratio

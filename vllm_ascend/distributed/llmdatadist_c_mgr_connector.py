@@ -22,7 +22,8 @@ from vllm import envs
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
-from vllm.distributed.parallel_state import get_tp_group, get_world_group, get_dcp_group
+from vllm.distributed.parallel_state import (get_dcp_group, get_tp_group,
+                                             get_world_group)
 from vllm.forward_context import ForwardContext
 from vllm.utils import get_ip, logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -30,10 +31,12 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request, RequestStatus
 
 import vllm_ascend.envs as envs_ascend
-from vllm_ascend.utils import AscendSocVersion, get_ascend_soc_version
-from vllm_ascend.utils import prefill_context_parallel_enable
+from vllm_ascend.utils import (AscendSocVersion, get_ascend_soc_version,
+                               prefill_context_parallel_enable)
+
 if prefill_context_parallel_enable():
-    from vllm.distributed.parallel_state import get_prefill_context_model_parallel_rank
+    from vllm.distributed.parallel_state import \
+        get_prefill_context_model_parallel_rank
 
 TORCH_DTYPE_TO_NPU_DTYPE = {
     torch.half: llm_datadist.DataType.DT_FLOAT16,
@@ -192,7 +195,8 @@ class LLMDataDistCMgrConnectorScheduler():
         else:
             dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        self.pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size if prefill_context_parallel_enable() else 1
+        self.pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size if prefill_context_parallel_enable(
+        ) else 1
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
 
         self.port = dp_rank_local * self.pcp_size * tp_size + envs_ascend.VLLM_ASCEND_LLMDD_RPC_PORT if dp_rank_local is not None else tp_size + envs_ascend.VLLM_ASCEND_LLMDD_RPC_PORT
@@ -333,8 +337,10 @@ class LLMDataDistCMgrConnectorWorker():
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.tp_rank = get_tp_group().rank_in_group
         self.rank = get_world_group().rank
-        self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size if prefill_context_parallel_enable() else 1
-        self.pcp_rank = get_prefill_context_model_parallel_rank() if prefill_context_parallel_enable() else 0
+        self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size if prefill_context_parallel_enable(
+        ) else 1
+        self.pcp_rank = get_prefill_context_model_parallel_rank(
+        ) if prefill_context_parallel_enable() else 0
         self.dcp_size = get_dcp_group().world_size
         self.local_ip = get_ip()
         self.kv_transfer_config: KVTransferConfig = vllm_config.kv_transfer_config
@@ -489,7 +495,8 @@ class LLMDataDistCMgrConnectorWorker():
             ]
             if len(device_list) <= self.pcp_rank * self.tp_size + self.tp_rank:
                 continue
-            device_info = device_list[self.pcp_rank * self.tp_size + self.tp_rank]
+            device_info = device_list[self.pcp_rank * self.tp_size +
+                                      self.tp_rank]
             super_pod_id_ = device_info.get("super_pod_id", None)
             server_id_ = device_info["server_id"]
             device_id_ = device_info["device_id"]
@@ -885,21 +892,28 @@ class LLMDataDistCMgrConnectorWorker():
             cp_dcp_offsets = []
             for cp_idx in range(remote_cp_size):
                 cp_offset = cp_idx * remote_tp_size
-                cp_dcp_offsets += list(range(cp_offset, cp_offset + remote_dcp_size))
+                cp_dcp_offsets += list(
+                    range(cp_offset, cp_offset + remote_dcp_size))
             remote_ports = [remote_port + cp_dcp_offset + (self.tp_rank if not self.use_mla else 0) \
                 for cp_dcp_offset in cp_dcp_offsets]
             # recompute cp/dcp block assign here, maybe we can also pass it from P node meta
             local_block_num = len(local_block_ids)
-            remote_block_nums = [local_block_num // (remote_cp_size * remote_dcp_size)] * remote_cp_size * remote_dcp_size
-            num_remain_blocks = local_block_num % (remote_cp_size * remote_dcp_size)
+            remote_block_nums = [
+                local_block_num // (remote_cp_size * remote_dcp_size)
+            ] * remote_cp_size * remote_dcp_size
+            num_remain_blocks = local_block_num % (remote_cp_size *
+                                                   remote_dcp_size)
             for i in range(num_remain_blocks):
                 remote_block_nums[i] += 1
             # make sure the last block (which may be unfull) of P nodes is put to the last block of D node
-            remote_ports = remote_ports[num_remain_blocks:] + remote_ports[:num_remain_blocks]
-            remote_block_nums = remote_block_nums[num_remain_blocks:] + remote_block_nums[:num_remain_blocks]
+            remote_ports = remote_ports[
+                num_remain_blocks:] + remote_ports[:num_remain_blocks]
+            remote_block_nums = remote_block_nums[
+                num_remain_blocks:] + remote_block_nums[:num_remain_blocks]
         else:
             # Other cases are not supported now, maybe need to reshard kv_cache.
-            raise NotImplementedError(f'Current case is not supported now: use_mla={self.use_mla}, '
+            raise NotImplementedError(
+                f'Current case is not supported now: use_mla={self.use_mla}, '
                 f'P tp={remote_tp_size}, pcp={remote_cp_size}, dcp={remote_dcp_size}, '
                 f'D tp={self.tp_size}, pcp={self.pcp_size}, dcp={self.dcp_size}'
             )
@@ -939,7 +953,8 @@ class LLMDataDistCMgrConnectorWorker():
             if num_blocks_to_pull == 0:
                 continue
             remote_block_ids = remote_block_ids_full[:num_blocks_to_pull]
-            local_block_ids = local_block_ids_full[local_block_offset:local_block_offset+num_blocks_to_pull]
+            local_block_ids = local_block_ids_full[
+                local_block_offset:local_block_offset + num_blocks_to_pull]
             local_block_offset += num_blocks_to_pull
             remote_cluster_id = self.connect_to_remote_agent(
                 remote_ip, remote_port)
