@@ -395,8 +395,7 @@ class AscendMLAMetadataBuilder:
                     q_full_idx=common_long_seq_metadata.q_full_idx,
                     pcp_prefill_mask=common_long_seq_metadata.pcp_prefill_mask,
                     pcp_allgather_restore_idx=long_seq_metadata.
-                    pcp_allgather_restore_idx
-                    if long_seq_metadata else None)
+                    pcp_allgather_restore_idx if long_seq_metadata else None)
 
             reqs_start = num_decodes  # prefill_start
             tokens_start = num_decode_tokens
@@ -1444,8 +1443,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             current_ms_metadata = get_multistream_comm_context()
             if current_ms_metadata is not None:
                 with torch.npu.stream(current_ms_metadata.comm_stream):
-                    o_proj_input[
-                        num_decode_tokens:num_actual_tokens] = output_prefill
+                    o_proj_input[num_decode_tokens:] = output_prefill
                     current_ms_metadata.after_comm_event.record()
             else:
                 o_proj_input[

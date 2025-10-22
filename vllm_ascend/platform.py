@@ -88,10 +88,6 @@ class NPUPlatform(Platform):
         return torch.npu.get_device_name(device_id)
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
-        return True
-
-    @classmethod
     def inference_mode(cls):
         return torch.inference_mode()
 
@@ -253,7 +249,7 @@ class NPUPlatform(Platform):
         if parallel_config and parallel_config.worker_cls == "auto":
             # TODO: this is a tricky way to disable `use_sequence_parallel_moe` in vllm.
             os.environ["VLLM_ALL2ALL_BACKEND"] = "flashinfer_all2allv"
-            if ascend_config.torchair_graph_config.enabled:
+            if ascend_config.torchair_graph_config.enabled or ascend_config.enable_shared_expert_dp:
                 parallel_config.worker_cls = "vllm_ascend.torchair.torchair_worker.NPUTorchairWorker"
             else:
                 parallel_config.worker_cls = "vllm_ascend.worker.worker_v1.NPUWorker"
@@ -315,6 +311,8 @@ class NPUPlatform(Platform):
         ascend_config = get_ascend_config()
 
         if use_mla and ascend_config.enable_shared_expert_dp:
+            if use_mla and not use_sparse:
+                return "vllm_ascend.torchair.torchair_mla.AscendMLATorchairBackend"
             if use_mla and use_sparse:
                 return "vllm_ascend.torchair.torchair_sfa.AscendSFATorchairBackend"
 
@@ -353,13 +351,6 @@ class NPUPlatform(Platform):
 
     @classmethod
     def is_pin_memory_available(cls):
-        return True
-
-    @classmethod
-    def supports_v1(cls, model_config: ModelConfig) -> bool:
-        """Returns whether the current platform can support v1 for the supplied
-        model configuration.
-        """
         return True
 
     @classmethod
