@@ -18,6 +18,12 @@ class AscendPrefillContextParallelMetadata:
 
     num_computed_tokens_of_pcp_dcp: Optional[list[Optional[list[Optional[
         list[int]]]]]] = None
+    
+    num_computed_tokens_of_cp_sp_single: list[list[list[int]]] = None
+
+    num_computed_tokens_of_cp_sp_current: list[list[list[int]]] = None
+
+    num_computed_tokens_of_cp_sp_accum: list[list[list[int]]] = None
 
     q_head_idx_tensor: torch.Tensor = None
 
