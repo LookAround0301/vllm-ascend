@@ -12,6 +12,8 @@ from vllm.attention.backends.abstract import (AttentionBackend,
                                               AttentionMetadata,
                                               MLAAttentionImpl)
 from vllm.config import VllmConfig, get_current_vllm_config
+
+# isort: off
 from vllm.distributed import (get_dcp_group,
                               get_decode_context_model_parallel_rank,
                               get_decode_context_model_parallel_world_size,
@@ -24,6 +26,7 @@ from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
 from vllm.utils import cdiv, round_down
 from vllm.v1.attention.backends.utils import AttentionCGSupport
+
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -43,9 +46,11 @@ from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
 from vllm_ascend.worker.npu_input_batch import InputBatch
 
 if prefill_context_parallel_enable():
-    from vllm.distributed import (
-        get_pcp_group, get_prefill_context_model_parallel_rank,
-        get_prefill_context_model_parallel_world_size)
+    from vllm.distributed import (get_pcp_group,
+                                  get_prefill_context_model_parallel_rank,
+                                  get_prefill_context_model_parallel_world_size
+                                  )
+# isort:on
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 

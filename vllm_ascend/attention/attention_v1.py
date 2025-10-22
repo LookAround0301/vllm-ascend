@@ -35,6 +35,8 @@ from vllm.utils import cdiv, direct_register_custom_op
 from vllm.v1.attention.backends.utils import AttentionCGSupport
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+# isort: off
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          maybe_save_kv_layer_to_connector,
                                          split_decodes_and_prefills,
@@ -49,9 +51,11 @@ from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, aligned_16, is_310p,
 from ..utils import weak_ref_tensors
 
 if prefill_context_parallel_enable():
-    from vllm.distributed import (
-        get_pcp_group, get_prefill_context_model_parallel_rank,
-        get_prefill_context_model_parallel_world_size)
+    from vllm.distributed import (get_pcp_group,
+                                  get_prefill_context_model_parallel_rank,
+                                  get_prefill_context_model_parallel_world_size
+                                  )
+# isort:on
 
 
 class AscendAttentionBackend(AttentionBackend):
