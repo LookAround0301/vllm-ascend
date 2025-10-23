@@ -360,40 +360,25 @@ class AscendAttentionMetadataBuilder:
                     num_computed_tokens_of_pcp_dcp=
                     num_computed_tokens_of_pcp_dcp)
 
-        if prefill_context_parallel_enable():
-            attn_metadata = AscendMetadata(
-                num_actual_tokens=num_actual_tokens,
-                num_decode_tokens=num_decode_tokens,
-                num_actual_tokens_pcp_padded=num_actual_tokens_pcp_padded,
-                block_tables=block_table,
-                query_start_loc=query_start_loc,
-                query_lens=query_lens,
-                seq_lens=seq_lens,
-                seq_lens_list=seq_lens.tolist(),
-                max_query_len=common_attn_metadata.max_query_len,
-                actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),
-                slot_mapping=slot_mapping,
-                attn_mask=attn_mask,
-                attn_state=attn_state,
-                enable_dbo_across_dp=common_attn_metadata.enable_dbo_across_dp,
-                num_prefills=num_prefills,
-                num_decodes=num_decodes,
-                prefill=prefill_metadata,
-                decode_meta=decode_metadata)
-        else:
-            attn_metadata = AscendMetadata(
-                num_actual_tokens=num_actual_tokens,
-                block_tables=block_table,
-                query_start_loc=query_start_loc,
-                query_lens=query_lens,
-                seq_lens=seq_lens,
-                seq_lens_list=seq_lens.tolist(),
-                max_query_len=common_attn_metadata.max_query_len,
-                actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),
-                slot_mapping=slot_mapping,
-                attn_mask=attn_mask,
-                attn_state=attn_state,
-                enable_dbo_across_dp=common_attn_metadata.enable_dbo_across_dp)
+        attn_metadata = AscendMetadata(
+            num_actual_tokens=num_actual_tokens,
+            num_decode_tokens=num_decode_tokens,
+            num_actual_tokens_pcp_padded=num_actual_tokens_pcp_padded,
+            block_tables=block_table,
+            query_start_loc=query_start_loc,
+            query_lens=query_lens,
+            seq_lens=seq_lens,
+            seq_lens_list=seq_lens.tolist(),
+            max_query_len=common_attn_metadata.max_query_len,
+            actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),
+            slot_mapping=slot_mapping,
+            attn_mask=attn_mask,
+            attn_state=attn_state,
+            enable_dbo_across_dp=common_attn_metadata.enable_dbo_across_dp,
+            num_prefills=num_prefills,
+            num_decodes=num_decodes,
+            prefill=prefill_metadata,
+            decode_meta=decode_metadata)
         return attn_metadata
 
     def build_for_graph_capture(
@@ -1137,9 +1122,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                                                       max_prefill_seq_len]
                 else:
                     ValueError("Attn_metadata.attn_mask is required")
+                seq_lens_back = attn_metadata.seq_lens
+                attn_metadata.seq_lens = attn_metadata.seq_lens[attn_metadata.num_decode_tokens:]
                 output_prefill = self._forward_prefill_no_cache(
                     prefill_query, key, value, attn_metadata,
                     output[num_decode_tokens:], prefill_query.shape[0])
+                attn_metadata.seq_lens = seq_lens_back
             output[num_decode_tokens:] = output_prefill
         return output
 
