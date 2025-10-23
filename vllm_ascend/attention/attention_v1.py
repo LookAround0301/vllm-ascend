@@ -479,7 +479,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             key=key,
             value=value,
             mask=mask,
-            seq_len=attn_metadata.seq_lens[attn_metadata.num_decode_tokens:],
+            seq_len=attn_metadata.seq_lens,
             scale_value=self.scale,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
