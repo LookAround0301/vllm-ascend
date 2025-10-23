@@ -474,16 +474,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
             mask = torch_npu.npu_format_cast(mask.contiguous(),
                                              ACL_FORMAT_FRACTAL_NZ)
 
-        torch_npu._npu_flash_attention(
-            query=query,
-            key=key,
-            value=value,
-            mask=mask,
-            seq_len=attn_metadata.seq_lens,
-            scale_value=self.scale,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            out=output)
+        torch_npu._npu_flash_attention(query=query,
+                                       key=key,
+                                       value=value,
+                                       mask=mask,
+                                       seq_len=attn_metadata.seq_lens,
+                                       scale_value=self.scale,
+                                       num_heads=self.num_heads,
+                                       num_kv_heads=self.num_kv_heads,
+                                       out=output)
         assert output is not None
         return output[:num_tokens, :, :]
 
@@ -1123,7 +1122,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 else:
                     ValueError("Attn_metadata.attn_mask is required")
                 seq_lens_back = attn_metadata.seq_lens
-                attn_metadata.seq_lens = attn_metadata.seq_lens[attn_metadata.num_decode_tokens:]
+                attn_metadata.seq_lens = attn_metadata.seq_lens[
+                    attn_metadata.num_decode_tokens:]
                 output_prefill = self._forward_prefill_no_cache(
                     prefill_query, key, value, attn_metadata,
                     output[num_decode_tokens:], prefill_query.shape[0])
