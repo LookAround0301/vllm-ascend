@@ -3954,9 +3954,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                    device=self.device,
                                    dtype=self.dtype), 1)
                 else:
-                    max_seq_len = max(seq_lens, default=0)
                     pcp_prefill_mask = torch.triu(
-                        torch.full((num_prefills, max_seq_len, max_seq_len),
+                        torch.full((2048,2048),
                                    True,
                                    device=self.device,
                                    dtype=torch.bool), 1)
