@@ -6,6 +6,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from unittest.mock import patch
+import numpy as np
 
 import torch
 import torch_npu
@@ -315,7 +316,7 @@ def update_attn_dcp_pcp_params(update_stream, forward_context, runtime_shape):
         (q_nope, k_nope, value, num_heads, num_kv_heads,
          scale, block_table, block_size, actual_seq_lengths_kv, workspace,
          attn_output, softmax_lse, cp_rank, dcp_rank, dcp_size) = param
-        actual_seq_lengths_kv = forward_context.attn_metadata[key].decode.num_computed_tokens_of_cp_dcp[:, cp_rank, dcp_rank]
+        actual_seq_lengths_kv = forward_context.attn_metadata[key].decode_meta.num_computed_tokens_of_pcp_dcp[:, cp_rank, dcp_rank]
         pad_length = runtime_shape - len(actual_seq_lengths_kv)
         pad_tensor = np.zeros(pad_length, dtype=actual_seq_lengths_kv.dtype)
         actual_seq_lengths_kv = np.concatenate([actual_seq_lengths_kv, pad_tensor])

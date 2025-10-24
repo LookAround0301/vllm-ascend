@@ -888,7 +888,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             'softmax_lse_flag': True,
             'block_table': attn_metadata.block_tables,
             'block_size': self.key_cache.shape[1],
-            "actual_seq_lengths_kv": attn_metadata.decode.num_computed_tokens_of_cp_dcp[:, self.cp_rank, self.dcp_rank],
+            "actual_seq_lengths_kv": attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp[:, self.pcp_rank, self.dcp_rank],
         }
         graph_params = get_graph_params()
         forward_context: ForwardContext = get_forward_context()
@@ -914,8 +914,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             graph_params.attn_params[num_tokens].append(
                 (q_nope, k_nope, value, self.num_heads, self.num_kv_heads,
                  self.scale, attn_metadata.block_tables, self.key_cache.shape[1],
-                 attn_metadata.decode.num_computed_tokens_of_cp_dcp[:, self.cp_rank, self.dcp_rank], workspace,
-                 attn_out, attn_lse, self.cp_rank, self.dcp_rank, self.dcp_size))
+                 attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp[:, self.pcp_rank, self.dcp_rank], workspace,
+                 attn_out, attn_lse, self.pcp_rank, self.dcp_rank, self.dcp_size))
             torch.npu.graph_task_group_begin(stream)
             torch_npu.npu_fused_infer_attention_score.out(
                 q_nope,

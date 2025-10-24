@@ -2320,6 +2320,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     self.kv_cache_config.kv_cache_groups):
                 block_table_tensor = self.input_batch.block_table[
                     kv_cache_group_id].get_device_tensor()
+                self.cp_kv_recover_idx = torch.zeros(self.max_num_tokens,
+                                            dtype=torch.int32,
+                                            device=self.device)
+                long_seq_metadata = self._generate_pcp_metadata(num_tokens, self.seq_lens_cpu)
+                if long_seq_metadata is not None:
+                    pcp_world_size = get_pcp_group().world_size if prefill_context_parallel_enable() else 1
+                    dcp_world_size = get_dcp_group().world_size
+                    num_computed_tokens_of_pcp_dcp = [[
+                        [0] * dcp_world_size for _ in range(pcp_world_size)
+                    ] for _ in range(num_tokens)]
+                    long_seq_metadata.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp
                 common_attn_metadata = AscendCommonAttentionMetadata(
                     query_start_loc=torch.tensor(
                         [0] + self.actual_seq_lengths_q[:num_reqs],
@@ -2343,6 +2354,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     decode_token_per_req=self.decode_token_per_req,
                     cos=self.cos,
                     sin=self.sin,
+                    prefill_context_parallel_metadata=long_seq_metadata,
                 )
                 attn_state = AscendAttentionState.DecodeOnly
                 if self.speculative_config and \
