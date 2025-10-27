@@ -1,5 +1,6 @@
 import types
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torchair
@@ -15,6 +16,7 @@ from vllm.model_executor.models.deepseek_mtp import DeepSeekMTP
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.utils import cdiv
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
@@ -31,6 +33,7 @@ if vllm_version_is("0.11.0"):
     from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 else:
     from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.logger import logger
 
 PADDING_SLOT_ID = -1
 
@@ -48,6 +51,9 @@ class MtpProposer(Proposer):
         self.device = device
         self.runner = runner
         self.num_speculative_tokens = vllm_config.speculative_config.num_speculative_tokens
+        self.pcp_size = self.runner.pcp_size
+        self.dcp_size = self.runner.dcp_size
+        self.pcp_rank = self.runner.pcp_rank
 
         # persistent buffers for graph
         self.input_ids = torch.zeros(self.runner.max_num_tokens,
@@ -61,6 +67,10 @@ class MtpProposer(Proposer):
              vllm_config.model_config.get_hidden_size()),
             dtype=self.runner.dtype,
             device=self.device)
+        self.full_indices = list(
+            range(self.runner.max_num_tokens * self.pcp_size * self.dcp_size +
+                self.pcp_size * self.dcp_size * self.runner.max_num_reqs)
+        )
         self.torchair_compiled_model = None  # type: ignore
         self.torchair_compiled_models = {}  # type: ignore
         self.torchair_graph_enabled = get_ascend_config(
@@ -207,7 +217,12 @@ class MtpProposer(Proposer):
                            num_scheduled_tokens: int = 0,
                            hidden_states: torch.Tensor = None,
                            attn_metadata=None,
-                           aux_hidden_states: torch.Tensor = None):
+                           aux_hidden_states: torch.Tensor = None,
+                           input_ids_pcp_full: torch.Tensor = None,
+                           query_start_loc_pcp_full: torch.Tensor = None,
+                           is_prefill: bool = False,
+                           req_scheduled_tokens= None,
+                           long_seq_metadata=None):
         if attn_metadata is not None and isinstance(attn_metadata, dict):
             attn_metadata = attn_metadata['model.layers.0.self_attn.attn']
         next_token_ids: list[int] = []
@@ -229,12 +244,20 @@ class MtpProposer(Proposer):
                                       device=self.device)
         accepted_token_indices = None
         if spec_decode_metadata is None:
-            # input_ids can be None for multimodal models.
-            target_token_ids = self.runner.input_ids[:num_scheduled_tokens]
-            target_positions = positions[:num_scheduled_tokens]
-            target_hidden_states = hidden_states[:num_scheduled_tokens]
-            target_slot_mapping = attn_metadata.slot_mapping
-            cu_num_tokens = attn_metadata.query_start_loc
+            if self.pcp_size > 1 and is_prefill:
+                batch_size = next_token_ids.shape[0]
+                target_token_ids = input_ids_pcp_full[:num_scheduled_tokens]
+                target_positions = positions[:num_scheduled_tokens]
+                target_hidden_states = hidden_states
+                target_slot_mapping = attn_metadata.slot_mapping
+                cu_num_tokens = query_start_loc_pcp_full[:batch_size + 1]
+            else:
+                # input_ids can be None for multimodal models.
+                target_token_ids = self.runner.input_ids[:num_scheduled_tokens]
+                target_positions = positions[:num_scheduled_tokens]
+                target_hidden_states = hidden_states[:num_scheduled_tokens]
+                target_slot_mapping = attn_metadata.slot_mapping
+                cu_num_tokens = attn_metadata.query_start_loc
         else:
             # TODO(woosuk): Refactor this.
             num_draft_tokens = spec_decode_metadata.num_draft_tokens
@@ -267,7 +290,10 @@ class MtpProposer(Proposer):
             cu_num_tokens=cu_num_tokens,
             block_table=attn_metadata.block_tables,
             sampling_metadata=sampling_metadata,
-            token_indices=accepted_token_indices)
+            token_indices=accepted_token_indices,
+            is_prefill=is_prefill,
+            req_scheduled_tokens=req_scheduled_tokens,
+            long_seq_metadata=long_seq_metadata)
         spec_token_ids = draft_token_ids.tolist()
         return spec_token_ids
 
@@ -348,7 +374,10 @@ class MtpProposer(Proposer):
             # [batch_size, max_num_blocks_per_req]
             block_table: torch.Tensor,
             sampling_metadata: SamplingMetadata,
-            token_indices=None) -> torch.Tensor:
+            token_indices=None,
+            is_prefill=False,
+            req_scheduled_tokens=None,
+            long_seq_metadata=None) -> torch.Tensor:
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
         last_token_indices = cu_num_tokens[1:] - 1
@@ -392,6 +421,13 @@ class MtpProposer(Proposer):
 
         seq_lens = target_positions[last_token_indices] + 1
         seq_lens = seq_lens.int()
+
+        if self.pcp_size > 1 and is_prefill:
+            num_tokens, input_ids, target_hidden_states, max_query_len, seq_lens, cu_num_tokens = \
+                self._split_pcp_input(req_scheduled_tokens, num_tokens, target_hidden_states)
+            num_input_tokens = num_tokens # TODO consider graph pad
+            self.input_ids[:num_input_tokens].copy_(input_ids)
+
         common_attn_metadata = AscendCommonAttentionMetadata(
             query_start_loc=cu_num_tokens[:batch_size + 1],
             query_start_loc_cpu=cu_num_tokens[:batch_size + 1].cpu(),
@@ -410,6 +446,7 @@ class MtpProposer(Proposer):
             graph_pad_size=self.runner.graph_pad_size,
             decode_token_per_req=self.runner.decode_token_per_req,
             num_computed_tokens_cpu=None,
+            prefill_context_parallel_metadata=long_seq_metadata,
             seq_lens=None)
 
         if not self.torchair_graph_enabled:
@@ -676,3 +713,52 @@ class MtpProposer(Proposer):
         global_indices_flat = global_indices[mask]
         values_flat = values[mask]
         out_ptr[global_indices_flat] = values_flat
+
+    def _pcp_pad_and_split(self, num_tokens):
+        num_pcp_padded_scheduled_tokens = cdiv(num_tokens, 2 * self.pcp_size) * 2 * self.pcp_size
+        pcp_pad = num_pcp_padded_scheduled_tokens - num_tokens
+        chunk_size = num_pcp_padded_scheduled_tokens // (2 * self.pcp_size)
+
+        # split position_ids (and use split position_ids to split input_ids afterwards)
+        req_position_cp = []
+        req_position_cp.extend(
+            self.full_indices[self.pcp_rank * chunk_size:(self.pcp_rank + 1) * chunk_size]
+        )
+        req_position_cp.extend(
+            self.full_indices[num_pcp_padded_scheduled_tokens - (self.pcp_rank + 1) *
+                chunk_size:num_pcp_padded_scheduled_tokens - self.pcp_rank * chunk_size]
+        )
+
+        return req_position_cp, num_pcp_padded_scheduled_tokens, pcp_pad
+
+    def _split_pcp_input(self, req_scheduled_tokens, num_tokens, target_hidden_states):
+        num_pcp_scheduled_tokens = []
+        input_ids_list = self.input_ids[:num_tokens].tolist()
+        ori_start_index = 0
+        pad_start_index = 0
+        pcp_split_input_ids_list = np.array([], dtype=np.int32)
+        pcp_split_hidden_states_list = []
+        for req_id in req_scheduled_tokens:
+            ori_num_tokens = req_scheduled_tokens[req_id]
+            req_position_pcp, num_pcp_padded_scheduled_tokens, num_pcp_pad = \
+                self._pcp_pad_and_split(ori_num_tokens)
+            actual_num_tokens = len(req_position_pcp)
+            num_pcp_scheduled_tokens.append(actual_num_tokens)
+            pad_input_ids = (
+                np.array(input_ids_list[ori_start_index : ori_start_index + ori_num_tokens]
+                + [0] * num_pcp_pad, dtype=np.int32)
+            )
+            ori_start_index += ori_num_tokens
+            pcp_chunk_indices = [pad_start_index + pos for pos in req_position_pcp]
+            pcp_split_input_ids = pad_input_ids[req_position_pcp]
+            pcp_split_hidden_states = target_hidden_states[pcp_chunk_indices]
+            pcp_split_input_ids_list = np.append(pcp_split_input_ids_list, pcp_split_input_ids)
+            pcp_split_hidden_states_list.append(pcp_split_hidden_states)
+            pad_start_index += num_pcp_padded_scheduled_tokens
+        num_tokens = sum(num_pcp_scheduled_tokens)
+        input_ids = torch.tensor(pcp_split_input_ids_list, dtype=torch.int32)
+        target_hidden_states = torch.cat(pcp_split_hidden_states_list, dim=0)
+        max_query_len = max(num_pcp_scheduled_tokens)
+        seq_lens = torch.tensor(num_pcp_scheduled_tokens, dtype=torch.int32)
+        cu_num_tokens = torch.tensor(np.insert(np.cumsum(np.array(num_pcp_scheduled_tokens)), 0, 0))
+        return num_tokens, input_ids, target_hidden_states, max_query_len, seq_lens, cu_num_tokens
