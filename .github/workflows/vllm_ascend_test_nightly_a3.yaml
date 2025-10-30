@@ -101,9 +101,16 @@ jobs:
           - name: multi-node-dpsk-4node-pd
             config_file_path: tests/e2e/nightly/multi_node/config/models/DeepSeek-R1-W8A8.yaml
             size: 4
+          - name: multi-node-qwenw8a8-2node
+            config_file_path: tests/e2e/nightly/multi_node/config/models/Qwen3-235B-W8A8.yaml
+            size: 2
+          - name: multi-node-glm-2node
+            config_file_path: tests/e2e/nightly/multi_node/config/models/GLM-4_5.yaml
+            size: 2
     uses: ./.github/workflows/_e2e_nightly_multi_node.yaml
     with:
       soc_version: a3
+      runner: linux-aarch64-a3-0
       image: m.daocloud.io/quay.io/ascend/cann:8.2.rc1-a3-ubuntu22.04-py3.11
       replicas: 1
       size: ${{ matrix.test_config.size }}
@@ -111,3 +118,11 @@ jobs:
     secrets:
       KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
 
+  clear_resources:
+    needs: multi-node-tests
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/_kill_lws_resources.yaml
+    with:
+      runner: linux-aarch64-a3-0
+    secrets:
+      KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}

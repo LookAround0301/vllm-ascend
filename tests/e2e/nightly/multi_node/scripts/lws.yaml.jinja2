@@ -7,7 +7,7 @@ spec:
   replicas: {{ replicas | default(1) }}
   leaderWorkerTemplate:
     size: {{ size | default(2) }}
-    restartPolicy: RecreateGroupOnPodRestart
+    restartPolicy: None
     leaderTemplate:
       metadata:
         labels:
@@ -30,6 +30,10 @@ spec:
                 value: {{ vllm_ascend_remote_url | default("https://github.com/vllm-project/vllm-ascend.git") }}
               - name: RESULT_FILE_PATH
                 value: {{ result_file_path | default("/root/.cache/tests/ret/test_result.txt") }}
+              - name: CONTROLLER_NAME
+                value: {{ controller_name | default("placeholder") }}
+              - name: SECRET
+                value: {{ kb_secret | default("placeholder") }}
             command:
               - sh
               - -c
@@ -37,11 +41,11 @@ spec:
                 bash /root/.cache/tests/run.sh
             resources:
               limits:
-                huawei.com/ascend-1980: "16"
+                huawei.com/ascend-1980: {{ npu_per_node | default("16") }}
                 memory: 512Gi
                 ephemeral-storage: 100Gi
               requests:
-                huawei.com/ascend-1980: "16"
+                huawei.com/ascend-1980: {{ npu_per_node | default("16") }}
                 ephemeral-storage: 100Gi
                 cpu: 125
             ports:
@@ -95,11 +99,11 @@ spec:
                 bash /root/.cache/tests/run.sh
             resources:
               limits:
-                huawei.com/ascend-1980: "16"
+                huawei.com/ascend-1980: {{ npu_per_node | default("16") }}
                 memory: 512Gi
                 ephemeral-storage: 100Gi
               requests:
-                huawei.com/ascend-1980: "16"
+                huawei.com/ascend-1980: {{ npu_per_node | default("16") }}
                 ephemeral-storage: 100Gi
                 cpu: 125
             volumeMounts:

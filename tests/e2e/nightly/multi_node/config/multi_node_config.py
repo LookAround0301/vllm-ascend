@@ -15,7 +15,7 @@ from tests.e2e.nightly.multi_node.config.utils import (get_avaliable_port,
 
 setup_logger()
 logger = logging.getLogger(__name__)
-DISAGGREGATED_PREFILL_PROXY_SCRIPT = "examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_example.py"
+DISAGGREGATED_PREFILL_PROXY_SCRIPT = "examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py"
 DISAGGEGATED_PREFILL_PORT = 5333
 
 
@@ -50,8 +50,6 @@ class MultiNodeConfig:
         self.proxy_port = get_avaliable_port()
         self.perf_cmd = perf_cmd
         self.acc_cmd = acc_cmd
-        assert perf_cmd is not None, "perf_cmd must be provided"
-        assert acc_cmd is not None, "acc_cmd must be provided"
 
         self.cur_index = int(os.getenv("LWS_WORKER_INDEX", 0))
         self.cur_ip = get_cur_ip()
@@ -86,16 +84,17 @@ class MultiNodeConfig:
         self.envs["LOCAL_IP"] = self.cur_ip
         self.envs["NIC_NAME"] = self.nic_name
 
+        master_ip = self.cluster_ips[0]
         if self.disaggregated_prefill:
             self.envs[
                 "DISAGGREGATED_PREFILL_RANK_TABLE_PATH"] = self.disaggregated_prefill.get(
                     "ranktable_path")
             if self.cur_index < self.decode_start_index:
-                self.envs["MASTER_IP"] = self.cluster_ips[0]
+                master_ip = self.cluster_ips[0]
             else:
-                self.envs["MASTER_IP"] = self.cluster_ips[
-                    self.decode_start_index]
+                master_ip = self.cluster_ips[self.decode_start_index]
 
+        self.envs["MASTER_IP"] = master_ip
         ascend_path = "/usr/local/Ascend/ascend-toolkit/latest/python/site-packages"
         self.envs[
             "LD_LIBRARY_PATH"] = f"{ascend_path}:{self.envs.get('LD_LIBRARY_PATH', os.environ.get('LD_LIBRARY_PATH', ''))}"
@@ -220,10 +219,10 @@ class MultiNodeConfig:
                          server_port=server_port,
                          server_cmd=server_cmd))
 
-        benchmarks = config_data.get("benchmarks", {})
+        benchmarks = config_data.get("benchmarks") or {}
         assert benchmarks is not None, "benchmarks must be provided"
-        perf_cmd = benchmarks["perf"]
-        acc_cmd = benchmarks["acc"]
+        perf_cmd = benchmarks.get("perf")
+        acc_cmd = benchmarks.get("acc")
 
         return cls(model=model,
                    test_name=test_name,

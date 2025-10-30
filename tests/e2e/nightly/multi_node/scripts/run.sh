@@ -120,6 +120,17 @@ download_go() {
     print_success "Go $GOVER installed successfully"
 }
 
+install_ais_bench() {
+    local AIS_BENCH="$SRC_DIR/vllm-ascend/benchmark"
+    git clone https://gitee.com/aisbench/benchmark.git $AIS_BENCH
+    cd $AIS_BENCH
+    git checkout v3.0-20250930-master
+    pip3 install -e ./
+    pip3 install -r requirements/api.txt
+    pip3 install -r requirements/extra.txt
+    cd -
+}
+
 install_go() {
     # Check if Go is already installed
     if command -v go &> /dev/null; then
@@ -151,14 +162,31 @@ kill_npu_processes() {
 }
 
 run_tests() {
-    pytest -sv tests/e2e/nightly/multi_node/test_multi_node.py
+    set +e
     kill_npu_processes
+    pytest -sv tests/e2e/nightly/multi_node/test_multi_node.py
     ret=$?
     if [ "$LWS_WORKER_INDEX" -eq 0 ]; then
-        mkdir -p "$(dirname "$RESULT_PATH")"
-        echo $ret > "$RESULT_PATH"
+        if [ $ret -eq 0 ]; then
+            print_success "All tests passed!"
+        else
+            print_error "Some tests failed!"
+            kubectl delete pod $CONTROLLER_NAME -n vllm-project
+        fi
     fi
-    return $ret
+    set -e
+}
+
+install_kubectl() {
+    arch=$(uname -m)
+    KUBECTL=/root/.cache/.kube/kubectl
+    if echo "$arch" | grep -qiE "arm|aarch64"; then
+        echo "Detected ARM architecture: $arch"
+        KUBECTL="$KUBECTL"_arm
+    fi
+    install -o root -g root -m 0755 $KUBECTL /usr/local/bin/kubectl
+    echo "$SECRET" | base64 -d > /tmp/kubeconfig
+    export KUBECONFIG=/tmp/kubeconfig
 }
 
 main() {
@@ -166,7 +194,9 @@ main() {
     check_and_config
     checkout_src
     install_sys_dependencies
+    install_kubectl
     install_vllm
+    install_ais_bench
     # to speed up mooncake build process, install Go here
     install_go
     cd "$WORKSPACE/source_code"

@@ -37,7 +37,7 @@ _MoECommMethods: Dict[Optional[MoECommType], MoECommMethod] = {}
 
 def get_moe_comm_method(
         moe_comm_type: Optional[MoECommType]) -> Optional[MoECommMethod]:
-    return _MoECommMethods.get(moe_comm_type)
+    return _MoECommMethods.get(moe_comm_type, None)
 
 
 def setup_moe_comm_method(moe_config):
@@ -64,13 +64,12 @@ class MoECommMethod(ABC):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         enable_shared_expert_dp: bool = False,
-        replace_allreduce: bool = False,
-        gate=None
+        replace_allreduce: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
                Optional[torch.Tensor]]:
         hidden_states, router_logits, mc2_mask, context_metadata = self.prepare_finalize.prepare(
             hidden_states, router_logits, enable_shared_expert_dp,
-            replace_allreduce, gate)
+            replace_allreduce)
         return hidden_states, router_logits, mc2_mask, context_metadata
 
     def finalize(self,
