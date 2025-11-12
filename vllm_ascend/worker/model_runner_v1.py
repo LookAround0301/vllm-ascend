@@ -471,13 +471,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                         device="cpu",
                                         pin_memory=True)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
-        self.pcp_allgather_restore_idx = torch.zeros(self.max_num_tokens,
-                                                     dtype=torch.int32,
-                                                     device=self.device)
+        self.pcp_allgather_restore_idx = torch.zeros(
+            self.max_num_tokens + 2 * self.pcp_size * self.max_num_reqs,
+            dtype=torch.int32,
+            device=self.device)
         self.num_pcp_pads = torch.zeros(self.max_num_reqs, dtype=torch.int32)
-        self.pcp_padded_slot_mapping = torch.zeros(self.max_num_tokens,
-                                                   dtype=torch.int32,
-                                                   device=self.device)
+        self.pcp_padded_slot_mapping = torch.zeros(
+            self.max_num_tokens + 2 * self.pcp_size * self.max_num_reqs,
+            dtype=torch.int32,
+            device=self.device)
         self.num_actual_tokens_pcp_padded = 0
         if self.speculative_config and self.pcp_size > 1:
             self.input_ids_pcp_full = torch.zeros(self.max_num_tokens,
@@ -1763,7 +1765,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         # prepare pcp meta data
         long_seq_metadata = self._generate_pcp_metadata(
-            total_num_scheduled_tokens, seq_lens_cpu)
+            total_num_scheduled_tokens)
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
@@ -2689,8 +2691,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 self.cp_kv_recover_idx = torch.zeros(self.max_num_tokens,
                                                      dtype=torch.int32,
                                                      device=self.device)
-                long_seq_metadata = self._generate_pcp_metadata(
-                    num_tokens, self.seq_lens_cpu)
+                long_seq_metadata = self._generate_pcp_metadata(num_tokens)
                 if long_seq_metadata is not None:
                     pcp_world_size = get_pcp_group(
                     ).world_size if prefill_context_parallel_enable() else 1
@@ -4238,7 +4239,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         pcp_tokens[:num_decode_reqs] = 1
         return pcp_tokens, positions, unpad_mask
 
-    def _get_pcp_local_seq_lens(
+    def _get_cp_local_seq_lens(
         self,
         seq_lens: torch.Tensor,
         pcp_world_size: int = 1,
@@ -4266,7 +4267,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             [-1, pcp_world_size, dcp_world_size])
         return dcp_local_seq_lens
 
-    def _generate_pcp_metadata(self, total_num_scheduled_tokens, seq_lens):
+    def _generate_pcp_metadata(self, total_num_scheduled_tokens):
         num_reqs = self.input_batch.num_reqs
         num_decodes = sum(self.input_batch.num_computed_tokens_cpu[:num_reqs]
                           >= self.input_batch.num_prompt_tokens[:num_reqs])
@@ -4274,15 +4275,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.num_actual_tokens_pcp_padded = num_actual_tokens_pcp_padded
         long_seq_metadata = None
         if self.pcp_size * self.dcp_size > 1:
+            decode_context_lens = self.input_batch.num_tokens[:num_decodes]
+            prefill_context_lens = self.input_batch.num_computed_tokens_cpu[
+                num_decodes:num_reqs]
+            context_lens = np.concatenate(
+                [decode_context_lens, prefill_context_lens])
             long_seq_metadata = AscendPrefillContextParallelMetadata(
                 num_actual_tokens_pcp_padded=num_actual_tokens_pcp_padded,
-                num_computed_tokens_of_pcp_dcp=self._get_pcp_local_seq_lens(
-                    seq_lens,
+                num_computed_tokens_of_pcp_dcp=self._get_cp_local_seq_lens(
+                    torch.tensor(context_lens),
                     self.pcp_size,
                     self.dcp_size,
                     self.parallel_config.cp_kv_cache_interleave_size,
                 ).numpy(),
             )
+
             if self.pcp_size > 1:
                 q_head_idx, q_tail_idx = [], []
                 kv_with_q_head_nomask_idx, kv_with_q_head_mask_idx = [], []
@@ -4293,7 +4300,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 kv_req_offset = 0
                 q_head_chunk_id = self.pcp_rank
                 q_tail_chunk_id = self.pcp_size * 2 - 1 - self.pcp_rank
-                for i, seq_len in enumerate(seq_lens):
+                for i, seq_len in enumerate(self.query_lens):
                     if i < num_decodes:
                         continue
                     chunk_len = seq_len // 2
