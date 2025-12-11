@@ -4657,38 +4657,38 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     # of the _npu_ring_mla operator are not proportional, so we split
                     # long sequences into shorter ones to improve performance.
                     split_size = 16 * 1024
-                if self.pcp_rank == 0:
-                    split_q_head_nomask_idx_list = [
-                        self.
-                        kv_idx_names['kv_with_q_head_nomask_idx_tensor']
-                    ]
-                else:
-                    split_q_head_nomask_idx_list, split_q_head_nomask_lens_list = self._split_multi_batch_kv_idx(
-                        split_with_q_head_nomask_idx_reqs, split_size)
-                split_q_tail_nomask_idx_list, split_q_tail_nomask_lens_list = self._split_multi_batch_kv_idx(
-                    split_kv_with_q_tail_nomask_idx_reqs, split_size)
-                for q_head_nomask_idx in split_q_head_nomask_idx_list:
-                    split_q_head_nomask_idx_tensor_list.append(
-                        _list_to_tensor(q_head_nomask_idx, self.device))
+                    if self.pcp_rank == 0:
+                        split_q_head_nomask_idx_list = [
+                            self.
+                            kv_idx_names['kv_with_q_head_nomask_idx_tensor']
+                        ]
+                    else:
+                        split_q_head_nomask_idx_list, split_q_head_nomask_lens_list = self._split_multi_batch_kv_idx(
+                            split_with_q_head_nomask_idx_reqs, split_size)
+                    split_q_tail_nomask_idx_list, split_q_tail_nomask_lens_list = self._split_multi_batch_kv_idx(
+                        split_kv_with_q_tail_nomask_idx_reqs, split_size)
+                    for q_head_nomask_idx in split_q_head_nomask_idx_list:
+                        split_q_head_nomask_idx_tensor_list.append(
+                            _list_to_tensor(q_head_nomask_idx, self.device))
 
-                for q_tail_nomask_idx in split_q_tail_nomask_idx_list:
-                    split_q_tail_nomask_idx_tensor_list.append(
-                        _list_to_tensor(q_tail_nomask_idx, self.device))
+                    for q_tail_nomask_idx in split_q_tail_nomask_idx_list:
+                        split_q_tail_nomask_idx_tensor_list.append(
+                            _list_to_tensor(q_tail_nomask_idx, self.device))
 
-                if self.pcp_rank == 0:
-                    head_attn_nomask_seqlens_list = [
-                        head_attn_nomask_seqlens
-                    ]
-                else:
-                    for q_head_nomask_lens in split_q_head_nomask_lens_list:
-                        head_attn_nomask_seqlens_list.append(
-                            torch.tensor(
-                                [chunk_seqlens, q_head_nomask_lens],
-                                dtype=torch.int32))
-                for q_tail_nomask_lens in split_q_tail_nomask_lens_list:
-                    tail_attn_nomask_seqlens_list.append(
-                        torch.tensor([chunk_seqlens, q_tail_nomask_lens],
-                                     dtype=torch.int32))
+                    if self.pcp_rank == 0:
+                        head_attn_nomask_seqlens_list = [
+                            head_attn_nomask_seqlens
+                        ]
+                    else:
+                        for q_head_nomask_lens in split_q_head_nomask_lens_list:
+                            head_attn_nomask_seqlens_list.append(
+                                torch.tensor(
+                                    [chunk_seqlens, q_head_nomask_lens],
+                                    dtype=torch.int32))
+                    for q_tail_nomask_lens in split_q_tail_nomask_lens_list:
+                        tail_attn_nomask_seqlens_list.append(
+                            torch.tensor([chunk_seqlens, q_tail_nomask_lens],
+                                         dtype=torch.int32))
                 pcp_prefill_mask = self.attn_mask
 
                 self.extra_long_seq_kwargs = {
