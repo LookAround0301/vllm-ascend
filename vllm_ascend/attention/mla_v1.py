@@ -18,7 +18,7 @@ from vllm.distributed import (get_dcp_group,
                               get_tp_group)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import logger
-from vllm.model_executor.layers.linear import (LinearBase,
+from vllm.model_executor.layers.linear import (LinearBase, ReplicatedLinear,
                                                UnquantizedLinearMethod)
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.attention.backends.utils import AttentionCGSupport
@@ -36,9 +36,13 @@ from vllm_ascend.compilation.acl_graph import (get_graph_params,
                                                update_graph_params_workspaces)
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
-from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
-                               is_enable_nz, weak_ref_tensors)
+from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ, dispose_layer,
+                               is_enable_nz, weak_ref_tensors, replace_layer)
 from vllm_ascend.worker.npu_input_batch import InputBatch
+from vllm_ascend.ops.shared_weight_layer import (
+    is_hidden_layer, post_process_after_loading_for_shared_weight_series,
+    reach_layer_for_shared_weight_series,
+    register_layer_to_shared_weight_series)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -852,6 +856,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.enable_kv_nz = ascend_config.torchair_graph_config.enable_kv_nz
 
         vllm_config = get_current_vllm_config()
+        self.vllm_config = vllm_config
         self.ring_mla_mask_size = 512
         self.prefill_mask = None
 
@@ -874,6 +879,30 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_group = get_tp_group(
         ).device_group if self.tp_size > 1 else None
+        self.enable_sharded_CP = envs.VLLM_ASCEND_ENABLE_SHARDED_CONTEXT_PARALLEL
+        from vllm_ascend.distributed.parallel_state import \
+            get_shared_weight_group
+        if self.enable_sharded_CP:
+            assert self.dcp_size == 1
+            self.local_num_heads = self.num_heads * self.tp_size
+
+            #TODO: Temporarily adapt sfa-cp, remove after adapting near PCP. --clrs97
+            self._replace_linear_class_for_mla_cp()
+            if is_hidden_layer(self.vllm_config, self.q_proj):
+                register_layer_to_shared_weight_series(
+                    series_name="q_proj",
+                    group=get_shared_weight_group(),
+                    layer=self.q_proj,
+                    prefetch_step=1)
+            if is_hidden_layer(self.vllm_config, self.o_proj):
+                register_layer_to_shared_weight_series(
+                    series_name="o_proj",
+                    group=get_shared_weight_group(),
+                    layer=self.o_proj,
+                    prefetch_step=1)
+
+        # print(self.o_proj)
+        # print("=================================================")
 
     def _v_up_proj(self, x):
         if x.dtype in [torch.float16, torch.bfloat16] \
@@ -974,6 +1003,13 @@ class AscendMLAImpl(MLAAttentionImpl):
         # Waiting for BMM NZ support
         # self.W_UV.data = torch_npu.npu_format_cast(self.W_UV.data, 29)
         # self.W_UK_T.data = torch_npu.npu_format_cast(self.W_UK_T.data, 29)
+        if self.enable_sharded_CP:
+            if is_hidden_layer(self.vllm_config, self.q_proj):
+                post_process_after_loading_for_shared_weight_series(
+                    self.q_proj)
+            if is_hidden_layer(self.vllm_config, self.o_proj):
+                post_process_after_loading_for_shared_weight_series(
+                    self.o_proj)
 
         if self.enable_mlapo:
             # Currently mlapo only supports W8A8 quantization in MLA scenario
@@ -1599,6 +1635,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     [prefill_k_c_normed, prefill_k_pe], dim=-1)
                 prefill_kv_c_k_pe = get_pcp_group().all_gather(
                     prefill_kv_c_k_pe, 0)
+                if self.enable_sharded_CP and is_hidden_layer(self.vllm_config, self.q_proj):
+                    reach_layer_for_shared_weight_series(self.q_proj)
                 prefill_kv_c_k_pe = torch.index_select(
                     prefill_kv_c_k_pe, 0, attn_metadata.prefill.pcp_metadata.
                     pcp_allgather_restore_idx)
@@ -1716,8 +1754,13 @@ class AscendMLAImpl(MLAAttentionImpl):
                            dependency=o_proj_input,
                            max_size=MAX_O_PROJ_PREFETCH_SIZE,
                            enabled=self.enable_prefetch)
+        if self.enable_sharded_CP and is_hidden_layer(self.vllm_config, self.o_proj):
+            reach_layer_for_shared_weight_series(self.o_proj)
 
-        output[...] = self.o_proj(o_proj_input,
+        if self.enable_sharded_CP:
+            output[...] = self.o_proj(o_proj_input)[0]
+        else:
+            output[...] = self.o_proj(o_proj_input,
                                   is_prefill=prefill_preprocess_res
                                   is not None)[0]
 
@@ -2101,3 +2144,42 @@ class AscendMLAImpl(MLAAttentionImpl):
         assert reorganized_k_pe.shape[0] == sum_seq_len
         assert max_seq_len_check == max_seq_len
         return reorganized_kv_c_normed, reorganized_k_pe
+
+    def _replace_linear_class_for_mla_cp(self):
+
+        vllm_config = get_current_vllm_config()
+        # Dispose tensor from the original q_proj
+        dispose_layer(self.q_proj)
+        # Construct the new q_proj using ReplicatedLinear
+        new_q_proj = ReplicatedLinear(self.q_lora_rank,
+                                      self.local_num_heads * self.qk_head_dim,
+                                      bias=False,
+                                      quant_config=vllm_config.quant_config,
+                                      prefix=self.q_proj.prefix)
+        # Replace the q_proj with the new one
+        replace_layer(self.q_proj, new_q_proj)
+
+        # Dispose tensor from the original kv_b_proj
+        dispose_layer(self.kv_b_proj)
+        # Construct the new kv_b_proj using ReplicatedLinear
+        new_kv_b_proj = ReplicatedLinear(
+            self.kv_lora_rank,
+            self.local_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=self.kv_b_proj.prefix)
+        # Replace the kv_b_proj with the new one
+        replace_layer(self.kv_b_proj, new_kv_b_proj)
+
+        # Dispose tensor from the original o_proj
+        dispose_layer(self.o_proj)
+        # Construct the new o_proj using ReplicatedLinear
+        config = vllm_config.model_config.hf_config
+        new_o_proj = ReplicatedLinear(config.num_attention_heads *
+                                      config.v_head_dim,
+                                      config.hidden_size,
+                                      bias=False,
+                                      quant_config=vllm_config.quant_config,
+                                      prefix=self.o_proj.prefix)
+        # Replace the o_proj with the new one
+        replace_layer(self.o_proj, new_o_proj)

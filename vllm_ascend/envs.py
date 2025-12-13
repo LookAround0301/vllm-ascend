@@ -176,6 +176,9 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Whether to anbale dynamic EPLB
     "DYNAMIC_EPLB":
     lambda: os.getenv("DYNAMIC_EPLB", "false").lower(),
+    # Decide whether we should enable sharded context parallelism.
+    "VLLM_ASCEND_ENABLE_SHARDED_CONTEXT_PARALLEL":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_SHARDED_CONTEXT_PARALLEL", '0'))),
 }
 
 # end-env-vars-definition

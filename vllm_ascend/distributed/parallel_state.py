@@ -19,6 +19,8 @@ _LMTP: Optional[GroupCoordinator] = None
 _P_TP: Optional[GroupCoordinator] = None
 _FLASHCOMM2_OTP: Optional[GroupCoordinator] = None
 _FLASHCOMM2_ODP: Optional[GroupCoordinator] = None
+_EMBED_TP: Optional[GroupCoordinator] = None
+_SHARED_WEIGHT: Optional[GroupCoordinator] = None
 
 
 def get_mc2_group() -> GroupCoordinator:
@@ -49,7 +51,7 @@ def get_flashcomm2_odp_group() -> GroupCoordinator:
 
 
 def get_mlp_tp_group() -> GroupCoordinator:
-    assert _MLP_TP is not None, ("mlp group is not initialized")
+    # assert _MLP_TP is not None, ("mlp group is not initialized")
     return _MLP_TP
 
 
@@ -58,17 +60,32 @@ def get_p_tp_group() -> GroupCoordinator:
         "distributed prefill tensor parallel group is not initialized")
     return _P_TP
 
+def get_embed_tp_group() -> GroupCoordinator:
+    assert _EMBED_TP is not None, ("emtp group is not initialized")
+    return _EMBED_TP
+
+def get_shared_weight_group() -> GroupCoordinator:
+    assert _SHARED_WEIGHT is not None, (
+        "output shared weight parallel group for flashcomm2 is not initialized"
+    )
+    return _SHARED_WEIGHT
 
 def model_parallel_initialized():
     return (_MC2 is not None)
 
 
 def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
+    enable_sharded_CP = envs_ascend.VLLM_ASCEND_ENABLE_SHARDED_CONTEXT_PARALLEL
     if model_parallel_initialized():
         return
     assert torch.distributed.is_initialized()
     world_size = torch.distributed.get_world_size()
     backend = torch.distributed.get_backend(get_world_group().device_group)
+
+    global_tp_size = parallel_config.tensor_parallel_size
+    global_dp_size = parallel_config.data_parallel_size
+    global_pp_size = parallel_config.pipeline_parallel_size
+    global_pcp_size = parallel_config.prefill_context_parallel_size
 
     # The layout of all ranks: ExternalDP * EP
     # ExternalDP is the data parallel group that is not part of the model,
@@ -125,54 +142,54 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
                                      get_world_group().local_rank,
                                      backend,
                                      group_name="mc2")
-    if envs_ascend.VLLM_ASCEND_ENABLE_MLP_OPTIMIZE:
-        global _MLP_TP
-        assert _MLP_TP is None, (
-            "mlp tensor model parallel group is already initialized")
+    _group_cache = {}
 
-        mlp_tp = parallel_config.data_parallel_size
+    def _create_or_get_group(group_size: int,
+                             group_name: str) -> GroupCoordinator:
+        if group_size is None:
+            return None
+        if group_size not in _group_cache:
 
-        all_ranks_mlp_head = torch.arange(world_size).reshape(
-            -1, mlp_tp, parallel_config.pipeline_parallel_size, 1)  # noqa
-        group_ranks = all_ranks_mlp_head.view(-1, mlp_tp).unbind(0)
-        group_ranks = [x.tolist() for x in group_ranks]
 
-        # message queue broadcaster is only used in tensor model parallel group
-        _MLP_TP = init_model_parallel_group(group_ranks,
-                                            get_world_group().local_rank,
-                                            backend,
-                                            group_name="mlp_tp")
+            rank_grid = torch.arange(world_size).reshape(
+                global_pp_size, global_dp_size, global_pcp_size)
+            print("========= aaaa  ===========")
+            print(f"global_dp_size:{global_dp_size}, group_size:{group_size}, world_size:{world_size}, global_pcp_size:{global_pcp_size}, group_name:{group_name}")
+            print("========= aaaa  ===========")
+            group_ranks = []
+            for pp_idx in range(global_pp_size):
+                stage_ranks = rank_grid[pp_idx]  # (dp, tp)
+                for chunk in range(1):
+                    for tp_idx in range(global_pcp_size):
+                        group = stage_ranks[chunk * group_size:(chunk + 1) *
+                                            group_size, tp_idx].tolist()
+                        group_ranks.append(group)
+            pg = init_model_parallel_group(group_ranks,
+                                           get_world_group().local_rank,
+                                           backend,
+                                           group_name=group_name)
+            _group_cache[group_size] = pg
 
-    # If oproj tensor parallel size is set, we will create a group for it.
-    otp_size = get_ascend_config().oproj_tensor_parallel_size
-    if otp_size is not None:
-        group_ranks = []
-        global _OTP
-        num_oproj_tensor_parallel_groups: int = (world_size // otp_size)
-        for i in range(num_oproj_tensor_parallel_groups):
-            ranks = list(range(i * otp_size, (i + 1) * otp_size))
-            group_ranks.append(ranks)
-        _OTP = init_model_parallel_group(group_ranks,
-                                         get_world_group().local_rank,
-                                         backend,
-                                         group_name="otp")
+        return _group_cache[group_size]
 
-    lmhead_tensor_parallel_size = get_ascend_config(
-    ).lmhead_tensor_parallel_size
-    if lmhead_tensor_parallel_size is not None:
-        group_ranks = []
-        global _LMTP
-        num_lmhead_tensor_parallel_groups: int = (world_size //
-                                                  lmhead_tensor_parallel_size)
-        for i in range(num_lmhead_tensor_parallel_groups):
-            ranks = list(
-                range(i * lmhead_tensor_parallel_size,
-                      (i + 1) * lmhead_tensor_parallel_size))
-            group_ranks.append(ranks)
-        _LMTP = init_model_parallel_group(group_ranks,
-                                          get_world_group().local_rank,
-                                          backend,
-                                          group_name="lmheadtp")
+    otp_size = get_ascend_config().module_tp_config.oproj_tensor_parallel_size
+    lmhead_tp_size = get_ascend_config(
+    ).module_tp_config.lmhead_tensor_parallel_size
+    embedding_tp_size = get_ascend_config(
+    ).module_tp_config.embedding_tensor_parallel_size
+    mlp_tp_size = get_ascend_config(
+    ).module_tp_config.embedding_tensor_parallel_size
+
+    global _OTP, _LMTP, _EMBED_TP, _MLP_TP
+
+    if otp_size > 0:
+        _OTP = _create_or_get_group(otp_size, "otp")
+    if lmhead_tp_size > 0:
+        _LMTP = _create_or_get_group(lmhead_tp_size, "lmheadtp")
+    if embedding_tp_size > 0:
+        _EMBED_TP = _create_or_get_group(embedding_tp_size, "emtp")
+    if mlp_tp_size > 0:
+        _MLP_TP = _create_or_get_group(mlp_tp_size, "mlptp")
 
     # TODO: Extract and unify the logic across different communication group.
     if flashcomm2_enable():
@@ -226,6 +243,18 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
                 backend,
                 group_name="flashcomm2_odp")
 
+    vllm_config = get_current_vllm_config()
+    # TODO: Check if the model is Deepseek V3.2 with enabled SFA CP and activated shared weights. It will then be normalized within the PCP parameters. -- clrs97
+    is_ds_v32 = hasattr(vllm_config.model_config.hf_config, "index_topk")
+    if enable_sharded_CP:
+        global _SHARED_WEIGHT
+        group_ranks = [list(range(torch.distributed.get_world_size()))]
+        _SHARED_WEIGHT = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="CP_shared_weight")
+
 
 def get_mlp_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
@@ -274,3 +303,8 @@ def destroy_ascend_model_parallel():
     ).flashcomm2_oproj_tensor_parallel_size != 1:
         _FLASHCOMM2_ODP.destroy()
         _FLASHCOMM2_ODP = None
+
+    global _SHARED_WEIGHT
+    if _SHARED_WEIGHT:
+        _SHARED_WEIGHT.destroy()
+    _SHARED_WEIGHT = None
