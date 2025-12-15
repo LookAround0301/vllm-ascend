@@ -3533,7 +3533,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_ids_pcp_full.cpu[:total_num_scheduled_tokens_pcp_full],
             non_blocking=True,
         )
-
+    
     def _split_multi_batch_kv_idx(
         self,
         kv_nomask_idx_multi_batch,
@@ -3588,7 +3588,7 @@ def _torch_cuda_wrapper():
 
     try:
         # replace cuda APIs with xpu APIs, this should work by default
-        torch.cuda.Event = torch.npu.Event
+        torch.cuda.Event = _EventPlaceholder
         torch.cuda.Stream = torch.npu.Stream
         torch.cuda.default_stream = torch.npu.default_stream
         torch.cuda.current_stream = torch.npu.current_stream
@@ -3607,3 +3607,4 @@ def _torch_cuda_wrapper():
         torch.cuda.default_stream = torch.npu.default_stream
         torch.cuda.current_stream = torch.npu.current_stream
         torch.cuda.stream = torch.npu.stream
+
