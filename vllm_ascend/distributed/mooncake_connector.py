@@ -42,13 +42,8 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.distributed.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.utils import get_transfer_timeout_value
 from vllm_ascend.utils import prefill_context_parallel_enable
+from vllm.distributed import get_pcp_group
 
-# isort: off
-if prefill_context_parallel_enable():
-    from vllm.distributed import (get_prefill_context_model_parallel_rank,
-                                  get_prefill_context_model_parallel_world_size
-                                  )
-# isort: on
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -1002,13 +997,12 @@ class MooncakeConnectorWorker:
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.side_channel_host = get_ip()
-        self.pcp_size = get_prefill_context_model_parallel_world_size(
-        ) if prefill_context_parallel_enable() else 1
+        self.pcp_size = get_pcp_group().world_size
         # Assert that pp_size and pcp_size cannot both be greater than 1
         assert not (self.pp_size > 1 and self.pcp_size
                     > 1), "pp and pcp cannot open in same time"
-        self.pcp_rank = get_prefill_context_model_parallel_rank(
-        ) if self.pcp_size > 1 else 0
+        self.pcp_rank = get_pcp_group(
+        ).rank_in_group if self.pcp_size > 1 else 0
         self.dcp_size = get_decode_context_model_parallel_world_size()
         self.dcp_rank = get_decode_context_model_parallel_rank(
         ) if self.dcp_size > 1 else 0
@@ -1329,8 +1323,6 @@ class MooncakeConnectorWorker:
                                 pcp_dcp_rank],
                             remote_engine_id=remote_engine_id,
                             remote_host=remote_host,
-                            remote_engine_id=meta.remote_engine_id,
-                            remote_host=meta.remote_host,
                             remote_handshake_port=remote_handshake_port_list[
                                 pcp_dcp_rank][i],
                             offset=i,
@@ -1354,7 +1346,6 @@ class MooncakeConnectorWorker:
                         local_block_ids=meta.local_block_ids,
                         remote_engine_id=remote_engine_id,
                         remote_host=remote_host,
-                        remote_host=meta.remote_host,
                         remote_handshake_port=remote_handshake_port_list[i][0],
                         offset=i,
                         tp_num_need_pulls=self.tp_num_need_pulls,
