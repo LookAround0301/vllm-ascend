@@ -3534,43 +3534,6 @@ class NPUModelRunner(GPUModelRunner):
             non_blocking=True,
         )
 
-
-@contextmanager
-def _torch_cuda_wrapper():
-
-    class _EventPlaceholder:
-
-        def __init__(self, *args, **kwargs) -> None:
-            self.record = lambda: None
-            self.synchronize = lambda: None
-
-    class _StreamPlaceholder:
-
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-    try:
-        # replace cuda APIs with xpu APIs, this should work by default
-        torch.cuda.Event = torch.npu.Event
-        torch.cuda.Stream = torch.npu.Stream
-        torch.cuda.default_stream = torch.npu.default_stream
-        torch.cuda.current_stream = torch.npu.current_stream
-        torch.cuda.stream = torch.npu.stream
-        yield
-    except Exception:
-        torch.cuda.Event = _EventPlaceholder
-        torch.cuda.Stream = _StreamPlaceholder
-        torch.cuda.default_stream = _StreamPlaceholder
-        torch.cuda.current_stream = _StreamPlaceholder
-        torch.cuda.stream = _StreamPlaceholder
-    finally:
-        # if anything goes wrong, just patch it with a placeholder
-        torch.cuda.Event = _EventPlaceholder
-        torch.cuda.Stream = torch.cuda.Stream
-        torch.cuda.default_stream = torch.npu.default_stream
-        torch.cuda.current_stream = torch.npu.current_stream
-        torch.cuda.stream = torch.npu.stream
-
     def _split_multi_batch_kv_idx(
         self,
         kv_nomask_idx_multi_batch,
@@ -3607,3 +3570,40 @@ def _torch_cuda_wrapper():
 
         merged_split_kv_len_2d = reshape_kv_len_to_time_first(split_kv_len_2d)
         return merged_split_kv_idx_3d, merged_split_kv_len_2d
+
+
+@contextmanager
+def _torch_cuda_wrapper():
+
+    class _EventPlaceholder:
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.record = lambda: None
+            self.synchronize = lambda: None
+
+    class _StreamPlaceholder:
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    try:
+        # replace cuda APIs with xpu APIs, this should work by default
+        torch.cuda.Event = torch.npu.Event
+        torch.cuda.Stream = torch.npu.Stream
+        torch.cuda.default_stream = torch.npu.default_stream
+        torch.cuda.current_stream = torch.npu.current_stream
+        torch.cuda.stream = torch.npu.stream
+        yield
+    except Exception:
+        torch.cuda.Event = _EventPlaceholder
+        torch.cuda.Stream = _StreamPlaceholder
+        torch.cuda.default_stream = _StreamPlaceholder
+        torch.cuda.current_stream = _StreamPlaceholder
+        torch.cuda.stream = _StreamPlaceholder
+    finally:
+        # if anything goes wrong, just patch it with a placeholder
+        torch.cuda.Event = _EventPlaceholder
+        torch.cuda.Stream = torch.cuda.Stream
+        torch.cuda.default_stream = torch.npu.default_stream
+        torch.cuda.current_stream = torch.npu.current_stream
+        torch.cuda.stream = torch.npu.stream
