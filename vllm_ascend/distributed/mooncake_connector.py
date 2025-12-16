@@ -60,7 +60,7 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     te_rpc_port: int
     kv_caches_base_addr: list[int]
     num_blocks: int
-    local_ip: str = None
+    local_ip: str = ""
 
 
 @dataclass
@@ -72,7 +72,7 @@ class ReqMeta:
     remote_engine_id: str
     remote_pcp_size: int
     remote_dcp_size: int
-    remote_multi_nodes_meta_mapping: dict
+    remote_multi_nodes_meta_mapping: dict[str, dict[str, Any]]
 
 
 @dataclass
@@ -684,7 +684,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             remote_pcp_size=kv_transfer_params.get("remote_pcp_size", 1),
             remote_dcp_size=kv_transfer_params.get("remote_dcp_size", 1),
             remote_multi_nodes_meta_mapping=kv_transfer_params.get(
-                "remote_multi_nodes_meta_mapping", 1),
+                "remote_multi_nodes_meta_mapping", {}),
         )
 
 
@@ -829,7 +829,7 @@ class MooncakeConnectorScheduler:
         self._reqs_need_send: dict[str, float] = {}
 
         # master-slave meta information for cross-nodes
-        self.multi_nodes_meta_mapping = {}
+        self.multi_nodes_meta_mapping: dict[str, dict[str, Any]] = {}
 
     def get_num_new_matched_tokens(
             self, request: "Request",
@@ -1344,6 +1344,7 @@ class MooncakeConnectorWorker:
                     self.kv_recv_thread.add_request(
                         request_id=req_id,
                         local_block_ids=meta.local_block_ids,
+                        remote_block_ids=meta.remote_block_ids,
                         remote_engine_id=remote_engine_id,
                         remote_host=remote_host,
                         remote_handshake_port=remote_handshake_port_list[i][0],
@@ -1365,7 +1366,8 @@ class MooncakeConnectorWorker:
                                       remote_host: str, remote_engine_id: str,
                                       remote_multi_nodes_meta_mapping: dict):
         rank = str(remote_handshake_port - base_port)
-        if remote_multi_nodes_meta_mapping.get(rank, None) is None:
+        if remote_multi_nodes_meta_mapping is None or remote_multi_nodes_meta_mapping.get(
+                rank, None) is None:
             return remote_host, remote_engine_id
         info = remote_multi_nodes_meta_mapping[rank]
         return info.get("host", remote_host), info.get("engine_id",

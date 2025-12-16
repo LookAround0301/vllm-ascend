@@ -387,9 +387,6 @@ class NPUWorker(WorkerBase):
         if (metadata := connector.get_handshake_metadata()) is None:
             return None
         return {self.rank: metadata}
-    
-    def get_kv_connector_handshake_metadata(self) -> Optional[dict]:
-        return None
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
