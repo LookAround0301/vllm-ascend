@@ -124,8 +124,10 @@ class BlockTable:
 
         self.block_table.np[[src, tgt]] = self.block_table.np[[tgt, src]]
 
-    def compute_slot_mapping(self, req_indices: np.ndarray,
-                             positions: np.ndarray) -> None:
+    def compute_slot_mapping(self,
+                             req_indices: np.ndarray,
+                             positions: np.ndarray,
+                             dynamic_pcp_size: int = 0) -> None:
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 0, K, K, K + 1, K + 1, K + 2, 2 * K, 2 * K, 2 * K + 1]
         # where K is the max_num_blocks_per_req and the block size is 2.
@@ -136,11 +138,13 @@ class BlockTable:
         if self.dcp_world_size * self.pcp_world_size > 1:
             # Note(hc): The DCP implement store kvcache with an interleave
             # style, the kvcache for the token whose token_idx is i is
-            # always stored on the GPU whose dcp_rank equals i % pcp_world_size:
+            # always stored on the GPU whose dcp_rank equals i % cp_world_size:
+
+            pcp_size = dynamic_pcp_size if dynamic_pcp_size > 0 else self.pcp_world_size
 
             # Use a "virtual block" which equals to world_size * block_size
             # for block_table_indices calculation.
-            virtual_block_size = self.block_size * self.dcp_world_size * self.pcp_world_size
+            virtual_block_size = self.block_size * self.dcp_world_size * pcp_size
 
             # IMPORTANT: In hybrid mode, positions are in logical block space,
             # but we need to map them to the correct logical block table indices
@@ -160,11 +164,10 @@ class BlockTable:
             virtual_block_offsets = positions % virtual_block_size
             self.current_rank = self.dcp_world_size * self.pcp_rank + self.dcp_rank
             mask = (virtual_block_offsets // self.cp_kv_cache_interleave_size %
-                    (self.dcp_world_size *
-                     self.pcp_world_size) == self.current_rank)
+                    (self.dcp_world_size * pcp_size) == self.current_rank)
             # Calculate local block_offsets
             block_offsets = virtual_block_offsets \
-                // (self.dcp_world_size * self.pcp_world_size * self.cp_kv_cache_interleave_size) \
+                // (self.dcp_world_size * pcp_size * self.cp_kv_cache_interleave_size) \
                 * self.cp_kv_cache_interleave_size + virtual_block_offsets % self.cp_kv_cache_interleave_size
             # Calculate slot_mapping
             slot_mapping = block_numbers * self.block_size + block_offsets
@@ -307,10 +310,13 @@ class MultiGroupBlockTable:
         for block_table in self.block_tables:
             block_table.swap_row(src, tgt)
 
-    def compute_slot_mapping(self, req_indices: np.ndarray,
-                             positions: np.ndarray) -> None:
+    def compute_slot_mapping(self,
+                             req_indices: np.ndarray,
+                             positions: np.ndarray,
+                             dynamic_pcp_size: int = 0) -> None:
         for block_table in self.block_tables:
-            block_table.compute_slot_mapping(req_indices, positions)
+            block_table.compute_slot_mapping(req_indices, positions,
+                                             dynamic_pcp_size)
 
     def commit_block_table(self, num_reqs: int) -> None:
         for block_table in self.block_tables:
