@@ -83,6 +83,8 @@ class AscendMetadataForDecode:
 @dataclass
 # class AscendCommonLongSequenceMetadata:
 class AscendPrefillContextParallelMetadata:
+    dynamic_pcp_size: int = 0
+
     pcp_allgather_restore_idx: torch.Tensor = None
 
     cp_kv_recover_idx_for_chunk: torch.Tensor = None

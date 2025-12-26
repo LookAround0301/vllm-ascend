@@ -18,6 +18,7 @@ class AscendPCPMetadata:
     q_full_idx: torch.Tensor = None
     pcp_prefill_mask: torch.Tensor = None
     pcp_allgather_restore_idx: Optional[list[int]] = None
+    dynamic_pcp_size: int = 0
 
 
 @dataclass
