@@ -60,6 +60,7 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               CommonAttentionMetadata)
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         EncoderOnlyAttentionSpec,
                                         FullAttentionSpec, KVCacheConfig,
@@ -140,6 +141,22 @@ class GraphCaptureContext:
     stream: torch.npu.Stream
 
 
+@dataclass
+class DynamicPCPInfo:
+
+    # For Batch Parallel (similar to DP):
+    # Retains information of all requests,
+    # used to construct model_output
+    original_input_batch: NPUInputBatch = None
+    original_req_ids: list[int] = None
+    original_req_id_to_index: dict[str, int] = None
+    # max num_tokens across all cpranks
+    max_num_token_across_cp: int = 0
+    # After model.forward(), all requests will be AG,
+    # and logits will be selected based on all requests
+    logits_indices: list[int] = None
+
+
 @contextmanager
 def graph_capture(device: torch.device):
     """
@@ -216,13 +233,12 @@ class NPUModelRunner(GPUModelRunner):
         self.ascend_config = get_ascend_config()
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
-        dump_cfg = self.ascend_config.dump_config
-        self.dump_enable = dump_cfg.enable_dump
+        dump_cfg = self.ascend_config.dump_config_path
         self.debugger = None
-        if self.dump_enable:
+        if dump_cfg is not None:
             if self.model_config.enforce_eager:
                 from msprobe.pytorch import PrecisionDebugger
-                self.debugger = PrecisionDebugger(dump_cfg.config_path)
+                self.debugger = PrecisionDebugger(dump_cfg)
             else:
                 raise RuntimeError(
                     "Dumping/debugging only works in eager mode.")
@@ -345,6 +361,13 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs,
                                                   dtype=torch.int32)
+        # 根据 scheduler.output 实时调整
+        # 动态PCP关闭时，dynamic_pcp_size默认等于pcp_size
+        # 动态PCP开启时，dynamic_pcp_size有效值在 [1,pcp_size] 之间
+        #   if dynamic_pcp_size == 1: 执行BP逻辑（类DP）
+        #   if dynamic_pcp_size == pcp_size: 执行原本CP逻辑
+        self.dynamic_pcp_size: int = 0
+        self.dynamic_pcp_info = DynamicPCPInfo()
         # here we use int32
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -474,7 +497,16 @@ class NPUModelRunner(GPUModelRunner):
         return self.model
 
     def _make_attention_mask(self, attn_state) -> torch.Tensor:
-        # pcp situation.
+        #  动态CP的DP场景需要mask，而且CP也需要mask
+        if 1 < self.pcp_size == self.dynamic_pcp_size:
+            return None
+        if self.pcp_size > 1 and self.dynamic_pcp_size == 1:
+            max_seq_len = max(seq_lens.max().item(), 0)
+            return torch.triu(
+                torch.full((max_seq_len, max_seq_len),
+                           float('-inf') if self.dtype == torch.float16 else 1,
+                           device=self.device,
+                           dtype=torch.bool), 1)
         if self.attn_mask_builder is None:
             raise ValueError("Attn mask builder is None")
         # Pooling situation.
@@ -562,7 +594,7 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.input_batch.block_table.compute_slot_mapping(
-            req_indices, positions_np)
+            req_indices, positions_np, dynamic_pcp_size=self.dynamic_pcp_size)
         self.input_batch.block_table.commit_slot_mapping(
             total_num_scheduled_tokens)
 
@@ -646,7 +678,7 @@ class NPUModelRunner(GPUModelRunner):
         cu_num_tokens, arange = self._get_cumsum_and_arange(
             num_scheduled_tokens)
 
-        if self.pcp_size > 1:
+        if 1 < self.pcp_size == self.dynamic_pcp_size:
             positions_np = self.positions.np[:total_num_scheduled_tokens]
             np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
                    position_pcp[:total_num_scheduled_tokens],
@@ -977,7 +1009,7 @@ class NPUModelRunner(GPUModelRunner):
                 blk_table = self.input_batch.block_table[kv_cache_group_id]
                 blk_table_tensor = blk_table.get_device_tensor()
                 blk_table.slot_mapping.gpu[slot_mapping_size:].fill_(0)
-                if self.pcp_size > 1:
+                if 1 < self.pcp_size == self.dynamic_pcp_size:
                     slot_mapping_for_pcp = blk_table.slot_mapping.gpu[:
                                                                       long_seq_metadata
                                                                       .
@@ -1185,12 +1217,20 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = hidden_states[:-pad_size, :]
 
         if self.pcp_size > 1:
-            hidden_states = get_pcp_group().all_gather(
-                hidden_states[:self.num_actual_tokens_pcp_padded //
-                              self.pcp_size], 0)
-            hidden_states = torch.index_select(
-                hidden_states, 0,
-                self.pcp_allgather_restore_idx[:hidden_states.shape[0]])
+            if self.dynamic_pcp_size == self.pcp_size:
+                hidden_states = get_pcp_group().all_gather(
+                    hidden_states[:self.num_actual_tokens_pcp_padded //
+                                  self.pcp_size], 0)
+                hidden_states = torch.index_select(
+                    hidden_states, 0,
+                    self.pcp_allgather_restore_idx[:hidden_states.shape[0]])
+            elif self.dynamic_pcp_size == 1:
+                hidden_states = nn.functional.pad(
+                    hidden_states[:self.num_actual_tokens_pcp_padded //
+                                  self.pcp_size],
+                    (0, 0, 0, self.dynamic_pcp_info.max_num_token_across_cp -
+                     hidden_states.shape[0]))
+                hidden_states = get_pcp_group().all_gather(hidden_states, 0)
         return hidden_states
 
     def _build_attn_state(self, num_reqs, num_scheduled_tokens,
@@ -1354,6 +1394,10 @@ class NPUModelRunner(GPUModelRunner):
                                "after execute_model() returns None.")
 
         with ProfileExecuteDuration().capture_async("prepare input"):
+            if self.pcp_size > 1:
+                self.dynamic_pcp_size = scheduler_output.dynamic_pcp_size
+                scheduler_output = self._pre_process_sched_output_in_dynamic_pcp(
+                    scheduler_output)
             self._update_states(scheduler_output)
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -1365,6 +1409,8 @@ class NPUModelRunner(GPUModelRunner):
                         scheduler_output)
 
             if not scheduler_output.total_num_scheduled_tokens:
+                if self.pcp_size > 1 and self.dynamic_pcp_size == 1:
+                    self._idle_generate()
                 if not has_kv_transfer_group():
                     logger.debug(
                         "skip this step for we receive the data from remote disaggregate prefill node"
@@ -1388,9 +1434,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.eplb_updator.take_update_info_from_eplb_process()
 
         # prevent debugger is None
-        need_dump = self.dump_enable and self.debugger is not None
-        if need_dump:
-            assert self.debugger is not None
+        if self.debugger is not None:
             dbg_cfg = getattr(self.debugger, "config", None)
             dump_level = str(
                 getattr(dbg_cfg, "level",
@@ -1407,7 +1451,7 @@ class NPUModelRunner(GPUModelRunner):
         aclgraph_runtime_mode, batch_descriptor = \
             self.cudagraph_dispatcher.dispatch(num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora)
 
-        if self.ascend_config.enable_async_exponential != 0:
+        if self.ascend_config.enable_async_exponential:
             self.sampler.do_async_exponential(
                 b_s=logits_indices.shape[0],
                 head_dim=self.model_config.get_vocab_size(),
@@ -1457,8 +1501,7 @@ class NPUModelRunner(GPUModelRunner):
                 if not broadcast_pp_output:
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
-                    if need_dump:
-                        assert self.debugger is not None
+                    if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
                     return hidden_states
@@ -1472,11 +1515,12 @@ class NPUModelRunner(GPUModelRunner):
                         hidden_states,
                         scheduler_output.total_num_scheduled_tokens,
                         num_scheduled_tokens_np)
-                    if need_dump:
-                        assert self.debugger is not None
+                    if self.debugger is not None:
                         self.debugger.stop()
                         self.debugger.step()
                     return pool_output
+                if self.pcp_size > 1 and self.dynamic_pcp_size == 1:
+                    logits_indices = self.dynamic_pcp_info.logits_indices
                 # Sometimes, after the model is compiled through the AOT backend,
                 # the model output may become a list containing only one Tensor object.
                 if isinstance(hidden_states, list) and \
@@ -1529,7 +1573,6 @@ class NPUModelRunner(GPUModelRunner):
             output.kv_connector_output = kv_connector_output
             return output
 
-        need_dump = self.dump_enable and self.debugger is not None
         # Unpack ephemeral state.
         (
             scheduler_output,
@@ -1628,13 +1671,13 @@ class NPUModelRunner(GPUModelRunner):
         if self.dynamic_eplb:
             self.eplb_updator.forward_end()
         if not self.use_async_scheduling:
-            if need_dump:
+            if self.debugger is not None:
                 assert self.debugger is not None
                 self.debugger.stop()
                 self.debugger.step()
             return model_runner_output
 
-        if need_dump:
+        if self.debugger is not None:
             assert self.debugger is not None
             self.debugger.stop()
             self.debugger.step()
@@ -1652,6 +1695,9 @@ class NPUModelRunner(GPUModelRunner):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
+            if self.pcp_size > 1 and self.dynamic_pcp_size == 1:
+                input_batch = self.dynamic_pcp_info.original_input_batch
+                sampling_metadata = input_batch.sampling_metadata
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[:self.input_batch.num_reqs]
             return self.sampler(
@@ -1700,8 +1746,13 @@ class NPUModelRunner(GPUModelRunner):
 
         # Copy some objects so they don't get modified after returning.
         # This is important when using async scheduling.
-        req_ids_output_copy = self.input_batch.req_ids.copy()
-        req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+        if self.pcp_size > 1 and self.dynamic_pcp_size == 1:
+            req_ids_output_copy = self.dynamic_pcp_info.original_req_ids
+            req_id_to_index_output_copy = self.dynamic_pcp_info.original_req_id_to_index
+        else:
+            req_ids_output_copy = self.input_batch.req_ids.copy()
+            req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy(
+            )
 
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
@@ -1749,7 +1800,8 @@ class NPUModelRunner(GPUModelRunner):
         # the sampled tokens back, because there's no direct communication
         # between the first-stage worker and the last-stage worker.
         req_ids = self.input_batch.req_ids
-        for req_idx in range(num_sampled_tokens):
+        # TODO: 检查这个逻辑 for req_idx in range(num_sampled_tokens):
+        for req_idx in range(len(self.input_batch.req_ids)):
             if self.use_async_scheduling:
                 sampled_ids = [
                     -1
@@ -3053,6 +3105,8 @@ class NPUModelRunner(GPUModelRunner):
 
     def _update_tokens_for_pcp(self, tokens):
         num_reqs = self.input_batch.num_reqs
+        if not (1 < self.pcp_size == self.dynamic_pcp_size):
+            return tokens, None, None
         tokens = np.array(tokens, dtype=np.int32)
         num_decode_reqs = (np.array(tokens) <= self.decode_threshold).sum()
         num_decode_tokens = sum(tokens[:num_decode_reqs])
@@ -3201,8 +3255,10 @@ class NPUModelRunner(GPUModelRunner):
             long_seq_metadata = AscendPrefillContextParallelMetadata(
                 num_actual_tokens_pcp_padded=num_actual_tokens_pcp_padded,
                 num_computed_tokens_of_pcp_dcp=num_computed_tokens_of_pcp_dcp.
-                numpy())
-            if self.pcp_size > 1:
+                numpy(),
+                dynamic_pcp_size=self.dynamic_pcp_size,
+            )
+            if 1 < self.pcp_size == self.dynamic_pcp_size:
                 q_head_idx, q_tail_idx = [], []
                 kv_with_q_head_nomask_idx, kv_with_q_head_mask_idx = [], []
                 kv_with_q_tail_nomask_idx, kv_with_q_tail_mask_idx = [], []
@@ -3436,6 +3492,170 @@ class NPUModelRunner(GPUModelRunner):
                             tensor,
                             torch.Tensor) and tensor.device.type != 'cpu':
                         mm_data[field] = tensor.cpu()
+
+    # 动态CP时，对 scheduler_output 进行前处理
+    def _pre_process_sched_output_in_dynamic_pcp(
+            self, scheduler_output: "SchedulerOutput") -> "SchedulerOutput":
+        print(f"==={dist.get_rank()}===> scheduler_output:{scheduler_output}")
+
+        # 动态PCP仅支持prefill阶段
+        # TODO-lsj: 考虑splitfuse情况
+        if scheduler_output.total_num_scheduled_tokens == 0 or \
+            list(scheduler_output.num_scheduled_tokens.values())[0] == 1:
+            return scheduler_output
+
+        # 动态PCP的DP场景：过滤 scheduler_output 中不属于当前cp_rank的请求
+        if scheduler_output.dynamic_pcp_size == 1:
+            # 清空已有请求
+            # TODO-lsj: 需初始化InputBatch，因为使用copy.deepcopy()无法深拷贝tensor变量。待优化
+            original_input_batch = InputBatch(
+                max_num_reqs=self.max_num_reqs,
+                max_model_len=self.model_config.max_model_len,
+                max_num_batched_tokens=self.max_num_tokens,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                vocab_size=self.model_config.get_vocab_size(),
+                block_sizes=[self.block_size],
+                is_spec_decode=bool(self.vllm_config.speculative_config),
+                logitsprocs=build_logitsprocs(
+                    self.vllm_config, self.device, self.pin_memory,
+                    self.is_pooling_model,
+                    self.vllm_config.model_config.logits_processors),
+                is_pooling_model=self.is_pooling_model,
+                kernel_block_sizes=[[self.vllm_config.cache_config.block_size]
+                                    ],
+                cp_kv_cache_interleave_size=self.parallel_config.
+                cp_kv_cache_interleave_size,
+            )
+            for req_id in original_input_batch.req_ids:
+                original_input_batch.remove_request(req_id)
+
+            # E.g. num_scheduled_tokens = {'1': 5, '2': 11, '3': 3},
+            #      dynamic_pcp_ranks = {'1': 0, '2': 1, '3': 0}
+            #   original_req_id_to_index = {'1': 0, '2': 1, '3': 2}
+            #   req_ids_per_cprank = [['1','3'],['2']]
+            #   num_token_per_cprank = [5+3,11]
+            #   max_num_token_across_cp = 11
+            original_req_id_to_index = {}  # 全量请求的 req_id -> index
+            req_ids_per_cprank = [[] for _ in range(self.pcp_size)
+                                  ]  # 记录各个cprank分到的请求
+            num_token_per_cprank = [0 for _ in range(self.pcp_size)
+                                    ]  # 记录各个cprank的token总数
+            for i, req in enumerate(scheduler_output.scheduled_new_reqs
+                                    ):  # prefill阶段只有scheduled_new_reqs
+                original_input_batch.add_request(
+                    self._generate_cached_request(req))
+                original_req_id_to_index[req.req_id] = i
+                req_ids_per_cprank[scheduler_output.dynamic_pcp_ranks[
+                    req.req_id]].append(req.req_id)
+                num_token_per_cprank[scheduler_output.dynamic_pcp_ranks[
+                    req.req_id]] += scheduler_output.num_scheduled_tokens[
+                        req.req_id]
+            original_input_batch.condense()
+            original_input_batch.refresh_metadata()
+            max_num_token_across_cp = max(num_token_per_cprank)
+
+            # E.g.
+            #   1、forward 结束后，各cprank的 hidden_states 分别为：[8,h] [11,h]
+            #   2、padding 后变为：[8+3=11,h] [11,h]
+            #   3、allgather 后变为：[22,h] ，其中 22 = 5(请求1) + 3(请求3) + 3(pad) + 11(请求2)
+            #   logits_indices = [4,21,7]
+            logits_indices = [0] * len(scheduler_output.num_scheduled_tokens)
+            offset = 0
+            for rank_id, req_ids in enumerate(req_ids_per_cprank):
+                offset = rank_id * max_num_token_across_cp  # 跳过 pad token
+                for req_id in req_ids:
+                    req_len = scheduler_output.num_scheduled_tokens[req_id]
+                    logits_indices[original_req_id_to_index[
+                        req_id]] = offset + req_len - 1
+                    offset += req_len
+
+            # 保留原有全量请求的数据
+            self.dynamic_pcp_info.original_input_batch = original_input_batch
+            self.dynamic_pcp_info.original_req_ids = list(
+                scheduler_output.num_scheduled_tokens.keys())
+            self.dynamic_pcp_info.original_req_id_to_index = original_req_id_to_index
+            self.dynamic_pcp_info.max_num_token_across_cp = max_num_token_across_cp
+            self.dynamic_pcp_info.logits_indices = logits_indices
+
+            print(
+                f"===rank{dist.get_rank()}===> "
+                f"original_input_batch:{original_input_batch}, "
+                f"original_req_ids: {self.dynamic_pcp_info.original_req_ids}, "
+                f"original_req_id_to_index:{original_req_id_to_index}, "
+                f"max_num_token_across_cp:{max_num_token_across_cp}, "
+                f"logits_indices:{logits_indices}")
+
+            # 仅保留属于当前 cprank 的请求
+            scheduler_output_new = SchedulerOutput(
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=CachedRequestData.make_empty(),
+                num_scheduled_tokens={},
+                total_num_scheduled_tokens=0,
+                scheduled_spec_decode_tokens={},
+                scheduled_encoder_inputs={},
+                num_common_prefix_blocks=[],
+                finished_req_ids=scheduler_output.
+                finished_req_ids,  # 会根据finished_req_ids进行request.pop，如果pop不存在的req_id则返回None
+                free_encoder_mm_hashes=[],
+                structured_output_request_ids={},
+                grammar_bitmask=None,
+                kv_connector_metadata=scheduler_output.
+                kv_connector_metadata,  # 用于KVCache传输
+                dynamic_pcp_size=scheduler_output.dynamic_pcp_size,
+                dynamic_pcp_ranks=scheduler_output.dynamic_pcp_ranks)
+
+            for req_id, req_rank_id in scheduler_output.dynamic_pcp_ranks.items(
+            ):
+                if req_rank_id != self.pcp_rank:
+                    continue
+                scheduler_output_new.num_scheduled_tokens[
+                    req_id] = scheduler_output.num_scheduled_tokens[req_id]
+            scheduler_output_new.total_num_scheduled_tokens = sum(
+                scheduler_output_new.num_scheduled_tokens.values())
+
+            # prefill 阶段只有 scheduled_new_reqs
+            for new_req_data in scheduler_output.scheduled_new_reqs:
+                if scheduler_output.dynamic_pcp_ranks[
+                        new_req_data.req_id] != self.pcp_rank:
+                    continue
+                scheduler_output_new.scheduled_new_reqs.append(new_req_data)
+
+            return scheduler_output_new
+
+        return scheduler_output
+
+    # 构造假数据进行陪跑（用于动态CP中BP的陪跑场景）
+    def _idle_generate(self):
+        input_ids_idle = torch.zeros(4, dtype=torch.int32, device=self.device)
+        positions_idle = torch.zeros(4, dtype=torch.int64, device=self.device)
+        num_input_tokens = len(input_ids_idle)
+        moe_comm_type = self._select_moe_comm_method(num_input_tokens,
+                                                     with_prefill=True)
+        batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens,
+                                           uniform_decode=False)
+        aclgraph_runtime_mode, batch_descriptor = \
+            self.aclgraph_dispatcher.dispatch(batch_descriptor)
+        attn_metadata = None
+
+        with set_ascend_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                with_prefill=True,
+                reserved_mc2_mask=self.reserved_mc2_mask,
+                moe_comm_type=moe_comm_type,
+                num_actual_tokens=0,
+                aclgraph_runtime_mode=aclgraph_runtime_mode,
+                batch_descriptor=batch_descriptor,
+                prefetch_stream=self.prefetch_stream,
+                model_instance=self.model,
+                weight_prefetch_method=self.weight_prefetch_method):
+            # generate
+            self._generate_process_reqs_hidden_states(attn_metadata, True,
+                                                      None, input_ids_idle,
+                                                      positions_idle, None,
+                                                      None)
 
 
 @contextmanager
