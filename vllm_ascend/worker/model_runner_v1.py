@@ -61,6 +61,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               CommonAttentionMetadata)
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         EncoderOnlyAttentionSpec,
                                         FullAttentionSpec, KVCacheConfig,
@@ -499,7 +500,16 @@ class NPUModelRunner(GPUModelRunner):
         return self.model
 
     def _make_attention_mask(self, attn_state) -> torch.Tensor:
-        # pcp situation.
+        #  动态CP的DP场景需要mask，而且CP也需要mask
+        if 1 < self.pcp_size == self.dynamic_pcp_size:
+            return None
+        if self.pcp_size > 1 and self.dynamic_pcp_size == 1:
+            max_seq_len = max(seq_lens.max().item(), 0)
+            return torch.triu(
+                torch.full((max_seq_len, max_seq_len),
+                           float('-inf') if self.dtype == torch.float16 else 1,
+                           device=self.device,
+                           dtype=torch.bool), 1)
         if self.attn_mask_builder is None:
             raise ValueError("Attn mask builder is None")
         # Pooling situation.
@@ -1792,7 +1802,8 @@ class NPUModelRunner(GPUModelRunner):
         # the sampled tokens back, because there's no direct communication
         # between the first-stage worker and the last-stage worker.
         req_ids = self.input_batch.req_ids
-        for req_idx in range(num_sampled_tokens):
+        # TODO: 检查这个逻辑 for req_idx in range(num_sampled_tokens):
+        for req_idx in range(len(self.input_batch.req_ids)):
             if self.use_async_scheduling:
                 sampled_ids = [
                     -1
@@ -3096,6 +3107,8 @@ class NPUModelRunner(GPUModelRunner):
 
     def _update_tokens_for_pcp(self, tokens):
         num_reqs = self.input_batch.num_reqs
+        if not (1 < self.pcp_size == self.dynamic_pcp_size):
+            return tokens, None, None
         tokens = np.array(tokens, dtype=np.int32)
         num_decode_reqs = (np.array(tokens) <= self.decode_threshold).sum()
         num_decode_tokens = sum(tokens[:num_decode_reqs])
