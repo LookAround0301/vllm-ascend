@@ -48,7 +48,7 @@ from vllm.distributed.parallel_state import (get_dcp_group, get_dp_group,
                                              get_pcp_group, get_pp_group,
                                              get_tp_group,
                                              is_global_first_rank)
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -361,6 +361,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs,
                                                   dtype=torch.int32)
+
         # 根据 scheduler.output 实时调整
         # 动态PCP关闭时，dynamic_pcp_size默认等于pcp_size
         # 动态PCP开启时，dynamic_pcp_size有效值在 [1,pcp_size] 之间
@@ -368,6 +369,7 @@ class NPUModelRunner(GPUModelRunner):
         #   if dynamic_pcp_size == pcp_size: 执行原本CP逻辑
         self.dynamic_pcp_size: int = 0
         self.dynamic_pcp_info = DynamicPCPInfo()
+
         # here we use int32
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -497,16 +499,7 @@ class NPUModelRunner(GPUModelRunner):
         return self.model
 
     def _make_attention_mask(self, attn_state) -> torch.Tensor:
-        #  动态CP的DP场景需要mask，而且CP也需要mask
-        if 1 < self.pcp_size == self.dynamic_pcp_size:
-            return None
-        if self.pcp_size > 1 and self.dynamic_pcp_size == 1:
-            max_seq_len = max(seq_lens.max().item(), 0)
-            return torch.triu(
-                torch.full((max_seq_len, max_seq_len),
-                           float('-inf') if self.dtype == torch.float16 else 1,
-                           device=self.device,
-                           dtype=torch.bool), 1)
+        # pcp situation.
         if self.attn_mask_builder is None:
             raise ValueError("Attn mask builder is None")
         # Pooling situation.
@@ -514,7 +507,7 @@ class NPUModelRunner(GPUModelRunner):
             return self.attn_mask_builder.get_attn_mask(2048, torch.bool)
 
         if self.vllm_config.model_config.use_mla:
-            if self.pcp_size > 1:
+            if 1 < self.pcp_size == self.dynamic_pcp_size:
                 return self.attn_mask_builder.get_pcp_mla_mask(self.dtype)
             # mla prefill
             if attn_state != AscendAttentionState.DecodeOnly:
@@ -599,7 +592,7 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens)
 
         total_num_pcp_pads = 0
-        if self.pcp_size > 1:
+        if 1 < self.pcp_size == self.dynamic_pcp_size:
             if not self.vllm_config.model_config.use_mla:
                 self.generate_kv_idx(scheduler_output)
             tokens_before_update = tokens.copy()
@@ -987,8 +980,8 @@ class NPUModelRunner(GPUModelRunner):
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
                 self.kv_cache_config.kv_cache_groups):
             # NOTE: This is strange, why did we use total_num_scheduled_tokens before?
-            slot_mapping_size = (total_num_scheduled_tokens
-                                 if self.pcp_size == 1 else
+            slot_mapping_size = (total_num_scheduled_tokens if self.pcp_size
+                                 == 1 or self.dynamic_pcp_size == 1 else
                                  total_num_scheduled_tokens * self.pcp_size -
                                  total_num_pcp_pads)
             if isinstance(kv_cache_group_spec.kv_cache_spec,
@@ -1226,8 +1219,7 @@ class NPUModelRunner(GPUModelRunner):
                     self.pcp_allgather_restore_idx[:hidden_states.shape[0]])
             elif self.dynamic_pcp_size == 1:
                 hidden_states = nn.functional.pad(
-                    hidden_states[:self.num_actual_tokens_pcp_padded //
-                                  self.pcp_size],
+                    hidden_states,
                     (0, 0, 0, self.dynamic_pcp_info.max_num_token_across_cp -
                      hidden_states.shape[0]))
                 hidden_states = get_pcp_group().all_gather(hidden_states, 0)
@@ -1800,8 +1792,7 @@ class NPUModelRunner(GPUModelRunner):
         # the sampled tokens back, because there's no direct communication
         # between the first-stage worker and the last-stage worker.
         req_ids = self.input_batch.req_ids
-        # TODO: 检查这个逻辑 for req_idx in range(num_sampled_tokens):
-        for req_idx in range(len(self.input_batch.req_ids)):
+        for req_idx in range(num_sampled_tokens):
             if self.use_async_scheduling:
                 sampled_ids = [
                     -1
@@ -2242,7 +2233,7 @@ class NPUModelRunner(GPUModelRunner):
     def profile_run(self) -> None:
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         if self.max_num_tokens > mc2_tokens_capacity and \
-            select_moe_comm_method(mc2_tokens_capacity, self.vllm_config) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
+            select_moe_comm_method(mc2_tokens_capacity, self.vllm_config, self.pcp_size, self.dynamic_pcp_size) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
             self._dummy_run(mc2_tokens_capacity,
                             with_prefill=True,
                             is_profile=True)
@@ -3105,8 +3096,6 @@ class NPUModelRunner(GPUModelRunner):
 
     def _update_tokens_for_pcp(self, tokens):
         num_reqs = self.input_batch.num_reqs
-        if not (1 < self.pcp_size == self.dynamic_pcp_size):
-            return tokens, None, None
         tokens = np.array(tokens, dtype=np.int32)
         num_decode_reqs = (np.array(tokens) <= self.decode_threshold).sum()
         num_decode_tokens = sum(tokens[:num_decode_reqs])
@@ -3493,7 +3482,6 @@ class NPUModelRunner(GPUModelRunner):
                             torch.Tensor) and tensor.device.type != 'cpu':
                         mm_data[field] = tensor.cpu()
 
-    # 动态CP时，对 scheduler_output 进行前处理
     def _pre_process_sched_output_in_dynamic_pcp(
             self, scheduler_output: "SchedulerOutput") -> "SchedulerOutput":
         print(f"==={dist.get_rank()}===> scheduler_output:{scheduler_output}")
@@ -3508,7 +3496,7 @@ class NPUModelRunner(GPUModelRunner):
         if scheduler_output.dynamic_pcp_size == 1:
             # 清空已有请求
             # TODO-lsj: 需初始化InputBatch，因为使用copy.deepcopy()无法深拷贝tensor变量。待优化
-            original_input_batch = InputBatch(
+            original_input_batch = NPUInputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=self.model_config.max_model_len,
                 max_num_batched_tokens=self.max_num_tokens,
@@ -3598,8 +3586,8 @@ class NPUModelRunner(GPUModelRunner):
                 finished_req_ids=scheduler_output.
                 finished_req_ids,  # 会根据finished_req_ids进行request.pop，如果pop不存在的req_id则返回None
                 free_encoder_mm_hashes=[],
-                structured_output_request_ids={},
-                grammar_bitmask=None,
+                # structured_output_request_ids={},
+                # grammar_bitmask=None,
                 kv_connector_metadata=scheduler_output.
                 kv_connector_metadata,  # 用于KVCache传输
                 dynamic_pcp_size=scheduler_output.dynamic_pcp_size,
@@ -3630,30 +3618,15 @@ class NPUModelRunner(GPUModelRunner):
         input_ids_idle = torch.zeros(4, dtype=torch.int32, device=self.device)
         positions_idle = torch.zeros(4, dtype=torch.int64, device=self.device)
         num_input_tokens = len(input_ids_idle)
-        moe_comm_type = self._select_moe_comm_method(num_input_tokens,
-                                                     with_prefill=True)
-        batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens,
-                                           uniform_decode=False)
-        aclgraph_runtime_mode, batch_descriptor = \
-            self.aclgraph_dispatcher.dispatch(batch_descriptor)
+        batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens)
         attn_metadata = None
 
-        with set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_input_tokens,
-                with_prefill=True,
-                reserved_mc2_mask=self.reserved_mc2_mask,
-                moe_comm_type=moe_comm_type,
-                num_actual_tokens=0,
-                aclgraph_runtime_mode=aclgraph_runtime_mode,
-                batch_descriptor=batch_descriptor,
-                prefetch_stream=self.prefetch_stream,
-                model_instance=self.model,
-                weight_prefetch_method=self.weight_prefetch_method):
+        with set_ascend_forward_context(attn_metadata,
+                                        self.vllm_config,
+                                        num_tokens=num_input_tokens,
+                                        model_instance=self.model):
             # generate
-            self._generate_process_reqs_hidden_states(attn_metadata, True,
-                                                      None, input_ids_idle,
+            self._generate_process_reqs_hidden_states(None, input_ids_idle,
                                                       positions_idle, None,
                                                       None)
 

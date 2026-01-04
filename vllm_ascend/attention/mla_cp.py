@@ -115,7 +115,8 @@ class AscendMlaCPMetadataBuilder(AscendMLAMetadataBuilder):
             q_full_idx=common_long_seq_metadata.q_full_idx,
             pcp_prefill_mask=common_long_seq_metadata.pcp_prefill_mask,
             pcp_allgather_restore_idx=common_long_seq_metadata.
-            pcp_allgather_restore_idx)
+            pcp_allgather_restore_idx,
+            dynamic_pcp_size=common_long_seq_metadata.dynamic_pcp_size)
 
     def build_chunked_metadata(
         self,
@@ -417,7 +418,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
 
         forward_context = get_forward_context()
 
-        if self.pcp_size > 1:
+        if 1 < self.pcp_size == attn_metadata.prefill.pcp_metadata.dynamic_pcp_size:
             num_actual_tokens = attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size
         else:
             num_actual_tokens = attn_metadata.num_actual_tokens
@@ -469,7 +470,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
             # FIX: aicore move should be also placed on the comm stream in dbo,
             # otherwise it may affect the accuracy
             # TODO: use an elegant way to overlap
-            if self.pcp_size > 1:
+            if 1 < self.pcp_size == attn_metadata.prefill.pcp_metadata.dynamic_pcp_size:
                 output_prefill = self._forward_prefill_cp(
                     prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
                     prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
@@ -568,7 +569,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe)
         # Preprocess for prefill tokens
         if has_prefill:
-            if self.pcp_size > 1:
+            if 1 < self.pcp_size == attn_metadata.prefill.pcp_metadata.dynamic_pcp_size:
                 num_actual_tokens = (attn_metadata.num_actual_tokens_pcp_padded
                                      - self.pcp_size * num_decode_tokens
                                      ) // self.pcp_size + num_decode_tokens
@@ -579,7 +580,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
                 .view(-1, self.num_heads, self.qk_head_dim)
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim:]
             prefill_q_nope = prefill_q[..., :self.qk_nope_head_dim]
-            if self.pcp_size > 1:
+            if 1 < self.pcp_size == attn_metadata.prefill.pcp_metadata.dynamic_pcp_size:
                 cos = attn_metadata.prefill.cos[:num_actual_tokens -
                                                 num_decode_tokens]
                 sin = attn_metadata.prefill.sin[:num_actual_tokens -
@@ -590,7 +591,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
             prefill_slots = attn_metadata.slot_mapping[
                 num_decode_tokens:num_actual_tokens]
             prefill_q_pe = self.rope_single(prefill_q_pe, cos, sin)
-            if self.pcp_size > 1:
+            if 1 < self.pcp_size == attn_metadata.prefill.pcp_metadata.dynamic_pcp_size:
                 prefill_kv_no_split = kv_no_split[:num_actual_tokens]
                 kv_c, k_pe = prefill_kv_no_split.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -630,14 +631,13 @@ class AscendMlaCPImpl(AscendMLAImpl):
             else:
                 prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(
                     prefill_kv_no_split, cos, sin, kv_cache, prefill_slots)
+                prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0],
+                                                 self.num_kv_heads, -1)
             prefill_k_nope, prefill_value = self.kv_b_proj(
                 prefill_k_c_normed)[0].view(
                     -1, self.num_heads,
                     self.qk_nope_head_dim + self.v_head_dim).split(
                         [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            if not self.pcp_size > 1:
-                prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0],
-                                                 self.num_kv_heads, -1)
             prefill_k_pe = prefill_k_pe.expand(
                 (*prefill_k_nope.shape[:-1], -1))
             prefill_preprocess_res = PrefillMLAPreprocessResult(
