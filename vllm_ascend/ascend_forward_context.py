@@ -195,7 +195,9 @@ def get_mc2_mask():
 
 def select_moe_comm_method(num_tokens: int,
                            vllm_config: VllmConfig,
-                           is_mtp_model=False) -> Optional[MoECommType]:
+                           is_mtp_model=False,
+                           pcp_size=2,
+                           dynamic_pcp_size=0) -> Optional[MoECommType]:
     """Select the MoE communication method according to parallel settings,
     device generation, token count, and quantization.
 
@@ -235,6 +237,13 @@ def select_moe_comm_method(num_tokens: int,
             moe_comm_type = MoECommType.MC2
         else:
             moe_comm_type = MoECommType.ALLGATHER
+
+        if ((pcp_size > 1 and
+             (moe_comm_type == MoECommType.ALLGATHER
+              or moe_comm_type == MoECommType.NAIVE_MULTICAST))
+                or (pcp_size > 1 and dynamic_pcp_size == 1
+                    and moe_comm_type == MoECommType.MC2)):
+            moe_comm_type = MoECommType.ALLTOALL
 
     elif soc_version in {AscendDeviceType.A3}:
         ascend_config = get_ascend_config()
