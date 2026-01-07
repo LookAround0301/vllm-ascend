@@ -18,6 +18,7 @@
 #
 
 import math
+import os
 import sys
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -2246,6 +2247,17 @@ class NPUModelRunner(GPUModelRunner):
         bind_kv_cache(kv_caches,
                       self.compilation_config.static_forward_context,
                       self.kv_caches, num_attn_module)
+        
+        if os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1":
+            #(TODO: ldeng) allocate hashk cache tensors here
+            hashk_caches = None
+            self.hashk_caches = []
+            from vllm_ascend.worker.kvcomp_utils import bind_hashk_cache
+            # bind hashk cache to forward context and model runner
+            bind_hashk_cache(hashk_caches,
+                             self.compilation_config.static_forward_context,
+                             self.hashk_caches, num_attn_module)
+
         return kv_caches
 
     def _allocate_kv_cache_tensors(
