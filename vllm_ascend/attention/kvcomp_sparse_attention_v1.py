@@ -31,6 +31,12 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               AttentionMetadataBuilder)
+
+from vllm_ascend.attention.attention_v1 import (AscendAttentionBackendImpl,
+                                                AscendAttentionMetadataBuilder,
+                                                AscendMetadata)
+
+
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -50,7 +56,7 @@ SWA_INT_MAX = 2147483647
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
-class AscendAttentionBackend(AttentionBackend):
+class AscendKvcompSparseAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -61,20 +67,20 @@ class AscendAttentionBackend(AttentionBackend):
         return "CUSTOM" if not envs_vllm.VLLM_USE_V2_MODEL_RUNNER else "FLASH_ATTN"
 
     @staticmethod
-    def get_impl_cls() -> Type["AscendAttentionBackendImpl"]:
+    def get_impl_cls() -> Type["AscendKvcompSparseAttentionBackendImpl"]:
         if enable_cp():
             from vllm_ascend.attention.attention_cp import \
                 AscendAttentionCPImpl
             return AscendAttentionCPImpl
-        return AscendAttentionBackendImpl
+        return AscendKvcompSparseAttentionBackendImpl
 
     @staticmethod
-    def get_builder_cls() -> type["AscendAttentionMetadataBuilder"]:
+    def get_builder_cls() -> type["AscendKvcompSparseAttentionMetadataBuilder"]:
         if enable_cp():
             from vllm_ascend.attention.attention_cp import \
                 AscendAttentionCPMetadataBuilder
             return AscendAttentionCPMetadataBuilder
-        return AscendAttentionMetadataBuilder
+        return AscendKvcompSparseAttentionMetadataBuilder
 
     @staticmethod
     def get_kv_cache_shape(
@@ -129,61 +135,23 @@ class AscendAttentionState(Enum):
 
 
 @dataclass
-class AscendMetadata:
-    # **************************** Basic Properties ************************** #
-    attn_mask: Optional[torch.Tensor] = None
-    # Current state of this attention run.
-    attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
+class AscendKvcompSparseMetadata(AscendMetadata):
+    # **************************** new properties for KVComp Sparse Attention ************************** #
+    # npu device seq_lens
+    seq_lens_device: torch.Tensor = None
+   
+    # npu device query_start_loc
+    query_start_loc_device: torch.Tensor = None
 
-    # Number of tokens excluding padding.
-    num_actual_tokens_pcp_padded: int = 0
-    num_actual_tokens: int = 0
-    num_decode_tokens: int = 0
-    num_prefills: int = 0
-    num_decodes: int = 0
+    # cpu query_lens
+    query_lens_cpu: torch.Tensor = None
 
-    # The sequence length per sequence. Sequence length means the computed
-    # tokens + new tokens (is None if it is a decoding).
-    # (batch_size,)
-    # TODO(Angazenn): The following parameters are quite redundant and
-    # contains similar information (such as seq_lens seq_lens_list). We
-    # should simplified these parameters once attention schema in vLLM-Ascend
-    # is unified.
-    seq_lens: torch.Tensor = None
-    seq_lens_list: List[int] = None  # type: ignore
-    actual_seq_lengths_q: List[int] = None  # type: ignore
-
-    query_start_loc: torch.Tensor = None
-    # Maximum query length in the batch (None for decoding).
-    max_query_len: Optional[int] = None
-
-    # ********************** KV Cache Related Properties ********************* #
-    # Block addresses per sequence (Seq id -> list of physical block).
-    # (batch_size, max_blocks_per_seq)
-    block_tables: torch.Tensor = None
-
-    # The indices of the token slots that input tokens will be stored into.
-    # E.g., if `slot_mapping` is [35, 2, 17] and the block size is 16, the
-    # three tokens are stored in the 3rd slot in block 2, 2nd slot in block 0,
-    # and 1st slot in block 1, respectively.
-    # (num_tokens,)
-    slot_mapping: torch.Tensor = None
-    # pcp
-    prefill: Optional[AscendMetadataForPrefill] = None
-    # dcp
-    decode_meta: Optional[AscendMetadataForDecode] = None
-
-    causal: bool = True
-    # runner_type in model_config.
-    model_runner_type: str = ""
-    # prefill reshape_and_cache event
-    reshape_cache_event: torch.npu.Event = None
-
-    # sliding window attention mask
-    swa_mask: Optional[torch.Tensor] = None
+    # npu query_lens
+    query_lens_device: torch.Tensor = None
 
 
-class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
+
+class AscendKvcompSparseAttentionMetadataBuilder(AttentionMetadataBuilder[AscendKvcompSparseMetadata]):
     # AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     # Does this backend/builder reorder the batch?
     # If not, set this to None. Otherwise set it to the query
@@ -203,7 +171,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         self.device = device
         self.max_num_blocks_per_req = cdiv(
             self.model_config.max_model_len,
-            AscendAttentionBackend.get_supported_block_size()[0])
+            AscendKvcompSparseAttentionBackend.get_supported_block_size()[0])
 
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
@@ -238,7 +206,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> AscendMetadata:
+    ) -> AscendKvcompSparseMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[:
@@ -300,7 +268,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         return attn_metadata
 
 
-class AscendAttentionBackendImpl(AttentionImpl):
+class AscendKvcompSparseAttentionBackendImpl(AttentionImpl):
 
     def __init__(
         self,
@@ -730,7 +698,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
                 "fused output quantization is not yet supported"
-                " for AscendAttentionBackendImpl")
+                " for AscendKvcompSparseAttentionBackendImpl")
 
         assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
         attn_type = self.attn_type
