@@ -2249,9 +2249,15 @@ class NPUModelRunner(GPUModelRunner):
                       self.kv_caches, num_attn_module)
         
         if os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1":
-            #(TODO: ldeng) allocate hashk cache tensors here
-            hashk_caches = None
-            self.hashk_caches = []
+            #(ldeng) allocate hashk cache tensors here
+            hashk_caches = {}
+            for layer_name, kv_cache in kv_caches.items():
+                num_blocks, block_size, num_kv_heads, head_size = kv_cache.shape
+                hashk_cache = torch.zeros((num_blocks, num_kv_heads, block_size, head_size // 8),
+                                          dtype=torch.uint8,
+                                          device=self.device)
+                hashk_caches[layer_name] = hashk_cache
+
             from vllm_ascend.worker.kvcomp_utils import bind_hashk_cache
             # bind hashk cache to forward context and model runner
             bind_hashk_cache(hashk_caches,
