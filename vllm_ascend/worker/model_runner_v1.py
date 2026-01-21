@@ -356,6 +356,11 @@ class NPUModelRunner(GPUModelRunner):
         self.reorder_batch_threshold: int | None = None
         self.long_seq_metadata = None
 
+        if os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1":
+            from vllm_ascend.worker.kvcomp_utils import KVCompConfig
+            self.kvcomp_config = KVCompConfig.from_json(os.getenv("VLLM_ASCEND_KVCOMP_CONFIG_PATH"))
+            self.hashk_caches = []
+
     def _init_device_properties(self) -> None:
         self.num_sms = None
 
@@ -2249,16 +2254,24 @@ class NPUModelRunner(GPUModelRunner):
                       self.kv_caches, num_attn_module)
         
         if os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1":
+            from vllm_ascend.worker.kvcomp_utils import bind_hashk_cache
+            from vllm.model_executor.models.utils import extract_layer_index
             #(ldeng) allocate hashk cache tensors here
             hashk_caches = {}
             for layer_name, kv_cache in kv_caches.items():
-                num_blocks, block_size, num_kv_heads, head_size = kv_cache.shape
-                hashk_cache = torch.zeros((num_blocks, num_kv_heads, block_size, head_size // 8),
-                                          dtype=torch.uint8,
-                                          device=self.device)
-                hashk_caches[layer_name] = hashk_cache
+                layer_index = extract_layer_index(layer_name, num_attn_module)
+                is_rollback_layer = layer_index in self.vllm_hash_attention_rollback_layers
+                is_skip_layer = layer_index in self.vllm_hash_attention_skip_layers
+                if is_rollback_layer or is_skip_layer:
+                    hashk_caches[layer_name] = None
+                else: # computing-hamming layer
+                    num_blocks, block_size, num_kv_heads, head_size = kv_cache.shape
+                    hashk_cache = torch.zeros((num_blocks, num_kv_heads, block_size, head_size // 8),
+                                            dtype=torch.uint8,
+                                            device=self.device)
+                    hashk_caches[layer_name] = hashk_cache
 
-            from vllm_ascend.worker.kvcomp_utils import bind_hashk_cache
+            
             # bind hashk cache to forward context and model runner
             bind_hashk_cache(hashk_caches,
                              self.compilation_config.static_forward_context,
