@@ -16,27 +16,28 @@ def bind_hashk_cache(
     that the hashk cache can be used in the forward pass.
 
     This function:
-      1) Fills the ModelRunner's kv cache list (`runner_kv_caches`) with
-         kv_caches.
+      1) Fills the ModelRunner's hashk cache list (`runner_hashk_caches`) with
+         hashk_caches.
       2) Associates each attention layer in the `forward_context` with its
-         corresponding KV cache in kv_caches.
+         corresponding hashk cache in hashk_caches.
 
     Args:
-        kv_caches: The allocated kv_caches with layer names as keys.
+        hashk_caches: The allocated hashk_caches with layer names as keys.
         forward_context: The global forward context containing all Attention
             layers with layer names as keys.
-        runner_kv_caches: The kv_cache declared by ModelRunner.
+        runner_hashk_caches: The hashk cache declared by ModelRunner.
     """
-    # Bind kv_caches to ModelRunner
+    # Bind hashk_caches to ModelRunner; ensure it is empty before binding
     assert len(runner_hashk_caches) == 0
 
-    # Convert kv_caches dict to a list of tensors in the order of layer_index.
+    # Convert hashk_caches dict to a list of tensors in the order of layer_index.
     index2name = defaultdict(list)
     for layer_name in hashk_caches:
         index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
 
     for layer_index in sorted(index2name.keys()):
         layer_names = index2name[layer_index]
+        # (TODO: ldeng), support multiple hashk caches for the same layer index later, e.g., encoder-decoder models.
         layer_name = layer_names[0]
         runner_hashk_caches.append(hashk_caches[layer_name])
 
