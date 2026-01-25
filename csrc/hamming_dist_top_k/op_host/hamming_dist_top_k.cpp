@@ -183,8 +183,8 @@ const gert::Shape HammingDistTopKTiling::GetOutShape(const size_t index) {
     return context_->GetOutputShape(index)->GetStorageShape();
 }
 
-// const uint32_t HammingDistTopKTiling::GetInputAttrData(const size_t index) {
-uint32_t HammingDistTopKTiling::GetInputAttrData(const size_t index) {
+// uint32_t HammingDistTopKTiling::GetInputAttrData(const size_t index) {
+const uint32_t HammingDistTopKTiling::GetInputAttrData(const size_t index) {
     if (auto attrPtr = context_->GetAttrs()) {
         const int64_t* p = attrPtr->GetInt(index);
         if (p != nullptr) {

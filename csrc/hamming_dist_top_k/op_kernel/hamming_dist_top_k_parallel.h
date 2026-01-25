@@ -44,13 +44,15 @@ public:
         continFlag_ = keyBlockTableGm_.GetPhyAddr() != nullptr;
         mm_.SetSubBlockIdx(0);
         mm_.Init(&tiling, pipe_);
-        
-        blockIdx = AscendC::GetBlockIdx(); // new
     }
 
     __aicore__ inline void Process()
     {
-        if (blockIdx >= param_.usedCoreNum) {
+        uint32_t blockIndex = AscendC::GetBlockIdx();
+        if ASCEND_IS_AIV {
+            blockIndex = blockIndex / 2;
+        }
+        if (blockIndex >= param_.usedCoreNum) {
             return;
         }
         uint32_t batchNumPerLoop = 1;
@@ -66,10 +68,8 @@ public:
             Duplicate<half>(constTensor, 1, param_.dimension);
         }
 
-        // YF_LOG("ldeng 71, curCoreLoop=%d\n", curCoreLoop);
 
         for (uint32_t loopIdx = 0; loopIdx < curCoreLoop; loopIdx++) {
-            //YF_LOG("ldeng 74\n");
             ComputeUnpackMM(loopIdx * batchNumPerLoop, batchNumPerLoop, loopIdx % BATCH_PING_PONG_NUM);
         }
         if ASCEND_IS_AIV {
@@ -78,12 +78,10 @@ public:
             InitLocalBuffersForTopK();
         }
 
-        //YF_LOG("ldeng 80\n");
         for (uint32_t loopIdx = 0; loopIdx < curCoreLoop; loopIdx++) {
             if ASCEND_IS_AIV {
                 VectorWaitCube(SYNC_AIC_AIV_FLAG2 + loopIdx % BATCH_PING_PONG_NUM);
                 if (GetSubBlockIdx() == loopIdx % 2) {
-                    //YF_LOG("ldeng 83\n");
                     ComputeTopK(loopIdx, loopIdx % BATCH_PING_PONG_NUM);
                 }
             }
@@ -305,7 +303,6 @@ protected:
             return;
         }
 
-        //YF_LOG("ldeng 299\n");
 
         uint32_t realReducedBatchIdx = curCoreBatchStartIdx_ + batchIdx;
         uint32_t realBatchIdx = realReducedBatchIdx / param_.head; /* batchIdx without headNum */
@@ -387,7 +384,6 @@ protected:
             second_last_block_tail_num = skipTailChunkNum - tailN2;
         }
 
-        //YF_LOG("batchIdx=%d, curSeqLen=%d, curChunkSize=%d, curChunkNum=%d, tileN2=%d,tailN2=%d,topKBlockNum=%d,skipTailChunkNum=%d,skipHeadChunkNum=%d,last_block_tail_num=%d,second_last_block_tail_num=%d, param_.tileN1=%d, \n", batchIdx, curSeqLen, curChunkSize, curChunkNum, tileN2, tailN2, topKBlockNum, skipTailChunkNum, skipHeadChunkNum, last_block_tail_num, second_last_block_tail_num,param_.tileN1);
 
         for (uint32_t i = 0; i < topKBlockNum; i++) {
             uint32_t copyLen = i == topKBlockNum - 1 ? tailN2 : tileN2;
@@ -396,16 +392,13 @@ protected:
             GenerateTopKIndexTensor(i, copyLen, tileN2, matmulGmOffset - mmOffset, curK);
             LocalTensor<half> topKInValueTensor = topKInValueQueue_.DeQue<half>();
 
-            //YF_LOG("ldeng 393 topKInValueTensor.GetSize()=%d\n", topKInValueTensor.GetSize());
             
             uint32_t chunkPerBlock = param_.tileN1 / curChunkSize;      // blocksize / chunksize = chunknum per block
             if (headChunkNum < skipHeadChunkNum) {
                 uint32_t curHeadChunkNum = min(skipHeadChunkNum - headChunkNum, copyLen);
                 headChunkNum += curHeadChunkNum;
-                //YF_LOG("ldeng 399\n");
                 //DumpTensor(topKInValueTensor, 400, topKInValueTensor.GetSize());
                 Duplicate(topKInValueTensor, static_cast<half>(MAX_HALF_VALUE), curHeadChunkNum);
-                //YF_LOG("ldeng 402\n");
                 //DumpTensor(topKInValueTensor, 403, topKInValueTensor.GetSize());
             }
 
@@ -414,7 +407,6 @@ protected:
             {
                 //uint32_t offset = tileN2 - second_last_block_tail_num;
                 //Maxs(topKInValueTensor[offset], topKInValueTensor[offset], MAX_HALF_VALUE, second_last_block_tail_num);
-                //YF_LOG("ldeng 385\n");
                 FillMaxValueFromTail(topKInValueTensor, tileN2, second_last_block_tail_num, curChunkSize);
             }
 
@@ -423,24 +415,20 @@ protected:
                 if(last_block_tail_num == tailN2)
                 {
                     //Maxs(topKInValueTensor, topKInValueTensor, MAX_HALF_VALUE, tailN2);
-                    //YF_LOG("ldeng 420\n");
                     //DumpTensor(topKInValueTensor, 421, topKInValueTensor.GetSize());
                     Duplicate(topKInValueTensor, static_cast<half>(MAX_HALF_VALUE), tailN2);
-                    //YF_LOG("ldeng 423\n");
                     //DumpTensor(topKInValueTensor, 424, topKInValueTensor.GetSize());
                 }
                 else
                 {
                     //uint32_t offset = tailN2 - last_block_tail_num;
                     //Maxs(topKInValueTensor[offset], topKInValueTensor[offset], MAX_HALF_VALUE, last_block_tail_num);
-                    //YF_LOG("ldeng 430\n");
                     //DumpTensor(topKInValueTensor, 431, topKInValueTensor.GetSize());
                     FillMaxValueFromTail(topKInValueTensor, tailN2, last_block_tail_num, curChunkSize);
                     //DumpTensor(topKInValueTensor, 433, topKInValueTensor.GetSize());
                 }
             }
             
-            //YF_LOG("ldeng 406\n");
 
             LocalTensor<int32_t> topKInIndexTensor = topKInIndexQueue_.DeQue<int32_t>();
             topKOutValueTensor = topKOutValueQueue_.AllocTensor<half>();
@@ -569,7 +557,6 @@ protected:
 protected:
     uint64_t innerSplitLoopTimes_ = 0;
     uint8_t innerSplitGMFlag_ = 0;
-    uint32_t blockIdx = 0; // new
 
     static constexpr uint32_t BLOCK_CUBE = 32;
     static constexpr uint64_t SYNC_MODE0 = 0;
@@ -645,14 +632,18 @@ protected:
         if (param_.preCoreNum == 0) {
             param_.preCoreNum = param_.usedCoreNum;
         }
-        if (blockIdx < param_.preCoreNum) {
+        uint32_t blockIndex = AscendC::GetBlockIdx();
+        if ASCEND_IS_AIV {
+            blockIndex = blockIndex / 2;
+        }
+        if (blockIndex < param_.preCoreNum) {
             curCoreBatch_ = param_.singleCoreBatch;
         } else {
             curCoreBatch_ = param_.singleCoreBatch - 1;
         }
 
-        curCoreBatchStartIdx_ = blockIdx * curCoreBatch_;
-        if (blockIdx >= param_.preCoreNum) {
+        curCoreBatchStartIdx_ = blockIndex * curCoreBatch_;
+        if (blockIndex >= param_.preCoreNum) {
             curCoreBatchStartIdx_ += param_.preCoreNum;
         }
     }

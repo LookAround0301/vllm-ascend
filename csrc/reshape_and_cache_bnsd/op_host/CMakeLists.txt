@@ -8,7 +8,7 @@
 # ======================================================================================================================
 
 add_ops_compile_options(
-        OP_NAME HammingDistTopK
+        OP_NAME ReshapeAndCacheBnsd
         OPTIONS --cce-auto-sync=off
                 -Wno-deprecated-declarations
                 -Werror
@@ -16,43 +16,26 @@ add_ops_compile_options(
                 --op_relocatable_kernel_binary=true
 )
 
-target_sources(op_host_aclnnInner PRIVATE
-        hamming_dist_top_k_def.cpp
+set(reshape_and_cache_bnsd PARENT_SCOPE)
+
+target_sources(op_host_aclnn PRIVATE
+        reshape_and_cache_bnsd.cpp
 )
-
-target_sources(opapi PRIVATE
-        aclnn_hamming_dist_top_k.cpp
-)
-
-if (NOT BUILD_OPEN_PROJECT)
-    target_sources(aclnn_ops_train PRIVATE
-        aclnn_hamming_dist_top_k.cpp
-    )
-
-    target_sources(aclnn_ops_infer PRIVATE
-        aclnn_hamming_dist_top_k.cpp
-    )
-endif ()
 
 target_sources(optiling PRIVATE
-        hamming_dist_top_k_tiling.cpp
+        reshape_and_cache_bnsd_tiling.cpp
 )
 
 if (NOT BUILD_OPEN_PROJECT)
     target_sources(opmaster_ct PRIVATE
-        hamming_dist_top_k_tiling.cpp
+        reshape_and_cache_bnsd_tiling.cpp
     )
 endif ()
 
-target_sources(opsproto PRIVATE)
+target_sources(opsproto PRIVATE
+        reshape_and_cache_bnsd_proto.cpp
+)
 
 target_include_directories(optiling PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
-)
-
-
-file(GLOB _GMM_Aclnn_header "${CMAKE_CURRENT_SOURCE_DIR}/aclnn_dispatch_gmm_combine_decode.h")
-
-install(FILES ${_GMM_Aclnn_header}
-        DESTINATION ${ACLNN_INC_INSTALL_DIR} OPTIONAL
 )
