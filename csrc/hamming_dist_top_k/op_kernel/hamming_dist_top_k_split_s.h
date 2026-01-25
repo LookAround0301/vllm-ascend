@@ -27,7 +27,6 @@
 
 #include <vector>
 #include "hamming_dist_top_k_base.h"
-// #include "../op_host/hamming_dist_top_k_tiling.h"
 
 namespace AscendC {
 

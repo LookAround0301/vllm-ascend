@@ -15,8 +15,8 @@ public:
     uint32_t blockDim_{0};
     uint64_t workspaceSize_{0};
     uint64_t tilingKey_{0};
-    AiCoreParams aicoreParams_{};
-    // AiCoreParams aicoreParams_{0};
+    // AiCoreParams aicoreParams_{};
+    AiCoreParams aicoreParams_{0};
 
     // from child class
     HammingDistTopKMatmulInfo inputParams_;
@@ -58,14 +58,14 @@ public:
     bool SetPlatformInfoForTiling();
     const gert::Shape GetShape(const size_t index);
     // 获取输入数据
-    // const uint32_t GetInputAttrData(const size_t index);
-    uint32_t GetInputAttrData(const size_t index);
+    const uint32_t GetInputAttrData(const size_t index);
+    // uint32_t GetInputAttrData(const size_t index);
     // output shape
     const gert::Shape GetOutShape(const size_t index);
 
     // 初始化sink和recent
-    // const void InitAttrParam() 
-    void InitAttrParam() {
+    const void InitAttrParam() {
+        // void InitAttrParam() {
         uint32_t sink = GetInputAttrData(1);
         uint32_t recent = GetInputAttrData(2);
         bool supportOffload = GetInputAttrData(3);
