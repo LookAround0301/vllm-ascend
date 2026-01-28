@@ -13,7 +13,6 @@ static ge::graphStatus TilingPrepareForHammingDistTopK(gert::TilingParseContext 
 }
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context) {
-    std::cout << "enter TilingFunc\n";
     ge::graphStatus ret;
     HammingDistTopKSplitSTiling hammingDistTopKSplitSTiling(context);
     hammingDistTopKSplitSTiling.GetShapeAttrsInfo();
@@ -25,8 +24,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context) {
         hammingDistTopKSplitSTiling.GetWorkspaceSize();
         hammingDistTopKSplitSTiling.PostTiling();
         context->SetTilingKey(hammingDistTopKSplitSTiling.GetTilingKey());
-        std::cout << "enter TilingFunc split SetTilingKey\n";
-        hammingDistTopKSplitSTiling.PrintTilingData(); //print for debug by ldeng
+        // hammingDistTopKSplitSTiling.PrintTilingData(); //print for debug by ldeng
+        // hammingDistTopKSplitSTiling.PrintTilingDataRope();
         return ge::GRAPH_SUCCESS;
     }
     
@@ -39,7 +38,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context) {
     hammingDistTopKTiling.GetWorkspaceSize();
     hammingDistTopKTiling.PostTiling();
     context->SetTilingKey(hammingDistTopKTiling.GetTilingKey());
-    std::cout << "enter TilingFunc SetTilingKey\n";
     return ge::GRAPH_SUCCESS;
 }
 

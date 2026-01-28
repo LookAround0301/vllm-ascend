@@ -1,15 +1,7 @@
 #ifndef HAMMING_DIST_TOP_K_TILING_H
 #define HAMMING_DIST_TOP_K_TILING_H
 
-#include <map>
-#include <vector>
-#include <numeric>
-#include <algorithm>
-#include <graph/utils/type_utils.h>
-#include "error/ops_error.h"
-
 #include "register/tilingdata_base.h"
-#include "register/op_def_registry.h"
 #include "tiling/tiling_api.h"
 #include "op_host_util.h"
 
@@ -20,12 +12,15 @@ BEGIN_TILING_DATA_DEF(HammingDistTopKTilingParams)
 	TILING_DATA_FIELD_DEF(uint32_t, batchN);
     TILING_DATA_FIELD_DEF(uint32_t, head);
     TILING_DATA_FIELD_DEF(uint32_t, dimension);
+    TILING_DATA_FIELD_DEF(uint32_t, nope_dimension);
+    TILING_DATA_FIELD_DEF(uint32_t, rope_dimension);
     TILING_DATA_FIELD_DEF(uint32_t, reducedBatch);
 	TILING_DATA_FIELD_DEF(uint32_t, maxSeqLen);
     TILING_DATA_FIELD_DEF(uint32_t, sink);
     TILING_DATA_FIELD_DEF(uint32_t, recent);
-    TILING_DATA_FIELD_DEF(bool, supportOffload);
+    TILING_DATA_FIELD_DEF(uint32_t, supportOffload);
     TILING_DATA_FIELD_DEF(uint32_t, layerSize);
+    TILING_DATA_FIELD_DEF(uint32_t, layerSizeRope);
     TILING_DATA_FIELD_DEF(uint32_t, matmulResultSize);
     TILING_DATA_FIELD_DEF(uint32_t, topKValueSize);
     TILING_DATA_FIELD_DEF(uint32_t, topKIdexSize);
@@ -41,10 +36,12 @@ BEGIN_TILING_DATA_DEF(HammingDistTopKTilingParams)
     TILING_DATA_FIELD_DEF(uint32_t, outter);
     TILING_DATA_FIELD_DEF(uint32_t, inner);
     TILING_DATA_FIELD_DEF(uint32_t, topkN);
+    TILING_DATA_FIELD_DEF(uint64_t, kNopeUnpackGmOffset);
     TILING_DATA_FIELD_DEF(uint64_t, mmGmOffset);
     TILING_DATA_FIELD_DEF(uint32_t, qHead);
     TILING_DATA_FIELD_DEF(uint64_t, qUnpackGmOffset);
     TILING_DATA_FIELD_DEF(uint32_t, headGroupNum);
+    TILING_DATA_FIELD_DEF(uint32_t, supportKeyRope);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(HammingDistTopKTilingParamsOp, HammingDistTopKTilingParams)
@@ -52,6 +49,7 @@ REGISTER_TILING_DATA_CLASS(HammingDistTopKTilingParamsOp, HammingDistTopKTilingP
 BEGIN_TILING_DATA_DEF(HammingDistTopKTilingData)
     TILING_DATA_FIELD_DEF_STRUCT(HammingDistTopKTilingParams, params);
     TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, matmulTiling);
+    TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, matmulTilingRope);
     TILING_DATA_FIELD_DEF_STRUCT(TopkTiling, topkTiling);
 END_TILING_DATA_DEF;
 
@@ -88,7 +86,7 @@ struct AiCoreParams {
     uint64_t l0bSize;
     uint64_t l0cSize;
 };
-
+// using HammingDistTopKCompileInfo = gert::GemmCompileInfo;
 }
 
 #endif

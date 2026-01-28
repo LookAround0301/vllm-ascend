@@ -22,21 +22,9 @@
 #ifndef HAMMING_DIST_TOP_K_BASE_H
 #define HAMMING_DIST_TOP_K_BASE_H
 
-#include <map>
-#include <vector>
-#include <numeric>
-#include <algorithm>
-#include <graph/utils/type_utils.h>
-// #include "error/ops_error.h"
-
-#include "register/tilingdata_base.h"
-#include "register/op_def_registry.h"
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
-
-#include "kernel_operator_list_tensor_intf.h"
-#include "lib/matrix/matmul/tiling.h"
 
 namespace AscendC {
 
@@ -79,13 +67,8 @@ struct TilingParam {
     uint32_t singleCoreK = 0;
     uint32_t ka = 0;
     uint32_t kb = 0;
-    uint32_t mTotalCnt = 0;
-    uint32_t nTotalCnt = 0;
-    uint32_t mBaseTail = 0;
-    uint32_t nBaseTail = 0;
-    bool isPerTensor = false;
-    bool isMClash = false;
-    bool isNClash = false;
+    uint32_t rope_ka = 0;
+    uint32_t rope_kb = 0;
     // tiling data for select
     uint32_t layer = 0;
     uint32_t batch = 0;
@@ -93,13 +76,17 @@ struct TilingParam {
     uint32_t batchN = 0;
     uint32_t selectUsedCoreNum = 0;
     uint32_t layerSize = 0;
+    uint32_t layerSizeRope = 0;
     uint32_t seqLen = 0;
     uint32_t dimension = 0;
+    uint32_t nope_dimension = 0;
+    uint32_t rope_dimension = 0;
     uint32_t reducedBatch = 0;
     uint32_t tileN1 = 0;
     uint32_t tileN2 = 0;
     uint32_t singleCoreBatch = 0;
     uint32_t singleCoreSeqLen = 0;
+    bool supportKeyRope;
     // tiling data for matmul
     uint32_t matmulResultSize = 0;
     // tiling data for topk
@@ -110,6 +97,7 @@ struct TilingParam {
     uint32_t topKInnerSize = 0;
     uint32_t topKValueSize = 0;
     uint32_t topKIdexSize = 0;
+    uint32_t kNopeUnpackGmOffset = 0;
     uint32_t mmGmOffset = 0;
     uint32_t qHead = 0;
     uint32_t headGroupNum = 0;
@@ -136,7 +124,10 @@ __aicore__ inline void SelectCustom(const LocalTensor<T> &dstLocal, const LocalT
 {
     AscendC::BinaryRepeatParams repeatParams = {1, 1, 1, 8, 0, 8}; // {dstBlkStride, src0BlkStride, src1BlkStride, dstRepStride, src0RepStride, src1RepStride} src0重复使用，repeat stride设置为0。
     uint64_t mask = MAX_FP16_PROCESS_NUM;
+    // DumpTensor(keyCompressed, 123, 256);
+    // DumpTensor(src0Local, 124, 256);
     Select(dstLocal, keyCompressed, src0Local, static_cast<T>(-1), AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, mask, repeatTimes, repeatParams);
+    // DumpTensor(dstLocal, 126, 256);
 }
 
 template <typename T>
@@ -168,7 +159,7 @@ __aicore__ inline void ReduceMaxCustom(const GlobalTensor<half> &inputGm, const 
 
     DataCopyPadExtParams<half> copyInPadParams{false, 0, 0, 0};  // 不填充
     DataCopyPad(reduceInputLocal, inputGm, copyInParams, copyInPadParams);  // DataCopyPad是内部算子
-
+    // DumpTensor(reduceInputLocal, 158, 6 * chunkSize);
     /* chunkNum尾巴小于8的位置，需要填充half最小值，这样BlockReduceMax对应位置的输出也会是half最小值，才不会影响后续TopK的计算 */
     uint32_t dataBlockNumAligned = matmul::CeilDiv(dataBlockNum, 8) * 8; // dataBlockNumAligned=256, /* 8: BlockReduceMax 一次并行计算8个dataBlock */
     if (dataBlockNumAligned > dataBlockNum) {  // 256>255
@@ -228,6 +219,7 @@ __aicore__ inline void ReduceMaxCustom(const GlobalTensor<half> &inputGm, const 
             dstOffset += repeat;  // dstOffset 按输出个数推进：每个 repeat 输出 1 个值
         }
         WholeReduceMax<half>(reduceOutputLocal[dstOffset], reduceInputLocal[srcOffset], mask, tailRepeat, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE); // (..., repeat, dstRepStride, srcBlkStride, srcRepStride)
+        // DumpTensor(reduceOutputLocal, 218, chunkNum);
     } else {
         int32_t totalRepeat = dataBlockNumAligned / 8;          // totalRepeat=32, /* 8: BlockReduceMax一次并行计算8个dataBlock */，重复32次计算完
         int32_t repeat = Min(MAX_REPEAT_TIMES, totalRepeat);    // MAX_REPEAT_TIMES内部参数，未知？假设repeat=32

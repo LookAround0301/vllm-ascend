@@ -378,6 +378,7 @@ at::Tensor npu_reshape_and_cache_bnsd_meta(const at::Tensor& hashq,
 
 at::Tensor npu_hamming_dist_top_k_meta(const at::Tensor &hashq, 
                                        const at::Tensor &hashkCache,
+                                       const at::Tensor& hashkCacheRope,
                                        const at::Tensor &topN,
                                        const at::Tensor &seqLen, 
                                        const c10::optional<at::Tensor> &chunkSize,

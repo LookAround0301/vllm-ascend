@@ -91,4 +91,4 @@ bash build.sh -n "$CUSTOM_OPS" -c "$SOC_ARG"
 # install custom ops to vllm_ascend/_cann_ops_custom
 ./output/CANN-custom_ops*.run --install-path=$ROOT_DIR/vllm_ascend/_cann_ops_custom
 export ASCEND_INSTALL_PATH=/usr/local/Ascend/ascend-toolkit/latest
-./output/CANN-custom_ops*.run --install-path=$ASCEND_INSTALL_PATH
+./output/CANN-custom_ops*.run

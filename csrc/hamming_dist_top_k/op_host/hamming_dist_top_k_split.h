@@ -18,10 +18,12 @@ public:
     uint64_t GetTilingKey();
 
     void SetMatmulTiling();
+    void SetMatmulTilingRope();
 
     void SetTopKTiling();
     
     void PrintTilingData();
+    void PrintTilingDataRope();
 
     ge::graphStatus GetWorkspaceSize();
 
@@ -38,6 +40,9 @@ public:
     uint64_t MAX_BATCH = 16;
     uint64_t SUPER_LONG_SEQLEN = 26 * 1024;
     uint64_t MIN_SPLIT_S_SEQLEN = 8 * 1024;
+
+    uint32_t KEY_ROPE_INPUT_INDEX = 7;
+    uint32_t KEY_BLOCK_TABLE_INPUT_INDEX = 5;
 };
 }
 #endif

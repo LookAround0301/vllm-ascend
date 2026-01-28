@@ -28,8 +28,7 @@ public:
         this->Input("key_compressed")
             .ParamType(REQUIRED)
             .DataType({ge::DT_UINT8})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
+            .Format({ge::FORMAT_ND});
         this->Input("k")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT32})
@@ -62,14 +61,22 @@ public:
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("indices_in")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("key_compressed_rope")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_UINT8})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("indices")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        // this->AICore()
-        //     .SetTiling(optiling::TilingFunc);
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)
@@ -79,8 +86,9 @@ public:
             .PrecisionReduceFlag(true)
             .ExtendCfgInfo("aclnnSupport.value", "support_aclnn")
             .ExtendCfgInfo("jitCompile.flag", "static_false,dynamic_false");
-        this->AICore().AddConfig("ascend910b", aicore_config);
+
         this->AICore().AddConfig("ascend910_93", aicore_config);
+        this->AICore().AddConfig("ascend910b", aicore_config);
 
     }
 };

@@ -7,7 +7,7 @@
 
 namespace optiling {
 namespace {
-constexpr uint32_t KEY_BLOCK_TABLE_INPUT_INDEX = 5;
+
 }
 bool HammingDistTopKSplitSTiling::IsCapable() {
     SetPlatformInfoForTiling();
@@ -47,6 +47,7 @@ ge::graphStatus HammingDistTopKSplitSTiling::GetWorkspaceSize() {
     uint64_t sysWorkspaceSize = WORKSIZE;
     //usrWorkspaceSize = workspace for Select + workspace for Topk
     uint64_t usrWorkspaceSize = ops::CeilDiv(static_cast<uint64_t>(tilingData_.params.get_layerSize() * COMPRESSED_RATE * sizeof(int8_t)), static_cast<uint64_t>(2)) +
+                                 ops::CeilDiv(static_cast<uint64_t>(tilingData_.params.get_layerSizeRope() * COMPRESSED_RATE * sizeof(int8_t)), static_cast<uint64_t>(2)) + 
                                  ops::CeilDiv(static_cast<uint64_t>(tilingData_.params.get_matmulResultSize() * sizeof(float)), static_cast<uint64_t>(2)) + 
                                  ops::CeilDiv(static_cast<uint64_t>(tilingData_.params.get_topKValueSize() * sizeof(float)), static_cast<uint64_t>(2)) + 
                                  static_cast<uint64_t>(tilingData_.params.get_topKIdexSize() * sizeof(int32_t)) +
@@ -62,6 +63,7 @@ ge::graphStatus HammingDistTopKSplitSTiling::DoOpTiling() {
     uint64_t qHead = GetShape(0).GetDim(1);
     uint64_t head = GetShape(1).GetDim(1);
     uint64_t dimension = GetShape(0).GetDim(3) * COMPRESSED_RATE;
+    uint64_t nope_dimension = GetShape(1).GetDim(3) * COMPRESSED_RATE;
     uint64_t headGroupNum = qHead / head;
     uint64_t maxSeqLen = tilingData_.params.get_maxSeqLen();
     uint64_t usedCoreNum = coreNum_;
@@ -72,7 +74,8 @@ ge::graphStatus HammingDistTopKSplitSTiling::DoOpTiling() {
     tilingData_.params.set_headGroupNum(headGroupNum);
     tilingData_.params.set_batchN(batch * head);
     tilingData_.params.set_dimension(dimension);
-    tilingData_.params.set_layerSize(batch * head * maxSeqLen * dimension / COMPRESSED_RATE);    
+    tilingData_.params.set_nope_dimension(nope_dimension);
+    tilingData_.params.set_layerSize(batch * head * maxSeqLen * nope_dimension / COMPRESSED_RATE);     
     tilingData_.params.set_matmulResultSize(batch * head * maxSeqLen);
     tilingData_.params.set_topKValueSize(batch * head * ops::CeilDiv(maxSeqLen, tileN2) * maxK);
     tilingData_.params.set_topKIdexSize(batch * head * ops::CeilDiv(maxSeqLen, tileN2) * maxK);
@@ -82,7 +85,15 @@ ge::graphStatus HammingDistTopKSplitSTiling::DoOpTiling() {
     tilingData_.params.set_sBlockSize(S_BLOCK_SIZE);
     tilingData_.params.set_tileN3(TILE_N3);
     tilingData_.params.set_tileN2(tileN2);
+    bool supportKeyRope = context_->GetOptionalInputShape(KEY_ROPE_INPUT_INDEX) != nullptr;;
+    tilingData_.params.set_supportKeyRope(supportKeyRope);
     SetMatmulTiling();
+    if (supportKeyRope) {
+        uint64_t rope_dimension = GetShape(KEY_ROPE_INPUT_INDEX).GetDim(3) * COMPRESSED_RATE;
+        tilingData_.params.set_rope_dimension(rope_dimension);
+        tilingData_.params.set_layerSizeRope(batch * head * maxSeqLen * rope_dimension / COMPRESSED_RATE);
+        SetMatmulTilingRope();  
+    }
     SetTopKTiling();
     return ge::GRAPH_SUCCESS;
 }
@@ -92,7 +103,7 @@ uint64_t HammingDistTopKSplitSTiling::GetTilingKey() {
 }
 
 void HammingDistTopKSplitSTiling::SetMatmulTiling() {
-    uint64_t dimension = GetShape(0).GetDim(3) * COMPRESSED_RATE;
+    uint64_t nope_dimension = GetShape(1).GetDim(3) * COMPRESSED_RATE;
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context_->GetPlatformInfo());
     matmul_tiling::MultiCoreMatmulTiling tiling(ascendcPlatform);
     tiling.SetDim(1);
@@ -100,11 +111,27 @@ void HammingDistTopKSplitSTiling::SetMatmulTiling() {
     tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT4);
     tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
     tiling.SetFixSplit(-1, L0B_BASE_SIZE, -1);
-    tiling.SetShape(1, VECTOR_CUBE_RATIO * tilingData_.params.get_tileN2(), dimension);
-    tiling.SetSingleShape(1, VECTOR_CUBE_RATIO * tilingData_.params.get_tileN2(), dimension);
-    tiling.SetOrgShape(1, VECTOR_CUBE_RATIO * tilingData_.params.get_tileN2(), dimension);
+    tiling.SetShape(1, VECTOR_CUBE_RATIO * tilingData_.params.get_tileN2(), nope_dimension);
+    tiling.SetSingleShape(1, VECTOR_CUBE_RATIO * tilingData_.params.get_tileN2(), nope_dimension);
+    tiling.SetOrgShape(1, VECTOR_CUBE_RATIO * tilingData_.params.get_tileN2(), nope_dimension);
     tiling.SetBias(false);
     tiling.GetTiling(tilingData_.matmulTiling); // if ret = -1, get tiling failed
+}
+
+void HammingDistTopKSplitSTiling::SetMatmulTilingRope() {
+    uint64_t rope_dimension = GetShape(KEY_ROPE_INPUT_INDEX).GetDim(3) * COMPRESSED_RATE;
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context_->GetPlatformInfo());
+    matmul_tiling::MultiCoreMatmulTiling tiling(ascendcPlatform);
+    tiling.SetDim(1);
+    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT4);
+    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT4);
+    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    tiling.SetFixSplit(-1, L0B_BASE_SIZE, -1);
+    tiling.SetShape(1, VECTOR_CUBE_RATIO * tilingData_.params.get_tileN2(), rope_dimension);
+    tiling.SetSingleShape(1, VECTOR_CUBE_RATIO * tilingData_.params.get_tileN2(), rope_dimension);
+    tiling.SetOrgShape(1, VECTOR_CUBE_RATIO * tilingData_.params.get_tileN2(), rope_dimension);
+    tiling.SetBias(false);
+    tiling.GetTiling(tilingData_.matmulTilingRope); // if ret = -1, get tiling failed
 }
 
 void HammingDistTopKSplitSTiling::SetTopKTiling() {
@@ -136,6 +163,20 @@ void HammingDistTopKSplitSTiling::PrintTilingData() {
        << "\n stepkb: " << tiling.get_stepKb();
     
     std::cout << "HammingDistTopKSplitSTiling::PrintTilingData()" << ss.str() << std::endl;
+}
+
+void HammingDistTopKSplitSTiling::PrintTilingDataRope() {
+    optiling::TCubeTiling &tiling = tilingData_.matmulTilingRope;
+    std::stringstream ss;
+    ss << "\n usedCoreNum: " << coreNum_ << " M: " << tiling.get_M() << " N: " << tiling.get_N()
+       << "\n Ka: " << tiling.get_Ka() << " Kb: " << tiling.get_Kb() << " singleCoreM: " << tiling.get_singleCoreM()
+       << "\n singleCoreN: " << tiling.get_singleCoreN() << " singleCoreK: " << tiling.get_singleCoreK()
+       << "\n baseM: " << tiling.get_baseM() << " baseN: " << tiling.get_baseN() << " baseK: " << tiling.get_baseK()
+       << "\n depthA1: " << tiling.get_depthA1() << " depthB1: " << tiling.get_depthB1()
+       << "\n stepM: " << tiling.get_stepM() << " stepN: " << tiling.get_stepN() << " stepka: " << tiling.get_stepKa()
+       << "\n stepkb: " << tiling.get_stepKb();
+    
+    std::cout << "HammingDistTopKSplitSTiling::PrintTilingDataRope()" << ss.str() << std::endl;
 }
 
 }

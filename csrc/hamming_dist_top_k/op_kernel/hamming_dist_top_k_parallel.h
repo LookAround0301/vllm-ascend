@@ -27,23 +27,28 @@ namespace AscendC {
 class HammingDistTopKParallelKernel {
 public:
     __aicore__ inline HammingDistTopKParallelKernel() {}
-    __aicore__ inline void Init(GM_ADDR query, GM_ADDR keyCompressed, GM_ADDR k,
+    __aicore__ inline void Init(GM_ADDR query, GM_ADDR keyCompressed, GM_ADDR keyCompressedRope, GM_ADDR k,
                                 GM_ADDR seqLen, GM_ADDR chunkSize, GM_ADDR keyBlockTable,
                                 GM_ADDR indices, GM_ADDR workSpace,
                                 const HammingDistTopKTilingData &tilingData, TPipe *pipe)
     {
         const TCubeTiling &tiling = tilingData.matmulTiling;
+        const TCubeTiling &tilingRope = tilingData.matmulTilingRope;
         const TopkTiling &topkTiling = tilingData.topkTiling;
         const HammingDistTopKTilingParams &tilingParam = tilingData.params;
         pipe_ = pipe;
         tilingData_ = tilingData;
-        InitTilingParams(tiling, topkTiling, tilingParam);
+        InitTilingParams(tiling, tilingRope, topkTiling, tilingParam);
         InitParams();
-        InitGlobalBuffers(query, keyCompressed, k, seqLen, chunkSize, keyBlockTable, indices, workSpace);
+        InitGlobalBuffers(query, keyCompressed, keyCompressedRope, k, seqLen, chunkSize, keyBlockTable, indices, workSpace);
 
         continFlag_ = keyBlockTableGm_.GetPhyAddr() != nullptr;
         mm_.SetSubBlockIdx(0);
         mm_.Init(&tiling, pipe_);
+        if (param_.supportKeyRope) {
+            mmRope_.SetSubBlockIdx(0);
+            mmRope_.Init(&tilingRope, pipe_);
+        }
     }
 
     __aicore__ inline void Process()
@@ -63,13 +68,12 @@ public:
         
         if ASCEND_IS_AIV {
             pipe_->Reset();
-            InitLocalBuffersForUnpack();
-            LocalTensor<half> constTensor = constBuf_.template Get<half>();
-            Duplicate<half>(constTensor, 1, param_.dimension);
         }
 
+        // YF_LOG("ldeng 71, curCoreLoop=%d\n", curCoreLoop);
 
         for (uint32_t loopIdx = 0; loopIdx < curCoreLoop; loopIdx++) {
+            //YF_LOG("ldeng 74\n");
             ComputeUnpackMM(loopIdx * batchNumPerLoop, batchNumPerLoop, loopIdx % BATCH_PING_PONG_NUM);
         }
         if ASCEND_IS_AIV {
@@ -78,10 +82,12 @@ public:
             InitLocalBuffersForTopK();
         }
 
+        //YF_LOG("ldeng 80\n");
         for (uint32_t loopIdx = 0; loopIdx < curCoreLoop; loopIdx++) {
             if ASCEND_IS_AIV {
                 VectorWaitCube(SYNC_AIC_AIV_FLAG2 + loopIdx % BATCH_PING_PONG_NUM);
                 if (GetSubBlockIdx() == loopIdx % 2) {
+                    //YF_LOG("ldeng 83\n");
                     ComputeTopK(loopIdx, loopIdx % BATCH_PING_PONG_NUM);
                 }
             }
@@ -127,15 +133,7 @@ protected:
             }
             if ASCEND_IS_AIV {
                 if (GetSubBlockIdx() == (j % SUB_BLOCK_NUM)) {
-                    LocalTensor<half> constTensor = constBuf_.template Get<half>();
-                    LocalTensor<half> selectTensor = selectBuf_. template Get<half>();
-                    LocalTensor<half> qReduceSumTensor = qReduceSumBuf_. template Get<half>();
-                    LocalTensor<half> qReduceSumLastRowTensor = qReduceSumLastRowBuf_. template Get<half>();
-                    if (batchIdx != 2) {
-                        Duplicate<half>(constTensor, 1, param_.dimension);
-                    }
-                    UnpackOneBatch(curSeqLen, curReducedBatch, constTensor, selectTensor, 0, qReduceSumTensor,
-                        qReduceSumLastRowTensor, true);
+                    UnpackOneBatch(curSeqLen, curReducedBatch, 0, true);
                 }
                 VectorNotifyCube<PIPE_MTE3>(SYNC_AIV_AIC_FLAG + pingPongFlag);
             }
@@ -177,12 +175,8 @@ protected:
                 subBlockSeqOffset += continFlag_ ? matmul::CeilDiv(curBlockCount, SUB_BLOCK_NUM) * param_.tileN1 :
                     matmul::CeilDiv(curSeqLen, SUB_BLOCK_NUM);
             }
-            LocalTensor<half> constTensor = constBuf_.template Get<half>();
-            LocalTensor<half> selectTensor = selectBuf_. template Get<half>();
-            LocalTensor<half> qReduceSumTensor = qReduceSumBuf_. template Get<half>();
-            LocalTensor<half> qReduceSumLastRowTensor = qReduceSumLastRowBuf_. template Get<half>();
-            UnpackOneBatch(subBlockSeqLen, curReducedBatch, constTensor, selectTensor, subBlockSeqOffset,
-                qReduceSumTensor, qReduceSumLastRowTensor, GetSubBlockIdx() == 0);
+
+            UnpackOneBatch(subBlockSeqLen, curReducedBatch, subBlockSeqOffset, GetSubBlockIdx() == 0);
             VectorNotifyCube<PIPE_MTE3>(SYNC_AIV_AIC_FLAG + pingPongFlag);
         }
         if ASCEND_IS_AIC {
@@ -191,33 +185,62 @@ protected:
         }
     }
 
-    __aicore__ inline void UnpackOneBatch(uint32_t sequenceLen, uint32_t batchIdx, LocalTensor<half> &constTensor,
-        LocalTensor<half> &selectTensor, uint32_t subBlockSeqOffset, LocalTensor<half> &qReduceSumTensor,
-        LocalTensor<half> &qReduceSumLastRowTensor, bool unpackQuery)
+    __aicore__ inline void UnpackOneBatch(uint32_t sequenceLen, uint32_t batchIdx, uint32_t subBlockSeqOffset, bool unpackQuery)
     {
         if ASCEND_IS_AIC {
             return;
         }
-        uint32_t realBatchIdx = batchIdx / param_.head; /* batchIdx without headNum */
-        uint32_t headIdx = batchIdx % param_.head;
-        uint32_t sequenceBlockNum = matmul::CeilDiv(sequenceLen, param_.tileN1);
-        uint32_t tailN1 = sequenceLen - (sequenceBlockNum - 1) * param_.tileN1;
+        InitLocalBuffersForUnpackQuery();
+        // unpack query
+        UnpackQuery(batchIdx);
+        pipe_->Reset();
+        InitLocalBuffersForUnpackKey();
+        // unpack key
+        UnpackKey(sequenceLen, batchIdx, subBlockSeqOffset, false);
+        if (param_.supportKeyRope) {
+            UnpackKey(sequenceLen, batchIdx, subBlockSeqOffset, true);
+        }
+        pipe_->Reset();
+    }
 
-        uint64_t queryGmOffset = batchIdx * param_.headGroupNum * COMPRESSED_DIMENSION;
+    __aicore__ inline void UnpackQuery(uint32_t batchIdx) {
+
+        LocalTensor<half> constTensor = constBuf_.template Get<half>();
+        LocalTensor<half> selectTensor = selectBuf_. template Get<half>();
+        LocalTensor<half> qReduceSumTensor = qReduceSumBuf_. template Get<half>();
+        LocalTensor<half> qReduceSumLastRowTensor = qReduceSumLastRowBuf_. template Get<half>();
+
+        Duplicate<half>(constTensor, 1, param_.dimension);
+
+        uint32_t compressedDimension = param_.dimension / COMPRESS_RATE;
+        uint64_t queryGmOffset = batchIdx * param_.headGroupNum * compressedDimension;
         LocalTensor<uint8_t> queryCompressed = queryCompressedInQueue_.AllocTensor<uint8_t>();
-        DataCopyExtParams queryCopyInParams{1, param_.headGroupNum * static_cast<uint32_t>(COMPRESSED_DIMENSION), 0, 0, 0};
+        DataCopyExtParams queryCopyInParams{1, param_.headGroupNum * static_cast<uint32_t>(compressedDimension), 0, 0, 0};
         DataCopyPadExtParams<uint8_t> queryCopyInPadParams{false, 0, 0, 0};
         DataCopyPad(queryCompressed, queryGm_[queryGmOffset], queryCopyInParams, queryCopyInPadParams);
-
+        //DumpTensor(queryCompressed, 210, queryCompressed.GetSize());
         queryCompressedInQueue_.EnQue(queryCompressed);
         queryCompressed = queryCompressedInQueue_.DeQue<uint8_t>();
-        SelectCustom<half>(selectTensor, queryCompressed, constTensor, static_cast<uint8_t>(param_.headGroupNum));
+        // half 每次迭代128个元素
+        uint32_t repeatedTimes = matmul::CeilDiv(param_.headGroupNum * param_.dimension, MAX_FP16_PROCESS_NUM);
+        SelectCustom<half>(selectTensor, queryCompressed, constTensor, static_cast<uint8_t>(repeatedTimes));
         PipeBarrier<PIPE_V>();
+        if (param_.supportKeyRope) {
+            uint32_t pad_dim = param_.rope_dimension / 2;
+            uint32_t valid_dim = param_.nope_dimension + pad_dim;
+            // YF_LOG("param_.dimension=%d, valid_dim=%d, pad_dim=%d\n", param_.dimension, valid_dim, pad_dim);
+            for (uint32_t i = 0; i < param_.headGroupNum; i++) {
+                // DumpTensor(selectTensor[i * param_.dimension], 224, 672);
+                Duplicate<half>(selectTensor[i * param_.dimension + valid_dim], 0, pad_dim);
+                // DumpTensor(selectTensor[i * param_.dimension], 226, 672);
+            }
+        }
         queryCompressedInQueue_.FreeTensor(queryCompressed);
 
         uint64_t qMask = MAX_FP16_PROCESS_NUM;
         uint32_t repeatTimes = matmul::CeilDiv(param_.dimension, MAX_FP16_PROCESS_NUM);
         LocalTensor<half> qHashTensor = selectTensor;
+        //DumpTensor(qHashTensor, 223, param_.dimension);
         if (param_.headGroupNum > 1) {
             static constexpr AscendC::CumSumConfig cumSumConfig{false, false, true};
             const AscendC::CumSumInfo cumSumInfo{param_.headGroupNum, param_.dimension};
@@ -234,7 +257,7 @@ protected:
             }
             qHashTensor = qReduceSumLastRowTensor;
         }
-
+        //DumpTensor(qHashTensor, 240, param_.dimension);
         LocalTensor<int4b_t> queryUnpacked = queryUnpackedOutQueue_.AllocTensor<int4b_t>();
         Cast<int4b_t, half>(queryUnpacked, qHashTensor, RoundMode::CAST_CEIL, qMask, repeatTimes, {1, 1, 2, 8});
         queryUnpackedOutQueue_.EnQue(queryUnpacked);
@@ -243,38 +266,107 @@ protected:
         DataCopyExtParams copyQOutParams{1, static_cast<uint32_t>(param_.dimension / 2), 0, 0, 0}; /* 2: 1 / size of int4b_t */
         DataCopyPad(qUnpackGm_[unpackQGmOffset], queryUnpacked, copyQOutParams);
         queryUnpackedOutQueue_.FreeTensor(queryUnpacked);
+    }
 
+    __aicore__ inline void UnpackKey(uint32_t sequenceLen, 
+                                    uint32_t batchIdx,
+                                    uint32_t subBlockSeqOffset,
+                                    bool isKeyRope) {
+        uint32_t realBatchIdx = batchIdx / param_.head; /* batchIdx without headNum */
+        uint32_t headIdx = batchIdx % param_.head;
+
+        uint32_t dimension = isKeyRope ? param_.rope_dimension : param_.nope_dimension;
+        GlobalTensor<uint8_t> keyGm = isKeyRope ? keyRopeGm_ : keyGm_;
+
+        uint32_t sequenceBlockNum = matmul::CeilDiv(sequenceLen, param_.tileN1);
+        uint32_t tailN1 = sequenceLen - (sequenceBlockNum - 1) * param_.tileN1;
+        uint32_t compressedDimension = dimension / COMPRESS_RATE;
+
+        LocalTensor<half> constTensor = constBuf_.template Get<half>();
+        LocalTensor<half> selectTensor = selectBuf_.template Get<half>();
+
+        Duplicate<half>(constTensor, 1, dimension);
+        // key select 迭代次数
+        uint32_t selectRepeatedTimes = computeSelectRepeatedTimes(dimension);
         for (uint32_t j = 0; j < sequenceBlockNum; j++) {
             LocalTensor<uint8_t> keyCompressed = keyCompressedInQueue_.AllocTensor<uint8_t>();
             uint32_t copySeqLen = j == sequenceBlockNum - 1 ? tailN1 : param_.tileN1;
-            DataCopyExtParams copyInParams{1, static_cast<uint32_t>(copySeqLen * COMPRESSED_DIMENSION), 0, 0, 0};
+            DataCopyExtParams copyInParams{1, static_cast<uint32_t>(copySeqLen * compressedDimension), 0, 0, 0};
             DataCopyPadExtParams<uint8_t> copyInPadParams{false, 0, 0, 0};
-            uint64_t keyGmOffset = batchIdx * param_.maxSeqLen * COMPRESSED_DIMENSION +
-                j * param_.tileN1 * COMPRESSED_DIMENSION + subBlockSeqOffset * COMPRESSED_DIMENSION;
+            uint64_t keyGmOffset = batchIdx * param_.maxSeqLen * compressedDimension +
+                j * param_.tileN1 * compressedDimension + subBlockSeqOffset * compressedDimension;
             if (!continFlag_) {
-                DataCopyPad(keyCompressed, keyGm_[keyGmOffset], copyInParams, copyInPadParams);
+                DataCopyPad(keyCompressed, keyGm[keyGmOffset], copyInParams, copyInPadParams);
             } else {
                 int32_t blockTableVal = keyBlockTableGm_.GetValue(realBatchIdx * param_.blockCount + j +
                                                                   subBlockSeqOffset / param_.tileN1);
                 uint64_t keyGmOffsetConti = (headIdx + static_cast<uint64_t>(blockTableVal) * param_.head) *
-                    param_.tileN1 * COMPRESSED_DIMENSION;
-                DataCopyPad(keyCompressed, keyGm_[keyGmOffsetConti], copyInParams, copyInPadParams);
+                    param_.tileN1 * compressedDimension;
+                DataCopyPad(keyCompressed, keyGm[keyGmOffsetConti], copyInParams, copyInPadParams);
             }
             keyCompressedInQueue_.EnQue(keyCompressed);
             keyCompressed = keyCompressedInQueue_.DeQue<uint8_t>();
-            SelectCustom<half>(selectTensor, keyCompressed, constTensor, static_cast<uint8_t>(copySeqLen));
-            PipeBarrier<PIPE_V>();
+            //DumpTensor(keyCompressed, 285, static_cast<uint32_t>(copySeqLen * compressedDimension));
+            //YF_LOG("sequenceBlockNum = %d j = %d copySeqLen = %d selectRepeatedTimes = %d subBlockSeqOffset = %d sequenceLen = %d\n", sequenceBlockNum, j, copySeqLen, selectRepeatedTimes, subBlockSeqOffset, sequenceLen);
+
+            if (selectRepeatedTimes > MAX_SELECT_REPEATED_TIMES) {
+                UnpackKeyCompressedWithBigDim(selectRepeatedTimes, selectTensor, constTensor, keyCompressed, keyGmOffset);
+            } else {
+                UnpackKeyCompressedWithLittleDim(selectTensor, constTensor, keyCompressed, dimension, keyGmOffset, copySeqLen);
+            }
             keyCompressedInQueue_.FreeTensor(keyCompressed);
-            LocalTensor<int4b_t> keyUnpacked = keyUnpackedOutQueue_.AllocTensor<int4b_t>();
-            uint64_t mask = MAX_FP16_PROCESS_NUM;
-            Cast<int4b_t, half>(keyUnpacked, selectTensor, RoundMode::CAST_CEIL, mask, static_cast<uint8_t>(copySeqLen), {1, 1, 2, 8});
-            keyUnpackedOutQueue_.EnQue(keyUnpacked);
-            keyUnpacked = keyUnpackedOutQueue_.DeQue<int4b_t>();
-            uint64_t unpackGmOffset = keyGmOffset * 8; /* 8: Original Dimension / Compressed Dimension */
-            DataCopyExtParams copyOutParams{1, static_cast<uint32_t>(copySeqLen * param_.dimension / 2), 0, 0, 0}; /* 2: 1 / size of int4b_t */
-            DataCopyPad(unpackGm_[unpackGmOffset], keyUnpacked, copyOutParams);
-            keyUnpackedOutQueue_.FreeTensor(keyUnpacked);
         }
+    }
+
+    __aicore__ inline void UnpackKeyCompressedWithBigDim(uint32_t selectRepeatedTimes,
+                                                         LocalTensor<half> &selectTensor,
+                                                         LocalTensor<half> &constTensor,
+                                                         LocalTensor<uint8_t> &keyCompressed,
+                                                         uint64_t keyGmOffset) {
+        uint32_t keySelectCycleCount = (selectRepeatedTimes + MAX_SELECT_REPEATED_TIMES - 1) / MAX_SELECT_REPEATED_TIMES;
+        uint32_t tailRepeateadTimes = selectRepeatedTimes % MAX_SELECT_REPEATED_TIMES;
+        LocalTensor<int4b_t> keyUnpacked = keyUnpackedOutQueue_.AllocTensor<int4b_t>();
+        // key offset
+        uint64_t keyCompressedOffset = 0;
+        uint32_t keyOffset = MAX_FP16_PROCESS_NUM * MAX_SELECT_REPEATED_TIMES / COMPRESS_RATE;
+        for (uint32_t index = 0; index < keySelectCycleCount; index++) {
+            uint32_t selectAndCastOffset = index * MAX_FP16_PROCESS_NUM * MAX_SELECT_REPEATED_TIMES;
+            uint32_t maxRepeatedTimes = (tailRepeateadTimes > 0 && (index == keySelectCycleCount - 1))
+                                            ? tailRepeateadTimes
+                                            : MAX_SELECT_REPEATED_TIMES;
+            SelectCustom<half>(selectTensor, keyCompressed[keyCompressedOffset], constTensor, static_cast<uint8_t>(maxRepeatedTimes));
+            // DumpTensor(selectTensor, 366, 672);
+            Cast<int4b_t, half>(keyUnpacked[selectAndCastOffset], selectTensor, RoundMode::CAST_CEIL, CAST_MASK, static_cast<uint8_t>(maxRepeatedTimes), {1, 1, 2, 8});
+            keyCompressedOffset = keyOffset * (index + 1);
+            // YF_LOG("keyGmOffset_ = %d tailRepeateadTimes = %d selectRepeatedTimes = %d \n", keyGmOffset_, tailRepeateadTimes, selectRepeatedTimes);
+        }
+        keyUnpackedOutQueue_.EnQue(keyUnpacked);
+        keyUnpacked = keyUnpackedOutQueue_.DeQue<int4b_t>();
+        DataCopyParams copyParams{1, static_cast<uint16_t>(selectRepeatedTimes * MAX_FP16_PROCESS_NUM / 2 / BLOCK_CUBE), 0, 0};  // 2: 1/2, size of int4b_t
+        DataCopy(unpackGm_[keyGmOffset * COMPRESS_RATE], keyUnpacked, copyParams);  // output to outQueue1 with DB_ON
+        keyUnpackedOutQueue_.FreeTensor(keyUnpacked);
+    }
+
+    __aicore__ inline void UnpackKeyCompressedWithLittleDim(LocalTensor<half> &selectTensor,
+                                                            LocalTensor<half> &constTensor,
+                                                            const LocalTensor<uint8_t> &keyCompressed,
+                                                            uint32_t dimension,
+                                                            uint64_t keyGmOffset, uint32_t repeateadTimes) {
+        SelectCustom<half>(selectTensor, keyCompressed, constTensor, static_cast<uint8_t>(repeateadTimes));
+        PipeBarrier<PIPE_V>();
+        LocalTensor<int4b_t> keyUnpacked = keyUnpackedOutQueue_.AllocTensor<int4b_t>();
+        uint64_t mask = MAX_FP16_PROCESS_NUM;
+        Cast<int4b_t, half>(keyUnpacked, selectTensor, RoundMode::CAST_CEIL, mask, static_cast<uint8_t>(repeateadTimes), {1, 1, 2, 8});
+        keyUnpackedOutQueue_.EnQue(keyUnpacked);
+        keyUnpacked = keyUnpackedOutQueue_.DeQue<int4b_t>();
+        uint64_t unpackGmOffset = keyGmOffset * 8; /* 8: Original Dimension / Compressed Dimension */
+        DataCopyExtParams copyOutParams{1, static_cast<uint32_t>(repeateadTimes * dimension / 2), 0, 0, 0}; /* 2: 1 / size of int4b_t */
+        if (param_.supportKeyRope) {
+            DataCopyPad(kRopeUnpackGm_[unpackGmOffset], keyUnpacked, copyOutParams);
+        } else {
+            DataCopyPad(unpackGm_[unpackGmOffset], keyUnpacked, copyOutParams);
+        }
+        keyUnpackedOutQueue_.FreeTensor(keyUnpacked);
     }
 
     __aicore__ inline void ComputeMM(uint32_t batchIdx, uint32_t seqLen)
@@ -289,12 +381,28 @@ protected:
         mm_.SetQuantScalar(ans);
 
         uint32_t realBatchIdx = curCoreBatchStartIdx_ + batchIdx;
-        mmOffsetA_ = realBatchIdx * param_.ka;
+        mmOffsetA_ = realBatchIdx * (param_.ka + param_.rope_ka);
         mmOffsetB_ = realBatchIdx * param_.maxSeqLen * param_.kb;
         mmOffsetC_ = realBatchIdx * param_.maxSeqLen;
         mm_.SetTensorA(qUnpackGm_[mmOffsetA_], AMatmulType::isTrans);
         mm_.SetTensorB(unpackGm_[mmOffsetB_], BMatmulType::isTrans);
-        mm_.IterateAll(matmulGm_[mmOffsetC_]);
+        mm_.IterateAll(matmulGm_[mmOffsetC_]);  // d
+
+        if (param_.supportKeyRope) {
+            SetFlag<HardEvent::FIX_MTE2>(eventIDFIX_MTE2);
+            WaitFlag<HardEvent::FIX_MTE2>(eventIDFIX_MTE2);
+            // DumpTensor(matmulGm_[mmOffsetC_], 435, 64);
+
+            mmRope_.SetOrgShape(param_.M, seqLen, param_.rope_ka);
+            mmRope_.SetSingleShape(param_.M, seqLen, param_.rope_ka);
+            mmRope_.SetQuantScalar(ans);
+            mmOffsetARope_ = mmOffsetA_ + param_.ka;
+            mmOffsetBRope_ = realBatchIdx * param_.maxSeqLen * param_.rope_kb;
+            mmRope_.SetTensorA(qUnpackGm_[mmOffsetARope_], AMatmulType::isTrans);
+            mmRope_.SetTensorB(kRopeUnpackGm_[mmOffsetBRope_], BMatmulType::isTrans);
+            mmRope_.IterateAll(matmulGm_[mmOffsetC_], 1);  // c
+            // DumpTensor(matmulGm_[mmOffsetC_], 445, 64);
+        }
     }
 
     __aicore__ inline void ComputeTopK(uint32_t batchIdx, uint32_t pingPongFlag)
@@ -303,6 +411,7 @@ protected:
             return;
         }
 
+        //YF_LOG("ldeng 299\n");
 
         uint32_t realReducedBatchIdx = curCoreBatchStartIdx_ + batchIdx;
         uint32_t realBatchIdx = realReducedBatchIdx / param_.head; /* batchIdx without headNum */
@@ -384,6 +493,7 @@ protected:
             second_last_block_tail_num = skipTailChunkNum - tailN2;
         }
 
+        //YF_LOG("batchIdx=%d, curSeqLen=%d, curChunkSize=%d, curChunkNum=%d, tileN2=%d,tailN2=%d,topKBlockNum=%d,skipTailChunkNum=%d,skipHeadChunkNum=%d,last_block_tail_num=%d,second_last_block_tail_num=%d, param_.tileN1=%d, \n", batchIdx, curSeqLen, curChunkSize, curChunkNum, tileN2, tailN2, topKBlockNum, skipTailChunkNum, skipHeadChunkNum, last_block_tail_num, second_last_block_tail_num,param_.tileN1);
 
         for (uint32_t i = 0; i < topKBlockNum; i++) {
             uint32_t copyLen = i == topKBlockNum - 1 ? tailN2 : tileN2;
@@ -392,13 +502,16 @@ protected:
             GenerateTopKIndexTensor(i, copyLen, tileN2, matmulGmOffset - mmOffset, curK);
             LocalTensor<half> topKInValueTensor = topKInValueQueue_.DeQue<half>();
 
+            //YF_LOG("ldeng 393 topKInValueTensor.GetSize()=%d\n", topKInValueTensor.GetSize());
             
             uint32_t chunkPerBlock = param_.tileN1 / curChunkSize;      // blocksize / chunksize = chunknum per block
             if (headChunkNum < skipHeadChunkNum) {
                 uint32_t curHeadChunkNum = min(skipHeadChunkNum - headChunkNum, copyLen);
                 headChunkNum += curHeadChunkNum;
+                //YF_LOG("ldeng 399\n");
                 //DumpTensor(topKInValueTensor, 400, topKInValueTensor.GetSize());
                 Duplicate(topKInValueTensor, static_cast<half>(MAX_HALF_VALUE), curHeadChunkNum);
+                //YF_LOG("ldeng 402\n");
                 //DumpTensor(topKInValueTensor, 403, topKInValueTensor.GetSize());
             }
 
@@ -407,6 +520,7 @@ protected:
             {
                 //uint32_t offset = tileN2 - second_last_block_tail_num;
                 //Maxs(topKInValueTensor[offset], topKInValueTensor[offset], MAX_HALF_VALUE, second_last_block_tail_num);
+                //YF_LOG("ldeng 385\n");
                 FillMaxValueFromTail(topKInValueTensor, tileN2, second_last_block_tail_num, curChunkSize);
             }
 
@@ -415,20 +529,24 @@ protected:
                 if(last_block_tail_num == tailN2)
                 {
                     //Maxs(topKInValueTensor, topKInValueTensor, MAX_HALF_VALUE, tailN2);
+                    //YF_LOG("ldeng 420\n");
                     //DumpTensor(topKInValueTensor, 421, topKInValueTensor.GetSize());
                     Duplicate(topKInValueTensor, static_cast<half>(MAX_HALF_VALUE), tailN2);
+                    //YF_LOG("ldeng 423\n");
                     //DumpTensor(topKInValueTensor, 424, topKInValueTensor.GetSize());
                 }
                 else
                 {
                     //uint32_t offset = tailN2 - last_block_tail_num;
                     //Maxs(topKInValueTensor[offset], topKInValueTensor[offset], MAX_HALF_VALUE, last_block_tail_num);
+                    //YF_LOG("ldeng 430\n");
                     //DumpTensor(topKInValueTensor, 431, topKInValueTensor.GetSize());
                     FillMaxValueFromTail(topKInValueTensor, tailN2, last_block_tail_num, curChunkSize);
                     //DumpTensor(topKInValueTensor, 433, topKInValueTensor.GetSize());
                 }
             }
             
+            //YF_LOG("ldeng 406\n");
 
             LocalTensor<int32_t> topKInIndexTensor = topKInIndexQueue_.DeQue<int32_t>();
             topKOutValueTensor = topKOutValueQueue_.AllocTensor<half>();
@@ -573,15 +691,20 @@ protected:
     static constexpr uint32_t SUB_BLOCK_NUM = 2;
     static constexpr uint32_t SUB_BLOCK_NUM_WITH_DB = 4;
     static constexpr float MIN_HALF_VALUE = -65535;
+    int32_t eventIDFIX_MTE2 = static_cast<int32_t>(GetTPipePtr()->FetchEventID(HardEvent::FIX_MTE2));
+
+    static constexpr uint32_t MAX_SELECT_REPEATED_TIMES = 254; // Select最大迭代次数
 
     GlobalTensor<uint8_t> queryGm_;
     GlobalTensor<uint8_t> keyGm_;
+    GlobalTensor<uint8_t> keyRopeGm_;
     GlobalTensor<int32_t> kGm_;
     GlobalTensor<int32_t> seqLenGm_;
     GlobalTensor<int32_t> chunkSizeGm_;
     GlobalTensor<int32_t> keyBlockTableGm_;
     GlobalTensor<int32_t> indicesGm_;
     GlobalTensor<int4b_t> unpackGm_;
+    GlobalTensor<int4b_t> kRopeUnpackGm_;
     GlobalTensor<half> matmulGm_;
     GlobalTensor<int4b_t> qUnpackGm_;
 
@@ -613,10 +736,12 @@ protected:
     // but actually we can move data to gm then to ub.
     using CMatmulType = matmul::MatmulType<TPosition::GM, CubeFormat::ND, half>;
     matmul::MatmulImpl<AMatmulType, BMatmulType, CMatmulType, BiasMatmulType, MM_CFG_NO_PRELOAD> mm_;
+    matmul::MatmulImpl<AMatmulType, BMatmulType, CMatmulType, BiasMatmulType, MM_CFG_NO_PRELOAD> mmRope_;
 
-    uint64_t mmGmOffset_;
     uint64_t mmOffsetA_;
     uint64_t mmOffsetB_;
+    uint64_t mmOffsetARope_;
+    uint64_t mmOffsetBRope_;
     uint64_t mmOffsetC_;
     uint32_t curCoreBatch_;
     uint32_t curCoreBatchStartIdx_;
@@ -648,7 +773,7 @@ protected:
         }
     }
 
-    __aicore__ inline void InitTilingParams(const TCubeTiling &tiling, const TopkTiling &topkTiling,
+    __aicore__ inline void InitTilingParams(const TCubeTiling &tiling, const TCubeTiling &tilingRope, const TopkTiling &topkTiling,
         const HammingDistTopKTilingParams &tilingParam)
     {
         // tiling data for select
@@ -656,6 +781,8 @@ protected:
         param_.batch = tilingParam.batch;
         param_.head = tilingParam.head;
         param_.dimension = tilingParam.dimension;
+        param_.nope_dimension = tilingParam.nope_dimension;
+        param_.rope_dimension = tilingParam.rope_dimension;
         param_.reducedBatch = tilingParam.reducedBatch;
         param_.tileN1 = tilingParam.tileN1;
         param_.tileN2 = tilingParam.tileN2;
@@ -665,15 +792,23 @@ protected:
         
         param_.maxK = tilingParam.maxK;
 
+        // support key rope
+        param_.supportKeyRope = tilingParam.supportKeyRope > 0;
+
         // tiling data for matmul
         param_.M = tiling.M;
         param_.N = tiling.N;
         param_.ka = tiling.Ka;
         param_.kb = tiling.Kb;
+        if (param_.supportKeyRope) {
+            param_.rope_ka = tilingRope.Ka;
+            param_.rope_kb = tilingRope.Kb;
+        }
 
         // tiling data for topk
         param_.mmGmOffset = tilingParam.mmGmOffset;
         param_.qUnpackGmOffset = tilingParam.qUnpackGmOffset;
+        param_.kNopeUnpackGmOffset = tilingParam.kNopeUnpackGmOffset;
         topkTiling_ = topkTiling;
         param_.maxSeqLen = tilingParam.maxSeqLen;
         param_.sink = tilingParam.sink;
@@ -681,32 +816,52 @@ protected:
         param_.blockCount = tilingParam.blockCount;
 
         // support offload
-        param_.supportOffload = tilingParam.supportOffload;
+        param_.supportOffload = tilingParam.supportOffload > 0;
     }
 
-    __aicore__ inline void InitGlobalBuffers(GM_ADDR query, GM_ADDR keyCompressed, GM_ADDR k, GM_ADDR seqLen,
+    __aicore__ inline void InitGlobalBuffers(GM_ADDR query, GM_ADDR keyCompressed, GM_ADDR keyCompressedRope, GM_ADDR k, GM_ADDR seqLen,
         GM_ADDR chunkSize, GM_ADDR keyBlockTable, GM_ADDR indices, GM_ADDR workSpace)
     {
         queryGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(query));
         keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(keyCompressed));
+        keyRopeGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(keyCompressedRope));
         kGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(k));
         seqLenGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(seqLen));
         chunkSizeGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(chunkSize));
         keyBlockTableGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(keyBlockTable));
         indicesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(indices));
         unpackGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int4b_t*>(workSpace));
-        matmulGm_.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(workSpace + param_.mmGmOffset));
+        kRopeUnpackGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int4b_t*>(workSpace + param_.kNopeUnpackGmOffset));
         qUnpackGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int4b_t*>(workSpace + param_.qUnpackGmOffset));
+        matmulGm_.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(workSpace + param_.mmGmOffset));
     }
 
-    __aicore__ inline void InitLocalBuffersForUnpack()
+    __aicore__ inline void InitLocalBuffersForUnpackKey()
     {
-        pipe_->InitBuffer(keyCompressedInQueue_, DOUBLE_BUFFER_NUM, param_.tileN1 * (param_.dimension / 8) * sizeof(int8_t)); /* 8: original dimension / compressed dimension */
-        pipe_->InitBuffer(keyUnpackedOutQueue_, DOUBLE_BUFFER_NUM, param_.tileN1 * param_.dimension * sizeof(int8_t) / 2); /* 2: 1 / sizeof(int4b_t) */ 
+        pipe_->InitBuffer(keyCompressedInQueue_, 1, param_.tileN1 * (param_.dimension / COMPRESS_RATE) * sizeof(int8_t)); /* 8: original dimension / compressed dimension */
+        pipe_->InitBuffer(keyUnpackedOutQueue_, 1, param_.tileN1 * param_.dimension * sizeof(int8_t) / 2); /* 2: 1 / sizeof(int4b_t) */ 
         pipe_->InitBuffer(constBuf_, param_.dimension * sizeof(half));
-        pipe_->InitBuffer(selectBuf_, param_.tileN1 * param_.dimension * sizeof(half));
-        pipe_->InitBuffer(queryCompressedInQueue_, DOUBLE_BUFFER_NUM, param_.headGroupNum * (param_.dimension / 8) * sizeof(int8_t)); /* 8: original dimension / compressed dimension */
-        pipe_->InitBuffer(queryUnpackedOutQueue_, DOUBLE_BUFFER_NUM, param_.headGroupNum * param_.dimension * sizeof(int8_t) / 2); /* 2: 1 / sizeof(int4b_t) */  
+        // 超过Select最大迭代限制次数
+        uint64_t selectRepeatedTimes = computeSelectRepeatedTimes(param_.dimension);
+        if (selectRepeatedTimes > MAX_SELECT_REPEATED_TIMES) {
+            pipe_->InitBuffer(selectBuf_, MAX_FP16_PROCESS_NUM * MAX_SELECT_REPEATED_TIMES * sizeof(half));
+        } else {
+            pipe_->InitBuffer(selectBuf_, param_.tileN1 * param_.dimension * sizeof(half));
+        }
+    }
+
+    __aicore__ inline uint64_t computeSelectRepeatedTimes(uint32_t dimension) {
+        uint64_t selectElmentCount = param_.tileN1 * dimension;
+        uint64_t selectRepeatedTimes = (selectElmentCount + MAX_FP16_PROCESS_NUM - 1) / MAX_FP16_PROCESS_NUM;
+        return selectRepeatedTimes;
+    }
+
+    __aicore__ inline void InitLocalBuffersForUnpackQuery()
+    {
+        pipe_->InitBuffer(constBuf_, param_.dimension * sizeof(half));
+        pipe_->InitBuffer(selectBuf_, param_.headGroupNum * param_.dimension * sizeof(half));
+        pipe_->InitBuffer(queryCompressedInQueue_, 1, param_.headGroupNum * (param_.dimension / 8) * sizeof(int8_t)); /* 8: original dimension / compressed dimension */
+        pipe_->InitBuffer(queryUnpackedOutQueue_, 1, param_.headGroupNum * param_.dimension * sizeof(int8_t) / 2); /* 2: 1 / sizeof(int4b_t) */  
         pipe_->InitBuffer(qReduceSumLastRowBuf_, param_.headGroupNum * param_.dimension * sizeof(half));
         pipe_->InitBuffer(qReduceSumBuf_, param_.headGroupNum * param_.dimension * sizeof(half));
     }

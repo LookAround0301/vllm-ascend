@@ -6,7 +6,7 @@
 namespace optiling {
 
 namespace {
-//constexpr uint32_t KEY_BLOCK_TABLE_INPUT_INDEX = 5;
+
 }
 
 bool HammingDistTopKTiling::IsCapable() 
@@ -42,7 +42,8 @@ ge::graphStatus HammingDistTopKTiling::DoOpTiling() {
         tilingData_.params.set_blockCount(blockCount);
         // printf("parallel: seqLen_ = %d\n", seqLen_);
     }
-    uint32_t dimension = GetShape(0).GetDim(3) * 8;
+    uint32_t dimension = GetShape(0).GetDim(3) * COMPRESSED_RATE;
+    uint64_t nope_dimension = GetShape(1).GetDim(3) * COMPRESSED_RATE;
     uint32_t reducedBatch = batch * head;
     uint32_t usedCoreNum = std::min(reducedBatch, coreNum_);
     uint32_t singleCoreBatch = ops::CeilDiv(reducedBatch, usedCoreNum);
@@ -55,6 +56,7 @@ ge::graphStatus HammingDistTopKTiling::DoOpTiling() {
     tilingData_.params.set_maxK(maxK);
 
     tilingData_.params.set_dimension(dimension);
+    tilingData_.params.set_nope_dimension(nope_dimension);
     tilingData_.params.set_reducedBatch(reducedBatch);
     tilingData_.params.set_usedCoreNum(usedCoreNum);
     tilingData_.params.set_tileN1(TILE_N1);
@@ -66,17 +68,28 @@ ge::graphStatus HammingDistTopKTiling::DoOpTiling() {
     tilingData_.params.set_singleCoreBatch(singleCoreBatch);
 
     tilingData_.params.set_singleCoreSeqLen(seqLen_);
-    tilingData_.params.set_mmGmOffset(static_cast<uint64_t>(reducedBatch) * seqLen_ * DIMENSION / 2 + /* 2 : 1 / sizeof(int4b_t) */
-        static_cast<uint64_t>(reducedBatch) * 1 * DIMENSION / 2);
-    tilingData_.params.set_qUnpackGmOffset(static_cast<uint64_t>(reducedBatch) * seqLen_ * DIMENSION / 2);
+    tilingData_.params.set_kNopeUnpackGmOffset(static_cast<uint64_t>(reducedBatch) * seqLen_ * nope_dimension / 2); /* 2 : 1 / sizeof(int4b_t) */
+    tilingData_.params.set_qUnpackGmOffset(static_cast<uint64_t>(reducedBatch) * seqLen_ * dimension / 2);
+    tilingData_.params.set_mmGmOffset(static_cast<uint64_t>(reducedBatch) * seqLen_ * dimension / 2 + /* 2 : 1 / sizeof(int4b_t) */
+        static_cast<uint64_t>(reducedBatch) * 1 * dimension / 2);
 
     this->SetMatmulTiling();
+
+    bool supportKeyRope = context_->GetOptionalInputShape(KEY_ROPE_INPUT_INDEX) != nullptr;;
+    tilingData_.params.set_supportKeyRope(supportKeyRope);
+    if (supportKeyRope) {
+        uint64_t rope_dimension = GetShape(KEY_ROPE_INPUT_INDEX).GetDim(3) * COMPRESSED_RATE;
+        tilingData_.params.set_rope_dimension(rope_dimension);
+        this->SetMatmulTilingRope();
+    }
+
     this->SetTopKTiling();
     return ge::GRAPH_SUCCESS;
 }
 
 ge::graphStatus HammingDistTopKTiling::DoLibApiTiling() {
     PrintTilingData();
+    PrintTilingDataRope();
     return ge::GRAPH_SUCCESS;
 }
 
@@ -132,11 +145,30 @@ void HammingDistTopKTiling::SetMatmulTiling() {
     if (seqLen_ >= SEQ_LEN_THRES) {
         tiling.SetFixSplit(-1, 512, -1); /* 512: BaseN = 512 and BaseK = 128 can fully utilize L0B */
     }
-    tiling.SetShape(1, seqLen_, DIMENSION);
-    tiling.SetSingleShape(1, seqLen_, DIMENSION);
-    tiling.SetOrgShape(1, seqLen_, DIMENSION);
+    uint64_t nope_dimension = GetShape(1).GetDim(3) * 8;
+    tiling.SetShape(1, seqLen_, nope_dimension);
+    tiling.SetSingleShape(1, seqLen_, nope_dimension);
+    tiling.SetOrgShape(1, seqLen_, nope_dimension);
     tiling.SetBias(false);
     tiling.GetTiling(tilingData_.matmulTiling); /* if ret = -1, get tiling failed */
+}
+
+void HammingDistTopKTiling::SetMatmulTilingRope() {
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context_->GetPlatformInfo());
+    matmul_tiling::MultiCoreMatmulTiling tiling(ascendcPlatform);
+    tiling.SetDim(1);
+    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT4);
+    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_INT4);
+    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    if (seqLen_ >= SEQ_LEN_THRES) {
+        tiling.SetFixSplit(-1, 512, -1); /* 512: BaseN = 512 and BaseK = 128 can fully utilize L0B */
+    }
+    uint64_t rope_dimension = GetShape(KEY_ROPE_INPUT_INDEX).GetDim(3) * 8;
+    tiling.SetShape(1, seqLen_, rope_dimension);
+    tiling.SetSingleShape(1, seqLen_, rope_dimension);
+    tiling.SetOrgShape(1, seqLen_, rope_dimension);
+    tiling.SetBias(false);
+    tiling.GetTiling(tilingData_.matmulTilingRope); /* if ret = -1, get tiling failed */
 }
 
 void HammingDistTopKTiling::SetTopKTiling() {   
@@ -175,6 +207,24 @@ void HammingDistTopKTiling::PrintTilingData() {
        << "\n stepkb: " << tiling.get_stepKb();
 }
 
+void HammingDistTopKTiling::PrintTilingDataRope() {
+    optiling::TCubeTiling &tiling = tilingData_.matmulTilingRope;
+    std::stringstream ss;
+    ss << "\n batch: " << tilingData_.params.get_batch()
+       << "\n head: " << tilingData_.params.get_head() << " qHead: " << tilingData_.params.get_qHead()
+       << "\n headGroupNum: " << tilingData_.params.get_headGroupNum()
+       << "\n reducedBatch: " << tilingData_.params.get_reducedBatch()
+       << "\n seqLen: " << tilingData_.params.get_maxSeqLen() << " dimension: " << tilingData_.params.get_dimension()
+       << "\n tileN1: " << tilingData_.params.get_tileN1() << " tileN2: " << tilingData_.params.get_tileN2();
+    ss << "\n usedCoreNum: " << tiling.get_usedCoreNum() << " M: " << tiling.get_M() << " N: " << tiling.get_N()
+       << "\n Ka: " << tiling.get_Ka() << " Kb: " << tiling.get_Kb() << " singleCoreM: " << tiling.get_singleCoreM()
+       << "\n singleCoreN: " << tiling.get_singleCoreN() << " singleCoreK: " << tiling.get_singleCoreK()
+       << "\n baseM: " << tiling.get_baseM() << " baseN: " << tiling.get_baseN() << " baseK: " << tiling.get_baseK()
+       << "\n depthA1: " << tiling.get_depthA1() << " depthB1: " << tiling.get_depthB1()
+       << "\n stepM: " << tiling.get_stepM() << " stepN: " << tiling.get_stepN() << " stepka: " << tiling.get_stepKa()
+       << "\n stepkb: " << tiling.get_stepKb();
+}
+
 const gert::Shape HammingDistTopKTiling::GetShape(const size_t index) {
     return context_->GetInputShape(index)->GetStorageShape();
 }
@@ -183,7 +233,6 @@ const gert::Shape HammingDistTopKTiling::GetOutShape(const size_t index) {
     return context_->GetOutputShape(index)->GetStorageShape();
 }
 
-// uint32_t HammingDistTopKTiling::GetInputAttrData(const size_t index) {
 const uint32_t HammingDistTopKTiling::GetInputAttrData(const size_t index) {
     if (auto attrPtr = context_->GetAttrs()) {
         const int64_t* p = attrPtr->GetInt(index);

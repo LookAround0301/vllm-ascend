@@ -15,7 +15,6 @@ public:
     uint32_t blockDim_{0};
     uint64_t workspaceSize_{0};
     uint64_t tilingKey_{0};
-    // AiCoreParams aicoreParams_{};
     AiCoreParams aicoreParams_{0};
 
     // from child class
@@ -53,26 +52,26 @@ public:
 
     void Reset();
     void SetMatmulTiling();
+    void SetMatmulTilingRope();
     void SetTopKTiling();
     void PrintTilingData();
+    void PrintTilingDataRope();
     bool SetPlatformInfoForTiling();
     const gert::Shape GetShape(const size_t index);
     // 获取输入数据
     const uint32_t GetInputAttrData(const size_t index);
-    // uint32_t GetInputAttrData(const size_t index);
     // output shape
     const gert::Shape GetOutShape(const size_t index);
 
     // 初始化sink和recent
     const void InitAttrParam() {
-        // void InitAttrParam() {
         uint32_t sink = GetInputAttrData(1);
         uint32_t recent = GetInputAttrData(2);
-        bool supportOffload = GetInputAttrData(3);
+        uint32_t supportOffload = GetInputAttrData(3);
         // printf("sink = %d recent = %d\n", sink, recent);
         tilingData_.params.set_sink(sink);
         tilingData_.params.set_recent(recent);
-        tilingData_.params.set_supportOffload(supportOffload > 0);
+        tilingData_.params.set_supportOffload(supportOffload);
     }
 
     uint32_t maxK = 2048;  // 默认maxK
@@ -83,7 +82,9 @@ public:
     uint64_t SUB_BLOCK_NUM_WITH_DB = 4;
     uint64_t WORKSIZE = 16 * 1024 * 1024;
     uint32_t TOP_K_ALIGN_NUM = 32;
+    uint32_t KEY_ROPE_INPUT_INDEX = 7;
     uint32_t KEY_BLOCK_TABLE_INPUT_INDEX = 5;
+    uint32_t COMPRESSED_RATE = 8;
 };
 
 
