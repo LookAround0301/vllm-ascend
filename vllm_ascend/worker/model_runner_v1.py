@@ -358,7 +358,9 @@ class NPUModelRunner(GPUModelRunner):
 
         if os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1":
             from vllm_ascend.worker.kvcomp_utils import KVCompConfig, HashEncoder
+            from vllm.utils import cdiv
             self.kvcomp_config = KVCompConfig.from_json(os.getenv("VLLM_ASCEND_KVCOMP_CONFIG_PATH"))
+            
             if self.vllm_config.model_config.use_mla:
                 self.hash_encoder_nope = HashEncoder(self.kvcomp_config.kv_lora_rank, self.kvcomp_config.hash_bits_kv_lora, self.dtype, self.device)
                 self.hash_encoder_rope = HashEncoder(self.kvcomp_config.qk_rope_head_dim, self.kvcomp_config.hash_bits_qk_rope, self.dtype, self.device)
@@ -367,6 +369,12 @@ class NPUModelRunner(GPUModelRunner):
             else: #GQA
                 self.hash_encoder = HashEncoder(self.kvcomp_config.head_dim, self.kvcomp_config.hash_bits, self.dtype, self.device)
                 self.hashk_caches = []
+            
+            self.chunk_sizes_for_hamming_full = torch.full([self.max_num_reqs], fill_value=self.block_size, dtype=torch.int32, device=self.device)
+            self.topk_for_hamming_full = torch.full([self.max_num_reqs], fill_value=self.kvcomp_config.vllm_hash_attention_topk // self.block_size, dtype=torch.int32, device=self.device)
+            self.topk_for_hamming_full_cpu = torch.full([self.max_num_reqs], fill_value=self.kvcomp_config.vllm_hash_attention_topk // self.block_size, dtype=torch.int32, device="cpu")
+            self.seq_lens_for_hamming = torch.zeros([self.max_num_reqs], dtype=torch.int32, device=self.device)
+            self.hamming_output = torch.zeros([self.max_num_reqs, self.model_config.get_num_kv_heads(self.parallel_config), cdiv(self.vllm_config.model_config.max_model_len, self.block_size)] , dtype=torch.int32, device=self.device)
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
