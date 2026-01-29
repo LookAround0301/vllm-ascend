@@ -53,6 +53,88 @@ def bind_hashk_cache(
         # NOTE: Use list because of v0 PP virtual engine.
         forward_context[layer_name].hashk_cache = [hashk_cache]
 
+def bind_hashk_cache_nope(
+    hashk_caches_nope: dict[str, torch.Tensor],
+    forward_context: dict[str, Attention],
+    runner_hashk_caches_nope: list[torch.Tensor],
+    num_attn_module: int = 1,
+) -> None:
+    """
+    Bind the allocated hashk cache for nope in MLA to both ModelRunner and forward context so
+    that the hashk cache for nope can be used in the forward pass.
+
+    This function:
+      1) Fills the ModelRunner's hashk cache list (`runner_hashk_caches_nope`) with
+         hashk_caches_nope.
+      2) Associates each attention layer in the `forward_context` with its
+         corresponding hashk cache for nope in MLA in hashk_caches_nope.
+
+    Args:
+        hashk_caches_nope: The allocated hashk_caches_nope with layer names as keys.
+        forward_context: The global forward context containing all Attention
+            layers with layer names as keys.
+        runner_hashk_caches_nope: The hashk cache for nope declared by ModelRunner.
+    """
+    # Bind hashk_caches_nope to ModelRunner; ensure it is empty before binding
+    assert len(runner_hashk_caches_nope) == 0
+
+    # Convert hashk_caches_nope dict to a list of tensors in the order of layer_index.
+    index2name = defaultdict(list)
+    for layer_name in hashk_caches_nope:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+    for layer_index in sorted(index2name.keys()):
+        layer_names = index2name[layer_index]
+        # (TODO: ldeng), support multiple hashk caches for the same layer index later, e.g., encoder-decoder models.
+        layer_name = layer_names[0]
+        runner_hashk_caches_nope.append(hashk_caches_nope[layer_name])
+
+    # Bind hashk_caches_nope to forward context
+    for layer_name, hashk_cache_nope in hashk_caches_nope.items():
+        # NOTE: Use list because of v0 PP virtual engine.
+        forward_context[layer_name].hashk_cache_nope = [hashk_cache_nope]
+
+def bind_hashk_cache_rope(
+    hashk_caches_rope: dict[str, torch.Tensor],
+    forward_context: dict[str, Attention],
+    runner_hashk_caches_rope: list[torch.Tensor],
+    num_attn_module: int = 1,
+) -> None:
+    """
+    Bind the allocated hashk cache for rope in MLA to both ModelRunner and forward context so
+    that the hashk cache for rope can be used in the forward pass.
+
+    This function:
+      1) Fills the ModelRunner's hashk cache list (`runner_hashk_caches_rope`) with
+         hashk_caches_rope.
+      2) Associates each attention layer in the `forward_context` with its
+         corresponding hashk cache for rope in MLA in hashk_caches_rope.
+
+    Args:
+        hashk_caches_rope: The allocated hashk_caches_rope with layer names as keys.
+        forward_context: The global forward context containing all Attention
+            layers with layer names as keys.
+        runner_hashk_caches_rope: The hashk cache for rope declared by ModelRunner.
+    """
+    # Bind hashk_caches_rope to ModelRunner; ensure it is empty before binding
+    assert len(runner_hashk_caches_rope) == 0
+
+    # Convert hashk_caches_rope dict to a list of tensors in the order of layer_index.
+    index2name = defaultdict(list)
+    for layer_name in hashk_caches_rope:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+    for layer_index in sorted(index2name.keys()):
+        layer_names = index2name[layer_index]
+        # (TODO: ldeng), support multiple hashk caches for the same layer index later, e.g., encoder-decoder models.
+        layer_name = layer_names[0]
+        runner_hashk_caches_rope.append(hashk_caches_rope[layer_name])
+
+    # Bind hashk_caches_rope to forward context
+    for layer_name, hashk_cache_rope in hashk_caches_rope.items():
+        # NOTE: Use list because of v0 PP virtual engine.
+        forward_context[layer_name].hashk_cache_rope = [hashk_cache_rope]
+
 
 
 @dataclass
