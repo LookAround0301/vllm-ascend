@@ -5,6 +5,7 @@ from vllm.attention.layer import Attention
 import json
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional
+import torch_npu
 
 import numpy as np
 import logging
@@ -51,6 +52,88 @@ def bind_hashk_cache(
     for layer_name, hashk_cache in hashk_caches.items():
         # NOTE: Use list because of v0 PP virtual engine.
         forward_context[layer_name].hashk_cache = [hashk_cache]
+
+def bind_hashk_cache_nope(
+    hashk_caches_nope: dict[str, torch.Tensor],
+    forward_context: dict[str, Attention],
+    runner_hashk_caches_nope: list[torch.Tensor],
+    num_attn_module: int = 1,
+) -> None:
+    """
+    Bind the allocated hashk cache for nope in MLA to both ModelRunner and forward context so
+    that the hashk cache for nope can be used in the forward pass.
+
+    This function:
+      1) Fills the ModelRunner's hashk cache list (`runner_hashk_caches_nope`) with
+         hashk_caches_nope.
+      2) Associates each attention layer in the `forward_context` with its
+         corresponding hashk cache for nope in MLA in hashk_caches_nope.
+
+    Args:
+        hashk_caches_nope: The allocated hashk_caches_nope with layer names as keys.
+        forward_context: The global forward context containing all Attention
+            layers with layer names as keys.
+        runner_hashk_caches_nope: The hashk cache for nope declared by ModelRunner.
+    """
+    # Bind hashk_caches_nope to ModelRunner; ensure it is empty before binding
+    assert len(runner_hashk_caches_nope) == 0
+
+    # Convert hashk_caches_nope dict to a list of tensors in the order of layer_index.
+    index2name = defaultdict(list)
+    for layer_name in hashk_caches_nope:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+    for layer_index in sorted(index2name.keys()):
+        layer_names = index2name[layer_index]
+        # (TODO: ldeng), support multiple hashk caches for the same layer index later, e.g., encoder-decoder models.
+        layer_name = layer_names[0]
+        runner_hashk_caches_nope.append(hashk_caches_nope[layer_name])
+
+    # Bind hashk_caches_nope to forward context
+    for layer_name, hashk_cache_nope in hashk_caches_nope.items():
+        # NOTE: Use list because of v0 PP virtual engine.
+        forward_context[layer_name].hashk_cache_nope = [hashk_cache_nope]
+
+def bind_hashk_cache_rope(
+    hashk_caches_rope: dict[str, torch.Tensor],
+    forward_context: dict[str, Attention],
+    runner_hashk_caches_rope: list[torch.Tensor],
+    num_attn_module: int = 1,
+) -> None:
+    """
+    Bind the allocated hashk cache for rope in MLA to both ModelRunner and forward context so
+    that the hashk cache for rope can be used in the forward pass.
+
+    This function:
+      1) Fills the ModelRunner's hashk cache list (`runner_hashk_caches_rope`) with
+         hashk_caches_rope.
+      2) Associates each attention layer in the `forward_context` with its
+         corresponding hashk cache for rope in MLA in hashk_caches_rope.
+
+    Args:
+        hashk_caches_rope: The allocated hashk_caches_rope with layer names as keys.
+        forward_context: The global forward context containing all Attention
+            layers with layer names as keys.
+        runner_hashk_caches_rope: The hashk cache for rope declared by ModelRunner.
+    """
+    # Bind hashk_caches_rope to ModelRunner; ensure it is empty before binding
+    assert len(runner_hashk_caches_rope) == 0
+
+    # Convert hashk_caches_rope dict to a list of tensors in the order of layer_index.
+    index2name = defaultdict(list)
+    for layer_name in hashk_caches_rope:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+    for layer_index in sorted(index2name.keys()):
+        layer_names = index2name[layer_index]
+        # (TODO: ldeng), support multiple hashk caches for the same layer index later, e.g., encoder-decoder models.
+        layer_name = layer_names[0]
+        runner_hashk_caches_rope.append(hashk_caches_rope[layer_name])
+
+    # Bind hashk_caches_rope to forward context
+    for layer_name, hashk_cache_rope in hashk_caches_rope.items():
+        # NOTE: Use list because of v0 PP virtual engine.
+        forward_context[layer_name].hashk_cache_rope = [hashk_cache_rope]
 
 
 
@@ -297,4 +380,156 @@ class KVCompConfig:
         with open(file_path, "r") as f:
             config_dict = json.load(f)
         return cls(**config_dict)
+
+
+class HashEncoder:
+    """
+    HashEncoder converts a float tensor to a binary hash code tensor,
+    and it packs every 8 bits into a uint8 number.
+    """
+
+    def __init__(
+        self, input_dim: int, hash_bits: int, dtype: torch.dtype, device: torch.device
+    ) -> None:
+        self.input_dim = input_dim
+
+        if hash_bits % 8 != 0:
+            raise ValueError("hash_bits must be a multiple of 8")
+
+        self.hash_bits = hash_bits
+
+        # number of uint8 numbers to store hash_bits bits
+        self.hash_numbers = self.hash_bits // 8
+
+        self.dtype = dtype
+        self.device = device
+
+        assert self.device.type == "npu"
+
+        if dtype not in [torch.float16, torch.float32, torch.float64]:
+            logger.warning(
+                "NPU only supports float16, float32 and float64 for hash_weights"
+            )
+            logger.warning("automatically using float16 for hash_weights now")
+            self.dtype = torch.float16
+
+        self._init_hash_weights()
+
+
+    def _init_hash_weights(self):
+        # Step 1: 随机高斯矩阵
+        random_weights = torch.normal(
+            mean=0,
+            std=2,
+            size=(self.input_dim, self.hash_bits),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        # Step 2: QR分解
+        Q, R = torch.linalg.qr(random_weights)
+
+        # Step 3: 调整符号，保证Haar 分布
+        d = torch.sign(torch.diag(R))
+        self.hash_weights = Q * d
+
+    def set_hash_weight(self, hash_weights: torch.Tensor) -> None:
+        if hash_weights.shape != (self.input_dim, self.hash_bits):
+            raise ValueError(
+                f"hash_weights shape {hash_weights.shape} does not match required shape {(self.input_dim, self.hash_bits)}"
+            )
+        if hash_weights.dtype != self.dtype:
+            raise ValueError(
+                f"hash_weights dtype {hash_weights.dtype} does not match required dtype {self.dtype}"
+            )
+        if hash_weights.device != self.device:
+            raise ValueError(
+                f"hash_weights device {hash_weights.device} does not match required device {self.device}"
+            )
+
+        self.hash_weights.copy_(hash_weights)
+
+
+
+    def compute_hash(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the hash code for input tensor x.
+        Args:
+            x: input tensor of shape (..., input_dim)
+        Returns:
+            A tensor of shape (..., hash_numbers=hash_bits // 8) representing the hash codes.
+            Each element is a uint8 number representing 8 bits of the hash code.
+        """
+        if x.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"x must be of shape (..., {self.input_dim}), but got {x.shape}"
+            )
+        if x.device != self.device:
+            raise ValueError(
+                f"x device {x.device} does not match required device {self.device}"
+            )
+
+        # original shape without the last dimension
+        # e.g. x.shape=[s1,s2,s3,input_dim], orig_shape=[s1,s2,s3]
+        orig_shape = x.shape[:-1]
+
+        # [N, input_dim], e.g., N = s1*s2*s3
+        x_flat = x.reshape(-1, self.input_dim)
+
+        if x_flat.dtype != self.dtype:
+            x_flat = x_flat.to(self.dtype)
+
+        # [N, hash_bits]
+        xW = torch.matmul(x_flat, self.hash_weights)
+        # [N * hash_bits]
+        xW_flat = xW.view(-1)
+        # [N*hash_numbers], where hash_numbers = hash_bits // 8
+        packed_codes_flat = torch_npu.npu_sign_bits_pack(xW_flat, size=1)
+
+        # e.g., [s1, s2, s3, hash_numbers]
+        out_shape = orig_shape + (self.hash_numbers,)
+        packed_codes = packed_codes_flat.view(out_shape)
+
+        return packed_codes
+
+    def _unpack_hash(self, packed_codes: torch.Tensor) -> torch.Tensor:
+        """
+        Unpack the hash codes to +1 or -1 bits.
+        Args:
+            packed_codes: input tensor of shape (..., hash_numbers), dtype=torch.uint8
+        Returns:
+            A tensor of shape (..., hash_bits=hash_numbers*8) representing the unpacked bits.
+            Each element is either -1 or 1.
+        """
+        if packed_codes.shape[-1] != self.hash_numbers:
+            raise ValueError(
+                f"packed_codes must be of shape (..., {self.hash_numbers}), but got {packed_codes.shape}"
+            )
+        if packed_codes.device != self.device:
+            raise ValueError(
+                f"packed_codes device {packed_codes.device} does not match required device {self.device}"
+            )
+        if packed_codes.dtype != torch.uint8:
+            raise ValueError(
+                f"packed_codes dtype {packed_codes.dtype} is not torch.uint8"
+            )
+
+        # e.g., packed_codes.shape=[s1, s2, s3, hash_numbers]
+        # orig_shape = [s1, s2, s3]
+        orig_shape = packed_codes.shape[:-1]
+
+        # [N * hash_numbers], e.g., N = s1*s2*s3
+        packed_codes_flat = packed_codes.view(-1)
+
+        # [N * hash_bits]
+        unpacked_bits_flat = torch_npu.npu_sign_bits_unpack(
+            packed_codes_flat, size=1, dtype=torch.float16
+        )
+    
+
+        out_shape = orig_shape + (self.hash_bits,)
+        unpacked_bits = unpacked_bits_flat.view(out_shape)
+
+        return unpacked_bits
+
+
 
