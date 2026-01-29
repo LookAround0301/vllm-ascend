@@ -357,9 +357,16 @@ class NPUModelRunner(GPUModelRunner):
         self.long_seq_metadata = None
 
         if os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1":
-            from vllm_ascend.worker.kvcomp_utils import KVCompConfig
+            from vllm_ascend.worker.kvcomp_utils import KVCompConfig, HashEncoder
             self.kvcomp_config = KVCompConfig.from_json(os.getenv("VLLM_ASCEND_KVCOMP_CONFIG_PATH"))
-            self.hashk_caches = []
+            if self.vllm_config.model_config.use_mla:
+                self.hash_encoder_nope = HashEncoder(self.kvcomp_config.kv_lora_rank, self.kvcomp_config.hash_bits_kv_lora, self.dtype, self.device)
+                self.hash_encoder_rope = HashEncoder(self.kvcomp_config.qk_rope_head_dim, self.kvcomp_config.hash_bits_qk_rope, self.dtype, self.device)
+                self.hashk_cache_nope = []
+                self.hashk_cache_rope = []
+            else: #GQA
+                self.hash_encoder = HashEncoder(self.kvcomp_config.head_dim, self.kvcomp_config.hash_bits, self.dtype, self.device)
+                self.hashk_caches = []
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
