@@ -9,7 +9,7 @@
 
 add_ops_compile_options(
         OP_NAME HammingDistTopK
-        OPTIONS --cce-auto-sync=off
+        OPTIONS --cce-auto-sync=on
                 -Wno-deprecated-declarations
                 -Werror
                 -mllvm -cce-aicore-hoist-movemask=false
@@ -31,6 +31,8 @@ target_sources(optiling PRIVATE
 if (NOT BUILD_OPEN_PROJECT)
     target_sources(opmaster_ct PRIVATE
         hamming_dist_top_k_tiling.cpp
+        hamming_dist_top_k.cpp
+        hamming_dist_top_k_split.cpp
     )
 endif ()
 

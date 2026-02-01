@@ -1243,6 +1243,7 @@ at::Tensor npu_hamming_dist_top_k(const at::Tensor &hashq,
                                        const c10::optional<int64_t> recent, 
                                        const c10::optional<int64_t> supportOffload,
                                        const c10::optional<at::Tensor> &blockTable,
+                                       const c10::optional<at::Tensor> &mask,
                                        const c10::optional<at::Tensor>& indices) {
 
     auto&& maxSeqLen_ = maxSeqLen.value_or(0);
@@ -1252,8 +1253,7 @@ at::Tensor npu_hamming_dist_top_k(const at::Tensor &hashq,
 
     at::Tensor out = convert_hamming_dist_top_k_output(hashq, hashkCache, indices);
     // 调用aclnn接口计算
-    // assert(0<0);
-    EXEC_NPU_CMD(aclnnHammingDistTopK, hashq, hashkCache, topN, seqLen, chunkSize, blockTable, indices, hashkCacheRope, maxSeqLen_, sink_, recent_, supportOffload_, out);
+    EXEC_NPU_CMD(aclnnHammingDistTopK, hashq, hashkCache, topN, seqLen, chunkSize, blockTable, indices, hashkCacheRope, mask, maxSeqLen_, sink_, recent_, supportOffload_, out);
     return out;
 }
 
@@ -1419,7 +1419,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_hamming_dist_top_k(Tensor q, Tensor k_comp, Tensor k_comp_rope, Tensor k,"
         "                      Tensor seq_len, Tensor? chunk_size=None,"
         "                      int? max_seq_len=None, int? sink=None, int? recent=None, int? support_offload=None,"
-        "                      Tensor? key_block_table=None, Tensor? indices=None) -> Tensor"
+        "                      Tensor? key_block_table=None, Tensor? mask=None, Tensor? indices=None) -> Tensor"
     );
     ops.impl("npu_hamming_dist_top_k", torch::kPrivateUse1, &vllm_ascend::npu_hamming_dist_top_k);
     

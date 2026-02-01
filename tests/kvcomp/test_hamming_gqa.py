@@ -96,15 +96,16 @@ class TestCustomHammingDistTopK(TestCase):
         indices = torch.zeros([batch_size, num_kv_head, 128], dtype=torch.int32)
 
         support_offload = 1
+        mask = torch.tensor([True, True, False, False, False])
         
         # start run custom ops
         class Network(nn.Module):
             def __init__(self):
                 super(Network, self).__init__()
 
-            def forward(self, qhash, khash, top_k, seqlen, chunk_size, max_seq_len, sink, recent, support_offload, block_table, indices):
+            def forward(self, qhash, khash, khash_rope, top_k, seqlen, chunk_size, max_seq_len, sink, recent, support_offload, block_table, mask, indices):
 
-                out1 = torch.ops._C_ascend.npu_hamming_dist_top_k(qhash, khash, top_k, seqlen, chunk_size, max_seq_len, sink, recent, support_offload, block_table, indices)
+                out1 = torch.ops._C_ascend.npu_hamming_dist_top_k(qhash, khash, None, top_k, seqlen, chunk_size, max_seq_len, sink, recent, support_offload, block_table, mask, indices)
 
                 return out1
         
@@ -121,12 +122,12 @@ class TestCustomHammingDistTopK(TestCase):
         npu = f'npu:{device_id}'
 
         npu_mode = torch.compile(npu_mode, backend=npu_backend, dynamic=False)
-        npu_out = npu_mode(qhash.to(npu), khash.to(npu), top_k.to(npu), seqlen.to(npu), chunk_size.to(npu), max_seq_len, sink, recent, support_offload, block_table.to(npu), indices.to(npu))
+        npu_out = npu_mode(qhash.to(npu), khash.to(npu), None, top_k.to(npu), seqlen.to(npu), chunk_size.to(npu), max_seq_len, sink, recent, support_offload, block_table.to(npu), mask.to(npu), indices.to(npu))
 
         print(f'acl graph npu_out = {npu_out}')
 
         print("test hamming eager.....")
-        output_eager = torch.ops._C_ascend.npu_hamming_dist_top_k(qhash.to(npu), khash.to(npu), top_k.to(npu), seqlen.to(npu), chunk_size.to(npu), max_seq_len, sink, recent, support_offload, block_table.to(npu), indices.to(npu))
+        output_eager = torch.ops._C_ascend.npu_hamming_dist_top_k(qhash.to(npu), khash.to(npu), None, top_k.to(npu), seqlen.to(npu), chunk_size.to(npu), max_seq_len, sink, recent, support_offload, block_table.to(npu), mask.to(npu), indices.to(npu))
         print(f'eager npu_out = {output_eager}')
 
 if __name__ == "__main__":

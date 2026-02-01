@@ -387,6 +387,7 @@ at::Tensor npu_hamming_dist_top_k_meta(const at::Tensor &hashq,
                                        const c10::optional<int64_t> recent, 
                                        const c10::optional<int64_t> supportOffload,
                                        const c10::optional<at::Tensor> &blockTable,
+                                       const c10::optional<at::Tensor> &mask,
                                        const c10::optional<at::Tensor>& indices) {
     if (indices.has_value()) {
         return at::empty_like(indices.value());

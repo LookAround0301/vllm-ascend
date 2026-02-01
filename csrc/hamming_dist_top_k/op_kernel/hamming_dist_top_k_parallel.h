@@ -28,7 +28,7 @@ class HammingDistTopKParallelKernel {
 public:
     __aicore__ inline HammingDistTopKParallelKernel() {}
     __aicore__ inline void Init(GM_ADDR query, GM_ADDR keyCompressed, GM_ADDR keyCompressedRope, GM_ADDR k,
-                                GM_ADDR seqLen, GM_ADDR chunkSize, GM_ADDR keyBlockTable,
+                                GM_ADDR seqLen, GM_ADDR chunkSize, GM_ADDR keyBlockTable, GM_ADDR mask,
                                 GM_ADDR indices, GM_ADDR workSpace,
                                 const HammingDistTopKTilingData &tilingData, TPipe *pipe)
     {
@@ -40,7 +40,7 @@ public:
         tilingData_ = tilingData;
         InitTilingParams(tiling, tilingRope, topkTiling, tilingParam);
         InitParams();
-        InitGlobalBuffers(query, keyCompressed, keyCompressedRope, k, seqLen, chunkSize, keyBlockTable, indices, workSpace);
+        InitGlobalBuffers(query, keyCompressed, keyCompressedRope, k, seqLen, chunkSize, keyBlockTable, mask, indices, workSpace);
 
         continFlag_ = keyBlockTableGm_.GetPhyAddr() != nullptr;
         mm_.SetSubBlockIdx(0);
@@ -126,6 +126,14 @@ protected:
         for (uint32_t j = 0; j < maxLoopNum; j++) {
             uint32_t curReducedBatch = (curCoreBatchStartIdx_ + batchIdx + j);
             uint32_t realCurBatch = curReducedBatch / param_.head;
+            // 当前batch不计算, 直接跳过
+            if (supportMask_) {
+                bool batchMask = maskGm_.GetValue(realCurBatch);
+                //YF_LOG("realCurBatch = %d, batchMask = %d\n", realCurBatch, batchMask);
+                if (!batchMask) {
+                    return;
+                }
+            }
             int32_t curSeqLen = GetCurSeqLen(seqLenGm_, chunkSizeGm_, realCurBatch);
             int32_t curK = kGm_.GetValue(realCurBatch);
             if (curK == 0 || curSeqLen == 0) {
@@ -154,6 +162,14 @@ protected:
     {
         uint32_t curReducedBatch = (curCoreBatchStartIdx_ + batchIdx);
         uint32_t realCurBatch = curReducedBatch / param_.head;
+        // 当前batch不计算, 直接跳过
+        if (supportMask_) {
+            bool batchMask = maskGm_.GetValue(realCurBatch);
+            //YF_LOG("realCurBatch = %d, batchMask = %d\n", realCurBatch, batchMask);
+            if (!batchMask) {
+                return;
+            }
+        }
         int32_t curSeqLen = GetCurSeqLen(seqLenGm_, chunkSizeGm_, realCurBatch);
         int32_t curK = kGm_.GetValue(realCurBatch);
         if (curK == 0 || curSeqLen == 0) {
@@ -415,6 +431,18 @@ protected:
 
         uint32_t realReducedBatchIdx = curCoreBatchStartIdx_ + batchIdx;
         uint32_t realBatchIdx = realReducedBatchIdx / param_.head; /* batchIdx without headNum */
+
+        // 当前batch是否需要skip
+        if (supportMask_) {
+            bool batchMask = maskGm_.GetValue(realBatchIdx);
+            //YF_LOG("realBatchIdx = %d, batchMask = %d\n", realBatchIdx, batchMask);
+            if (!batchMask) {
+                // todo block table直接赋值给输出的Indices
+                SetBlockTableForIndices(realBatchIdx, realReducedBatchIdx * param_.maxK);
+                //YF_LOG("realBatchIdx = %d SetBlockTableForIndices\n", realBatchIdx);
+                return;
+            }
+        }
         uint32_t curSeqLen = seqLenGm_.GetValue(realBatchIdx);
         uint32_t curK = kGm_.GetValue(realBatchIdx);
         uint32_t curChunkSize = 1;
@@ -572,6 +600,21 @@ protected:
         topKOutIndexQueue_.FreeTensor(topKOutIndexTensor);
     }
 
+    __aicore__ inline void SetBlockTableForIndices(uint32_t curBatchIdx, uint64_t outGmOffset) {
+        // 找到当前batch对应的tableblock
+        LocalTensor<int32_t> tableBlockTensor = tableBlockBuf_.template Get<int32_t>();
+        DataCopyParams copyParams{1, static_cast<uint16_t>(param_.blockCount * sizeof(int32_t)), 0, 0};
+        DataCopy(tableBlockTensor, keyBlockTableGm_[curBatchIdx * param_.blockCount], copyParams);
+        //DumpTensor(tableBlockTensor, 500, 64);
+        SetFlag<HardEvent::MTE2_MTE3>(0);
+        WaitFlag<HardEvent::MTE2_MTE3>(0);
+
+        // 直接复制
+        uint32_t copyLen = param_.blockCount < param_.maxK ? param_.blockCount : param_.maxK;
+        DataCopyExtParams cpOut{1, static_cast<uint32_t>(copyLen * sizeof(int32_t)), 0, 0, 0};
+        DataCopyPad(indicesGm_[outGmOffset], tableBlockTensor, cpOut);
+    }
+
     __aicore__ inline void GenerateTopKValueTensor(uint32_t i, uint32_t copyLen,
         uint32_t tileN2, uint64_t matmulGmOffset, uint32_t curK, uint32_t chunkSize)
     {
@@ -702,6 +745,7 @@ protected:
     GlobalTensor<int32_t> seqLenGm_;
     GlobalTensor<int32_t> chunkSizeGm_;
     GlobalTensor<int32_t> keyBlockTableGm_;
+    GlobalTensor<bool> maskGm_;
     GlobalTensor<int32_t> indicesGm_;
     GlobalTensor<int4b_t> unpackGm_;
     GlobalTensor<int4b_t> kRopeUnpackGm_;
@@ -746,6 +790,7 @@ protected:
     uint32_t curCoreBatch_;
     uint32_t curCoreBatchStartIdx_;
     bool continFlag_;
+    bool supportMask_ = true;
 
     __aicore__ inline void InitParams()
     {
@@ -820,7 +865,7 @@ protected:
     }
 
     __aicore__ inline void InitGlobalBuffers(GM_ADDR query, GM_ADDR keyCompressed, GM_ADDR keyCompressedRope, GM_ADDR k, GM_ADDR seqLen,
-        GM_ADDR chunkSize, GM_ADDR keyBlockTable, GM_ADDR indices, GM_ADDR workSpace)
+        GM_ADDR chunkSize, GM_ADDR keyBlockTable, GM_ADDR mask,GM_ADDR indices, GM_ADDR workSpace)
     {
         queryGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(query));
         keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(keyCompressed));
@@ -829,6 +874,8 @@ protected:
         seqLenGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(seqLen));
         chunkSizeGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(chunkSize));
         keyBlockTableGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(keyBlockTable));
+        maskGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bool*>(mask));
+        supportMask_ = maskGm_.GetPhyAddr() != nullptr;
         indicesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(indices));
         unpackGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int4b_t*>(workSpace));
         kRopeUnpackGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int4b_t*>(workSpace + param_.kNopeUnpackGmOffset));

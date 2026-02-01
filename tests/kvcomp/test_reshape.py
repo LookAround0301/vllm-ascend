@@ -35,7 +35,7 @@ def load_input_tensors_for_npu_reshape_and_cache_bnsd(load_path: str) -> dict[st
         print(f"An error occurred during loading: {e}")
 
 def test_reshape_and_cache_bnsd():
-    load_path = "/home/z00845282/hamming/zjl_hamming_n/vllm-ascend/npu_reshape_and_cache_bnsd_1009155843_rank_0_layerid_0.pt"
+    load_path = "/data/z00845282/updateops/vllm-ascend/tests/kvcomp/npu_reshape_and_cache_bnsd_1009155843_rank_0_layerid_0.pt"
     input_tensors = load_input_tensors_for_npu_reshape_and_cache_bnsd(load_path)
 
     hashk_op = input_tensors['hashk_op']
@@ -50,9 +50,16 @@ def test_reshape_and_cache_bnsd():
     bs = hashk_op.shape[0] // num_kv_heads
     hashk_op_org = hashk_op.reshape(num_kv_heads, bs, head_size)
 
-    print(hashk_op_org)
+    # print(hashk_op_org)
+    print(f"before +++++++++++++++++++++++++ hashk_op:{hashk_op.shape}  +++++++++++++++++++")
+    print(f"before +++++++++++++++++++++++++ hashk_cache_op:{hashk_cache_op.shape}  +++++++++++++++++++")
+    print(f"before +++++++++++++++++++++++++ slot_mapping_op:{slot_mapping_op}  +++++++++++++++++++")
+    print(f"before +++++++++++++++++++++++++ seq_lens_op:{seq_lens_op}  +++++++++++++++++++")
+    print(f"before +++++++++++++++++++++++++ hashk_cache_op:{hashk_cache_op.shape}  +++++++++++++++++++")
 
     torch.ops._C_ascend.npu_reshape_and_cache_bnsd(hashk_op, hashk_cache_op, slot_mapping_op, seq_lens_op, hashk_cache_op)
+    print(f"after +++++++++++++++++++++++++ hashk_op:{hashk_op.shape}, hashk_cache_op:{hashk_cache_op.shape}, slot_mapping_op:{slot_mapping_op},  seq_lens_op:{seq_lens_op}  +++++++++++++++++++")
+
 
     # verify
     for token_id in range(bs):

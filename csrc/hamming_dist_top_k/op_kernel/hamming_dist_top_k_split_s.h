@@ -46,7 +46,7 @@ class HammingDistTopKSplitSKernel {
 public:
     __aicore__ inline HammingDistTopKSplitSKernel() {}
     __aicore__ inline void Init(GM_ADDR query, GM_ADDR keyCompressed, GM_ADDR keyCompressedRope, GM_ADDR k,
-                                GM_ADDR seqLen, GM_ADDR chunkSize, GM_ADDR keyBlockTable,
+                                GM_ADDR seqLen, GM_ADDR chunkSize, GM_ADDR keyBlockTable, GM_ADDR mask,
                                 GM_ADDR indices, GM_ADDR workSpace,
                                 const HammingDistTopKTilingData &tilingData, TPipe *que)
     {
@@ -58,7 +58,7 @@ public:
         tilingData_ = tilingData;
         InitTilingParams(tiling, tilingRope, topkTiling, tilingParam);
         InitParams();
-        InitGlobalBuffers(query, keyCompressed, keyCompressedRope, k, seqLen, chunkSize, keyBlockTable, indices, workSpace);
+        InitGlobalBuffers(query, keyCompressed, keyCompressedRope, k, seqLen, chunkSize, keyBlockTable, mask, indices, workSpace);
         mm_.SetSubBlockIdx(0);
         mm_.Init(&tiling, pipe_);
         if (param_.supportKeyRope) {
@@ -90,6 +90,7 @@ public:
             if (!param_.supportOffload) {
                 InitLocalBuffersForTopKSort();
             }
+            InitLocalBuffersForTableBlock();
         }
 
         if ASCEND_IS_AIC {
@@ -225,7 +226,19 @@ protected:
         uint64_t keyUnpackInGmOffset = 0;
         bool hasTailSeqLens = false;
         for (uint32_t i = 0; i < param_.batchN; i++) {
-            curBatchIdx = i / param_.head, curHeadIdx = i % param_.head, seqLens = uint32_t(seqLenGm_.GetValue(curBatchIdx)), kScalar = uint32_t(kGm_.GetValue(curBatchIdx)), effectLen = effectLenArr_[curBatchIdx];
+            curBatchIdx = i / param_.head;
+            // 当前batch不计算Key直接跳过
+            if (supportMask_) {
+                bool batchMask = maskGm_.GetValue(curBatchIdx);
+                //YF_LOG("curBatchIdx = %d, batchMask = %d\n", curBatchIdx, batchMask);
+                if (!batchMask) {
+                    continue;
+                }
+            }
+            curHeadIdx = i % param_.head;
+            seqLens = uint32_t(seqLenGm_.GetValue(curBatchIdx));
+            kScalar = uint32_t(kGm_.GetValue(curBatchIdx));
+            effectLen = effectLenArr_[curBatchIdx];
             if (seqLens == 0 || kScalar == 0 || effectLen == 0) {
                 continue; // seqLen=0或者kScalar==0或者chunkTopK effectLen==0直接跳过
             }
@@ -433,6 +446,14 @@ protected:
                 if (tileIdx < batchSeqTileN[i]) {
                     curBatchIdx = i;
                     break;
+                }
+            }
+            // 是否跳过
+            if (supportMask_) {
+                bool batchMask = maskGm_.GetValue(curBatchIdx);
+                if (!batchMask) {
+                    //YF_LOG("curBatchIdx = %d, batchMask = %d\n", curBatchIdx, batchMask);
+                    continue;
                 }
             }
             uint32_t curSeqLen = uint32_t(seqLenGm_.GetValue(curBatchIdx));
@@ -819,6 +840,19 @@ protected:
             }
             uint32_t curVectorDealBatchNIdx = iterIdx * vectorTotalNum + blockIdx_ * VECTOR_CUBE_RATIO + subBlockIdx_;
             uint32_t curBatchIdx = curVectorDealBatchNIdx / param_.head;
+
+            // 当前batch是否需要skip
+            if (supportMask_) {
+                bool batchMask = maskGm_.GetValue(curBatchIdx);
+                //YF_LOG("curBatchIdx = %d, batchMask = %d\n", curBatchIdx, batchMask);
+                if (!batchMask) {
+                    // todo block table直接赋值给输出的Indices
+                    SetBlockTableForIndices(curBatchIdx, curVectorDealBatchNIdx * param_.maxK);
+                    //YF_LOG("curBatchIdx = %d SetBlockTableForIndices\n", curBatchIdx);
+                    continue;
+                }
+            }
+
             uint32_t curKScalar = uint32_t(kGm_.GetValue(curBatchIdx)), curEffectLen = effectLenArr_[curBatchIdx], curSeqLen = uint32_t(seqLenGm_.GetValue(curBatchIdx));
             uint32_t curChunkSize = isChunkTopK_ ? uint32_t(chunkSizeGm_.GetValue(curBatchIdx)) : MIN_CHUNK_SIZE;
             if (curSeqLen == 0 || curKScalar == 0 || curEffectLen == 0) {
@@ -945,6 +979,21 @@ protected:
         topKIndexSortInQueue_.FreeTensor(sortedTopKIndexTensor);
     }
 
+    __aicore__ inline void SetBlockTableForIndices(uint32_t curBatchIdx, uint64_t outGmOffset) {
+        // 找到当前batch对应的tableblock
+        LocalTensor<int32_t> tableBlockTensor = tableBlockBuf_.template Get<int32_t>();
+        DataCopyParams copyParams{1, static_cast<uint16_t>(param_.blockCount * sizeof(int32_t)), 0, 0};
+        DataCopy(tableBlockTensor, keyBlockTableGm_[curBatchIdx * param_.blockCount], copyParams);
+        //DumpTensor(tableBlockTensor, 921, 64);
+        SetFlag<HardEvent::MTE2_MTE3>(0);
+        WaitFlag<HardEvent::MTE2_MTE3>(0);
+
+        // 直接复制
+        uint32_t copyLen = param_.blockCount < param_.maxK ? param_.blockCount : param_.maxK;
+        DataCopyExtParams cpOut{1, static_cast<uint32_t>(copyLen * sizeof(int32_t)), 0, 0, 0};
+        DataCopyPad(indicesGm_[outGmOffset], tableBlockTensor, cpOut);
+    }
+
     __aicore__ inline void MergeTopKInExhaustionMode(uint32_t topKBlockNum, uint64_t topKResultGmOffset, uint32_t blockTail, uint32_t blockTile, uint32_t curKScalar, LocalTensor<half>& topKValueOutTensor, LocalTensor<int32_t>& topKIndexOutTensor)
     { 
         if ASCEND_IS_AIC {
@@ -1063,6 +1112,7 @@ protected:
     uint32_t minChunkSize_ = MAX_CHUNK_SIZE;
     uint32_t tileSeqLenSize_ = 0;
     bool isContinuousBatch_ = true;
+    bool supportMask_ = true;
 
     static constexpr uint32_t BLOCK_CUBE = 32;
     static constexpr uint64_t SYNC_MODE0 = 0;
@@ -1082,6 +1132,7 @@ protected:
     GlobalTensor<int32_t> seqLenGm_;
     GlobalTensor<int32_t> chunkSizeGm_;
     GlobalTensor<int32_t> keyBlockTableGm_;
+    GlobalTensor<bool> maskGm_;
     GlobalTensor<int32_t> indicesGm_;
     GlobalTensor<int4b_t> unpackGm_;
     GlobalTensor<int4b_t> kRopeUnpackGm_;
@@ -1198,7 +1249,7 @@ protected:
     }
 
     __aicore__ inline void InitGlobalBuffers(GM_ADDR query, GM_ADDR keyCompressed, GM_ADDR keyCompressedRope, GM_ADDR k, GM_ADDR seqLen,
-        GM_ADDR chunkSize, GM_ADDR keyBlockTable , GM_ADDR indices, GM_ADDR workSpace)
+        GM_ADDR chunkSize, GM_ADDR keyBlockTable, GM_ADDR mask, GM_ADDR indices, GM_ADDR workSpace)
     {
         queryGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(query));
         keyCompressedGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(keyCompressed));
@@ -1207,6 +1258,8 @@ protected:
         seqLenGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(seqLen));
         chunkSizeGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(chunkSize));
         keyBlockTableGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(keyBlockTable));
+        maskGm_.SetGlobalBuffer(reinterpret_cast<__gm__ bool*>(mask));
+        supportMask_ = maskGm_.GetPhyAddr() != nullptr;
         isChunkTopK_ = chunkSizeGm_.GetPhyAddr() != nullptr;
         isContinuousBatch_ = keyBlockTableGm_.GetPhyAddr() != nullptr;
         indicesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(indices));
@@ -1261,7 +1314,6 @@ protected:
         pipe_->InitBuffer(topKIndexSortInQueue_, 1, param_.maxK * sizeof(uint32_t));
         pipe_->InitBuffer(topKIndexSortTmpQueue_, 1, 3 * param_.maxK * sizeof(uint32_t));
         pipe_->InitBuffer(topKIndexSortCalcQueue_, 1, 3 * param_.maxK * sizeof(uint32_t));
-        InitLocalBuffersForTableBlock();
     }
 
     __aicore__ inline void InitLocalBuffersForTableBlock()

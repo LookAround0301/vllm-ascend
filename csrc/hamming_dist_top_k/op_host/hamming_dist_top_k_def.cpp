@@ -71,6 +71,11 @@ public:
             .DataType({ge::DT_UINT8})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("mask")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_BOOL})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("indices")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT32})
