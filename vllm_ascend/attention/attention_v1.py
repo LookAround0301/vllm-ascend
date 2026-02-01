@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import ClassVar, List, Optional, Tuple, Type
 
+import os
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
@@ -44,6 +45,11 @@ from vllm_ascend.compilation.acl_graph import (
     update_draft_graph_params_workspaces, update_graph_params_workspaces)
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_device_type,
                                weak_ref_tensors)
+from vllm_ascend.attention.kv_compress import AscendKvcompSparseMetadata
+if os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1":
+    from vllm_ascend.worker.kvcomp_utils import (KVCompConfig, HashEncoder,
+        update_hashk_cache, update_block_table_from_topn_chunks_equal,
+        hashk_cache_reshape_vectorise)
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
@@ -182,6 +188,7 @@ class AscendMetadata:
     # sliding window attention mask
     swa_mask: Optional[torch.Tensor] = None
 
+    kv_comp_meta: Optional[AscendKvcompSparseMetadata] = None
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     # AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
@@ -260,6 +267,15 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         query_start_loc = query_start_loc_cpu.pin_memory().to(
             self.device, non_blocking=True)
 
+        kv_comp_meta = common_attn_metadata.kv_comp_sparse_metadata
+        if os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1":
+            kv_comp_meta.num_decode_tokens_device = torch.tensor([num_decode_tokens], dtype=torch.int32) \
+                                        .to(device=self.device, non_blocking=True)  
+            kv_comp_meta.num_prefill_tokens_device = torch.tensor([num_actual_tokens-num_decode_tokens], dtype=torch.int32) \
+                                        .to(device=self.device, non_blocking=True) 
+            kv_comp_meta.num_actual_tokens_device = torch.tensor([num_actual_tokens], dtype=torch.int32) \
+                                        .to(device=self.device, non_blocking=True) 
+
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
@@ -276,7 +292,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_prefills=num_prefills,
             num_decodes=num_decodes,
             causal=common_attn_metadata.causal,
-            model_runner_type=self.model_config.runner_type)
+            model_runner_type=self.model_config.runner_type,
+            kv_comp_meta=kv_comp_meta)
         return attn_metadata
 
     def build_for_graph_capture(
@@ -336,6 +353,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.key_cache = None
         self.value_cache = None
         self.is_kv_producer = self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
+        self.kv_comp_metadata = None
+        self.idx = None
 
     def full_graph_fia(self, query: torch.Tensor, key: torch.Tensor,
                        value: torch.Tensor, attn_metadata: AscendMetadata,
@@ -543,6 +562,71 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output = output.view(batch_size, self.num_heads, self.head_size)
         return output
 
+    def _forward_fia_kvcomp(self, query: torch.Tensor,
+                                   attn_metadata: AscendMetadata,
+                                   output: torch.Tensor,):
+        hash_encoder = self.kv_comp_metadata.hash_encoder
+        hash_topk_config = self.kv_comp_metadata.hash_topk_config
+        batch_size = attn_metadata.seq_lens.shape[0]
+        block_size = self.key_cache.shape[1]
+        # Step 1: Encode all queries into hash codes (already optimized in HashEncoder)
+        query_flat = query.view(-1, self.head_size)  # [num_tokens * num_heads, head_size]
+        hashq = hash_encoder.compute_hash(query_flat)  # [num_tokens * num_heads, hash_bits//16]
+        hashq = hashq.view(-1, self.num_heads, hashq.shape[-1])  # [num_tokens, num_heads, hash_bits//16]
+
+        # we get top_k first
+        top_k_value = 1
+        top_k_ratio = hash_topk_config.top_k_ratio_per_layer[self.idx]
+               
+        top_k_list = torch.ceil(top_k_ratio*attn_metadata.seq_lens/block_size)
+        top_k_list = torch.clamp(top_k_list, min=top_k_value).to(torch.int32)
+        chunk_size = 16  #chunk_size input for hamming_dist_top_k
+        
+        top_n_list = torch.ceil(top_k_list*block_size//chunk_size) #top_n inut for hamming_dist_top_k
+        if torch.all( top_k_list*block_size > attn_metadata.seq_lens).item():
+            return self.forward_paged_attention(query, attn_metadata, output)
+        hashq_op = hashq.to(torch.uint8).unsqueeze(2)
+        device = hashq_op.device
+
+        #save all input tensors as a dictionary for hamming_dist_top_k such that we can test it seperately
+        # --- Saving the tensors ---
+        hashk_cache_op = hashk_cache_reshape_vectorise(self.kv_comp_metadata.hashk_cache[self.idx], attn_metadata.block_tables, attn_metadata.seq_lens)
+        seq_len_op = attn_metadata.seq_lens.to(device)
+        chunk_size_op = torch.full((batch_size,), chunk_size, dtype=torch.int32, device=device)
+        top_n_op = top_n_list.to(torch.int32).to(device)
+        
+        chunk_topn_block_indices = torch.ops._C_ascend.npu_hamming_dist_top_k(
+            hashq_op, 
+            hashk_cache_op, 
+            None,
+            top_n_op, 
+            seq_len_op, 
+            chunk_size_op, 
+            None)
+        chunk_topn_indices_op = chunk_topn_block_indices.to(device)
+        block_table_op = attn_metadata.block_tables.to(device)
+        # seq_lens_op = attn_metadata.seq_lens.to(device)
+        top_k_op = top_k_list.to(device)
+        block_size = block_size
+        chunk_size_op = chunk_size
+        if block_size == chunk_size_op:
+            new_block_tables, new_seq_len = update_block_table_from_topn_chunks_equal(
+                chunk_topn_indices=chunk_topn_indices_op,
+                block_table=block_table_op,        
+                seq_lens=seq_len_op,            
+                top_n=top_n_op,                         
+                top_k=top_k_op,                         
+                block_size=block_size,                    
+                chunk_size=chunk_size_op)
+            #end_time = time.perf_counter()
+            #elapsed_time = end_time - start_time
+            #logger.info(f"update_block_table_from_topn_chunks_equal: {elapsed_time:.6f} seconds") 
+        elif  block_size % chunk_size_op == 0:
+            new_block_tables, new_seq_len = block_table_op, seq_len_op
+        else:
+            raise f"block_size={block_size} is not a multiple of chun_size={chunk_size_op}"
+        return self.forward_paged_attention(query, attn_metadata, output)
+
     def forward_fused_infer_attention(self, query: torch.Tensor,
                                       key: torch.Tensor, value: torch.Tensor,
                                       attn_metadata: AscendMetadata,
@@ -568,6 +652,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
             key = key[:num_tokens]
             value = value[:num_tokens]
+        
+        if (attn_metadata.attn_state == AscendAttentionState.DecodeOnly and
+            os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1" and self.kv_comp_metadata.hashk_cache[self.idx] != None and
+            max(attn_metadata.seq_lens)>self.kv_comp_metadata.hash_topk_config.seq_len_threshhold):
+            return self._forward_fia_kvcomp(query, attn_metadata, output)
+
         # Get workspace from cache or calculate it if not present.
         attn_output, _ = torch_npu.npu_fused_infer_attention_score(
             query=query,
@@ -725,6 +815,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+        
         assert output is not None, "Output tensor must be provided."
 
         if output_scale is not None or output_block_scale is not None:
@@ -745,12 +836,49 @@ class AscendAttentionBackendImpl(AttentionImpl):
             return output.fill_(0)
         key, value = self.reshape_and_cache(key, value, kv_cache,
                                             attn_metadata)
+        self.kv_comp_metadata = attn_metadata.kv_comp_meta
+        if os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1" and len(kv_cache) > 1:
+            self.idx = int(layer.layer_name.split('.')[2])
+            hashk_cache = self.kv_comp_metadata.hashk_cache[self.idx]
+            # if hashk_cache != None:
+            #     num_tokens = attn_metadata.num_actual_tokens
+            #     head_size = key.shape[-1]
+            #     key_flat = key[:num_tokens].view(-1, head_size)  # [num_tokens * num_kv_heads, head_size]
+            #     key_hash = self.kv_comp_metadata.hash_encoder.compute_hash(key_flat)  # [num_tokens * num_kv_heads, hash_bits//16]
+            #     num_decode_tokens_device = self.kv_comp_metadata.num_prefill_tokens_device
+            #     num_prefill_tokens_device = self.kv_comp_metadata.num_prefill_tokens_device
+            #     num_actual_tokens_device = self.kv_comp_metadata.num_actual_tokens_device
+            #     # print(f"================ key_hash:{key_hash.shape} hashk_cache:{hashk_cache.shape} num_actual_tokens_device:{num_actual_tokens_device} ================")
+            #     # print(f"================ key_hash:{key_hash.shape}  ================")
+            #     # print(f"================ hashk_cache:{hashk_cache.shape}  ================")
+            #     # print(f"================ attn_metadata.slot_mapping:{attn_metadata.slot_mapping} {attn_metadata.slot_mapping.shape} ================")
+            #     # print(f"================ num_actual_tokens_device:{num_actual_tokens_device}  ================")
+            #     # print(f"================ key_hash:{key_hash.shape}  ================")
+            #     # attn_metadata.slot_mapping:{attn_metadata.slot_mapping.shape} hashk_cache:{hashk_cache.shape} num_actual_tokens_device:{num_actual_tokens_device}
+            #     # key_hash = key_hash.view(num_tokens, -1, key_hash.shape[-1])  # [num_tokens, num_kv_heads, hash_bits//16]
+            #     torch.ops._C_ascend.npu_reshape_and_cache_bnsd(
+            #         key_hash,
+            #         hashk_cache,
+            #         attn_metadata.slot_mapping,
+            #         num_actual_tokens_device,
+            #         hashk_cache
+            #     )
+            #     print(f"================ key_hash:{key_hash.shape} hashk_cache:{hashk_cache.shape} num_actual_tokens_device:{num_actual_tokens_device[0]} ================")
+
+
+            update_hashk_cache(
+                key=key[:attn_metadata.num_actual_tokens], 
+                hashk_cache=hashk_cache,
+                slot_mapping=attn_metadata.slot_mapping,
+                hash_encoder=self.kv_comp_metadata.hash_encoder
+            )
         # pooling model branch
         if attn_metadata.model_runner_type == "pooling":
             attn_output = self._forward_encoder_attention(
                 query, key, value, attn_metadata, output)
             output[:num_tokens] = attn_output[:num_tokens]
             return output
+        
         output = self.forward_impl(query, key, value, kv_cache, attn_metadata,
                                    output)
         return output

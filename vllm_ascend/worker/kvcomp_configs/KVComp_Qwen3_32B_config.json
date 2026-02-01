@@ -8,6 +8,7 @@
     "chunk_repre_method": "max",
     "head_dim": 128,
     "hash_bits": 128,
+    "is_layer_sensitive": true,
     "top_k_ratio_per_layer": [
         1,
         1,

@@ -47,6 +47,54 @@ if TYPE_CHECKING:
 
 MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
 
+# kvcomp TODO: temp initialize
+import os
+from datetime import datetime
+from .hash_encoder import HashEncoder
+import csv
+import numpy as np
+from vllm_ascend.utils import enable_custom_op
+enable_custom_op()
+
+ENABLE_KVCOMP=False
+KVCOMP_ENABLE_JUMP=False # enable free jump, if set to false, use fix jump step
+KVCOMP_CHUNK_SIZE = 128
+KVCOMP_MAX_TOPK= 4096 // KVCOMP_CHUNK_SIZE
+KVCOMP_NUM_HIDDEN_LAYERS = 61
+KVCOMP_FIX_JUMP_STEP=1
+KVCOMP_FULLKV_LAYERS = tuple(list([0,1,2,3,4,5]))
+# KVCOMP_REUSE_LAYER_ID = [-1] * KVCOMP_NUM_HIDDEN_LAYERS
+KVCOMP_REUSE_LAYER_ID = [   -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 
+                             9,  9, -1, 12, -1, -1, -1, -1, -1, -1, 
+                            -1, -1, 21, 21, -1, -1, -1, 26, 26, 26, 
+                            26, 26, 26, 26, -1, 34, 34, 34, 34, 34, 
+                            34, 34, 34, 34, 34, 34, 34, 34, 34, -1, 
+                            49, 49, 49, 49, 49, 49, 49, 49, 49, 49, 49]
+KVCOMP_MAX_BATCH = 256
+KVCOMP_MAX_BLOCK_PER_SEQ = 1024
+
+if KVCOMP_ENABLE_JUMP:
+    KVCOMP_COMPUTE_HAMMING_LAYERS = []
+    for i in range(0, KVCOMP_NUM_HIDDEN_LAYERS):
+        if KVCOMP_REUSE_LAYER_ID[i] == -1 and i not in KVCOMP_FULLKV_LAYERS:
+            KVCOMP_COMPUTE_HAMMING_LAYERS.append(i)
+    KVCOMP_COMPUTE_HAMMING_LAYERS = tuple(KVCOMP_COMPUTE_HAMMING_LAYERS)
+else:
+    KVCOMP_COMPUTE_HAMMING_LAYERS = tuple(range(0, KVCOMP_NUM_HIDDEN_LAYERS, KVCOMP_FIX_JUMP_STEP))
+    for i in range(0, KVCOMP_NUM_HIDDEN_LAYERS):
+        if i % KVCOMP_FIX_JUMP_STEP == 0:
+            KVCOMP_REUSE_LAYER_ID[i] = -1
+        else:
+            KVCOMP_REUSE_LAYER_ID[i] = i - i % KVCOMP_FIX_JUMP_STEP
+DEBUG_LAYER_REUSE_ANALYZE = False
+if ENABLE_KVCOMP:
+    print('=======================kvcomp enabled=========================')
+else:
+    print('=======================kvcomp disabled=========================')
+if KVCOMP_ENABLE_JUMP:
+    print('=======================jump enabled=========================')
+else:
+    print('=======================jump disabled=========================')
 
 class AscendMLABackend(AttentionBackend):
     accept_output_buffer: bool = True
@@ -125,7 +173,10 @@ class AscendMLADecodeMetadata:
     cos: torch.Tensor = None
     cp_seq_len: torch.Tensor = None
     batch_seq_mask: torch.Tensor = None
-
+    # kvcomp
+    seq_lens_device: torch.Tensor = None
+    kvcomp_top_k_device: torch.Tensor = None
+    kvcomp_top_k_cpu: torch.Tensor = None
 
 @dataclass
 class AscendMLAMetadata:
@@ -153,6 +204,11 @@ class AscendMLAMetadata:
     num_decodes: int
     num_decode_tokens: int
     num_prefills: int
+    # kvcomp
+    num_decode_tokens_device: torch.Tensor  
+    num_prefill_tokens_device: torch.Tensor 
+    slot_mapping_cpu: torch.Tensor
+    hamming_output_records: list[dict]
 
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
@@ -430,6 +486,15 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             decode_metadata = self.build_decode_metadata(
                 common_prefix_len, common_attn_metadata)
 
+        # kvcomp
+        device = self.device
+        num_decode_tokens_device = torch.tensor([self.num_decode_tokens], dtype=torch.int32) \
+                                        .to(device=device, non_blocking=True)  
+        num_prefill_tokens_device = torch.tensor([self.num_actual_tokens-self.num_decode_tokens], dtype=torch.int32) \
+                                        .to(device=device, non_blocking=True) 
+        slot_mapping_cpu = self.slot_mapping.cpu()
+        hamming_output_records = [None] * KVCOMP_NUM_HIDDEN_LAYERS
+
         return self.metadata_cls(  # type: ignore
             num_actual_tokens_pcp_padded=self.num_actual_tokens,
             num_input_tokens=common_attn_metadata.num_input_tokens,
@@ -447,6 +512,10 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             query_start_loc=query_start_loc,
             block_tables=self.block_table,
             seq_lens=self.seq_lens,
+            num_decode_tokens_device = num_decode_tokens_device,  # kvcomp
+            num_prefill_tokens_device = num_prefill_tokens_device, # kvcomp
+            slot_mapping_cpu=slot_mapping_cpu, # kvcomp
+            hamming_output_records=hamming_output_records #kvcomp
         )
 
     def build_chunked_metadata(
@@ -634,6 +703,15 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                     common_attn_metadata)
 
         cos, sin = get_cos_and_sin_mla(input_positions, use_cache=True)
+
+        # kvcomp
+        device = self.device
+        seq_lens_device = self.seq_lens.to(device=device, non_blocking=True)
+        top_k_device = ((seq_lens_device + (KVCOMP_CHUNK_SIZE-1)) // KVCOMP_CHUNK_SIZE).to(dtype=torch.int32)
+        top_k_device = torch.clamp(top_k_device, min=1, max=KVCOMP_MAX_TOPK)
+        top_k = ((self.seq_lens + (KVCOMP_CHUNK_SIZE-1)) // KVCOMP_CHUNK_SIZE).to(dtype=torch.int32)
+        top_k = torch.clamp(top_k, min=1, max=KVCOMP_MAX_TOPK)
+
         decode_metadata = AscendMLADecodeMetadata(
             input_positions=input_positions,
             block_table=self.block_table,
@@ -645,7 +723,11 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             sin=sin[:self.num_decode_tokens, ...],
             cos=cos[:self.num_decode_tokens, ...],
             cp_seq_len=cp_seq_len,
-            batch_seq_mask=batch_seq_mask)
+            batch_seq_mask=batch_seq_mask,
+            seq_lens_device=seq_lens_device, # kvcomp
+            kvcomp_top_k_cpu=top_k, # kvcomp
+            kvcomp_top_k_device=top_k_device # kvcomp
+            )
         return decode_metadata
 
     def build_for_graph_capture(
@@ -755,6 +837,24 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.enable_mlapo = envs.VLLM_ASCEND_ENABLE_MLAPO
 
         self.is_kv_producer = self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
+
+        # kvcomp
+        self.kvcomp_initialized = False
+        self.khash_nope_cache = None
+        self.khash_rope_cache = None
+        self.hash_encoder_nope = None
+        self.hash_encoder_rope = None
+        self.khash_zeros_full = None
+        self.qhash_zeros_full = None
+        self.kvcomp_chunk_size = KVCOMP_CHUNK_SIZE
+        self.kvcomp_chunk_size_full = None
+        self.kvcomp_sparse_ratio = 0.3
+        self.kvcomp_sparse_max_topk = KVCOMP_MAX_TOPK
+        self.kvcomp_indices_full = None
+        self.kvcomp_max_batch = KVCOMP_MAX_BATCH
+        self.kvcomp_max_block_per_seq = KVCOMP_MAX_BLOCK_PER_SEQ
+        self.k_idx = 0
+        self.q_idx = [0] * 16
 
     def _v_up_proj(self, x):
         # Convert from (N, B, L)/(N, B, 1, L) to (N, B, L)
@@ -1141,6 +1241,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         k_pe: torch.Tensor,
         block_size: int,
         attn_metadata: AscendMLAMetadata,
+        layer_id: int = 0, # kvcomp
     ) -> torch.Tensor:
         decode_meta = attn_metadata.decode
         assert decode_meta is not None
@@ -1161,6 +1262,139 @@ class AscendMLAImpl(MLAAttentionImpl):
                                  self.kv_lora_rank)
             k_pe = k_pe.view(-1, self.num_kv_heads, block_size,
                              self.qk_rope_head_dim)
+
+        # kvcomp
+        if DEBUG_LAYER_REUSE_ANALYZE:
+            # 用来输出qk相关性, 做跳层策略分析
+            device_id = torch.distributed.get_rank()
+            base_path = f"/data/h00932900/profiling/20251231/device_{device_id}/output98_openthink"
+            os.makedirs(base_path, exist_ok=True)
+            q = torch.cat((q_nope, q_pe), dim=-1)
+            kv_c_and_k_pe_cache = torch.cat((k_nope, k_pe), dim=-1)
+            for b_idx in range(attn_metadata.decode.block_table.shape[0]):
+                if attn_metadata.decode.seq_lens[b_idx] > 0:
+                    # 开始保存profiling数据
+                    cuda_idx = str(kv_c_and_k_pe_cache.device) #cuda:1
+                    cuda_idx = cuda_idx.replace(":", "_")
+                    idx_num = int(cuda_idx.split("_")[1])
+
+                    cuda_idx = cuda_idx.replace("_", "")
+                    base_path = f"/data/h00932900/profiling/20251231/{cuda_idx}/output98_openthink"
+                    os.makedirs(base_path, exist_ok=True)
+                    q_path = f"{base_path}/real_q_cuda0_{layer_id}_custom{self.q_idx[idx_num]}.pt"
+                    torch.save(q.cpu(), q_path)
+                    self.q_idx[idx_num] += 1
+
+                    cuda0_path = f"/data/h00932900/profiling/20251231/output98_openthink"
+                    os.makedirs(cuda0_path, exist_ok=True)
+                    # if kv_c_and_k_pe_cache.device == torch.device('npu:0'):
+                    if torch.distributed.get_rank() == 0:
+                        k_path = f"{cuda0_path}/real_k_cuda0_{layer_id}_custom{self.k_idx}.pt"
+                        torch.save(kv_c_and_k_pe_cache.cpu(), k_path)
+                        self.k_idx += 1
+        if ENABLE_KVCOMP and layer_id not in KVCOMP_FULLKV_LAYERS:
+            block_table = decode_meta.block_table
+            device = block_table.device
+            seq_lens = decode_meta.seq_lens                 # cpu
+            seq_lens_device = decode_meta.seq_lens_device   # npu
+            seq_lens_list = decode_meta.seq_lens_list
+            if layer_id in KVCOMP_COMPUTE_HAMMING_LAYERS:
+                # if torch.distributed.get_rank() == 0:
+                #     print(f'compute op hamming, layer_id={layer_id}')
+                batch_size = num_tokens
+                # print(f'seq_lens_device={seq_lens_device}')
+
+                max_seq_len = decode_meta.max_seq_lens
+                # print(f'max_seq_len={max_seq_len}')
+
+                chunk_size = self.kvcomp_chunk_size_full[:batch_size]
+                top_k_device = decode_meta.kvcomp_top_k_device
+                top_k = decode_meta.kvcomp_top_k_cpu
+                tail_chunk_size = (seq_lens - 1) % self.kvcomp_chunk_size + 1
+                new_seq_lens = (top_k - 1) * self.kvcomp_chunk_size + tail_chunk_size
+                new_seq_lens_list = new_seq_lens.tolist()
+
+                sink = 1
+                recent = 4
+                indices = self.kvcomp_indices_full[:batch_size]
+
+                # print(f'q_nope.shape={q_nope.shape}')            # (bs, 16, 512)
+                # print(f'q_pe.shape={q_pe.shape}')                # (bs, 16, 64)
+
+                qhash_nope = self.hash_encoder_nope.compute_hash(q_nope)
+                # print(f'qhash_nope.shape={qhash_nope.shape}')    # (bs, 16, 64)
+                qhash_rope = self.hash_encoder_rope.compute_hash(q_pe)
+                # print(f'qhash_rope.shape={qhash_rope.shape}')    # (bs, 16, 8)
+                qhash = torch.cat((qhash_nope, qhash_rope), dim=-1).contiguous()
+                # print(f'qhash.shape={qhash.shape}')              # (bs, 16, 72)
+                qhash_zeros = torch.zeros(qhash_rope.shape, dtype=qhash_rope.dtype, device=device)
+                # if self.qhash_zeros_full == None or self.qhash_zeros_full.numel() < qhash_rope.numel():
+                #         self.qhash_zeros_full = torch.zeros(qhash_rope.shape, dtype=qhash_rope.dtype).to(device=device, non_blocking=True)
+                # qhash_zeros = self.qhash_zeros_full[:qhash_rope.shape[0]]
+                # print(f'qhash_zeros.shape={qhash_zeros.shape}')  # (bs, 16, 8)
+                qhash_pad = torch.cat((qhash, qhash_zeros), dim=2).unsqueeze(2).contiguous()
+
+                # if torch.distributed.get_rank() == 0:
+                #     # 设置打印选项为显示全部
+                #     torch.set_printoptions(threshold=np.inf)
+                #     print(f'qhash_pad.shape={qhash_pad.shape}')      # (bs, 16, 1, 80)
+                #     # print(f'qhash_pad: {qhash_pad[0, 0, 0, :]}')
+                #     # print(f'qhash_pad is contiguous: {qhash_pad.is_contiguous()}')
+
+                #     print(f'self.khash_nope_cache.shape={self.khash_nope_cache.shape}')  # torch.Size([5119, 1, 128, 64])
+                #     # print(f'self.khash_nope_cache={self.khash_nope_cache[1, 0, 0, :]}')
+
+                #     print(f'self.khash_rope_cache.shape={self.khash_rope_cache.shape}')  # torch.Size([5119, 1, 128, 16])
+                #     # print(f'self.khash_rope_cache={self.khash_rope_cache[1, 0, 0, :]}')
+
+                #     print(f'top_k_device={top_k_device}')
+                #     print(f'seq_lens_device: {seq_lens_device}')
+                #     print(f'chunk_size={chunk_size}')
+                #     print(f'max_seq_len={max_seq_len}')
+                #     print(f'block_table[0]: {block_table[0]}')
+                #     # 恢复默认打印方式
+                #     torch.set_printoptions(profile="default")
+
+                    
+
+                new_block_table = torch.ops._C_ascend.npu_hamming_dist_top_k(
+                    qhash_pad, 
+                    self.khash_nope_cache,
+                    self.khash_rope_cache,
+                    top_k_device,
+                    seq_lens_device,
+                    chunk_size,
+                    max_seq_len,
+                    sink,
+                    recent,
+                    None,
+                    block_table,
+                    indices
+                )
+                # if torch.distributed.get_rank() == 0:
+                #     print(f'[DEBUG]new_block_table[0] of layer_id {layer_id} = {new_block_table[0][:32]}')
+                #     print(f'[DEBUG]new_seq_lens={new_seq_lens}')
+
+                attn_metadata.hamming_output_records[layer_id] = {
+                    'new_block_table': new_block_table, 
+                    'new_seq_lens': new_seq_lens, 
+                    'new_seq_lens_list': new_seq_lens_list}
+            else:
+                # reuse_layer_id = layer_id // attn_metadata.jump_step * attn_metadata.jump_step
+                reuse_layer_id = KVCOMP_REUSE_LAYER_ID[layer_id]
+                hamming_output = attn_metadata.hamming_output_records[reuse_layer_id]
+                new_block_table = hamming_output['new_block_table']
+                # if torch.distributed.get_rank() == 0:
+                #     print(f'reuse op hamming, layer_id={layer_id}, reuse_layer_id={reuse_layer_id}')
+                new_seq_lens = hamming_output['new_seq_lens']
+                new_seq_lens_list = hamming_output['new_seq_lens_list']
+                # if torch.distributed.get_rank() == 0:
+                #     print(f'reuse op hamming, layer_id={layer_id}, reuse_layer_id={reuse_layer_id}')
+                #     print(f'new_block_table[0] of layer_id {layer_id} = {new_block_table[0][:32]}')
+            
+            decode_meta.block_table = new_block_table
+            decode_meta.seq_lens = new_seq_lens
+            decode_meta.seq_lens_list = new_seq_lens_list
 
         attn_output_shape: tuple | None = None
         if attn_metadata.attn_state in [
@@ -1270,6 +1504,12 @@ class AscendMLAImpl(MLAAttentionImpl):
             attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                 q_nope, k_nope, k_nope, **common_kwargs)
 
+        # kvcomp
+        if ENABLE_KVCOMP and layer_id not in KVCOMP_FULLKV_LAYERS: 
+            decode_meta.block_table = block_table
+            decode_meta.seq_lens = seq_lens
+            decode_meta.seq_lens_list = seq_lens_list
+
         return self._v_up_proj(attn_output)
 
     def reorg_decode_q(self, decode_q_nope, decode_q_pe):
@@ -1341,7 +1581,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         return decode_preprocess_res, None
 
     def mla_preprocess_prefill(self, q_c, kv_no_split, kv_cache,
-                               attn_metadata):
+                               attn_metadata, layer_name):
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_actual_tokens = attn_metadata.num_actual_tokens
         prefill_kv_no_split = kv_no_split[num_decode_tokens:num_actual_tokens]
@@ -1369,11 +1609,66 @@ class AscendMLAImpl(MLAAttentionImpl):
         prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0],
                                          self.num_kv_heads, -1)
         prefill_k_pe = prefill_k_pe.expand((*prefill_k_nope.shape[:-1], -1))
+
+        # kvcomp
+        layer_id = int(layer_name.split(".")[2])
+        if ENABLE_KVCOMP and layer_id not in KVCOMP_FULLKV_LAYERS:
+            if layer_id in KVCOMP_COMPUTE_HAMMING_LAYERS:
+                # print(f'prefill khash layer_id={layer_id}')
+                # print(f'prefill_k_c_normed.shape: {prefill_k_c_normed.shape}')  # torch.Size([8192, 1, 1, 512])
+                # print(f'prefill_k_pe.shape: {prefill_k_pe.shape}')              # torch.Size([8192, 1, 1, 64])
+                device = attn_metadata.slot_mapping.device
+
+                
+                # seq_len = torch.tensor([prefill_k_c_normed.shape[0]], dtype=torch.int32, device=device)
+                # print(f'seq_len={seq_len}')
+                # seq_len = attn_metadata.num_prefill_tokens_device
+                
+                khash_nope = self.hash_encoder_nope.compute_hash(prefill_k_c_normed)
+                # print(f'khash_nope.shape={khash_nope.shape}')  # torch.Size([4218, 1, 64])
+                khash_rope = self.hash_encoder_rope.compute_hash(prefill_k_pe)
+                # print(f'khash_rope.shape={khash_rope.shape}')  # torch.Size([4218, 1, 8])
+
+                # print(f'attn_metadata.slot_mapping.shape: {attn_metadata.slot_mapping.shape}')
+                # print(f'attn_metadata.slot_mapping={attn_metadata.slot_mapping}')
+
+                khash_nope_new = khash_nope.transpose(0, 1).reshape(-1, khash_nope.shape[-1]).contiguous()  # 融合num_kv_head维
+                # print(f'khash_nope_new.shape={khash_nope_new.shape}')  # torch.Size([4218, 64])
+
+                khash_rope_new = khash_rope.transpose(0, 1).reshape(-1, khash_rope.shape[-1]).contiguous()  # 融合num_kv_head维
+                # print(f'khash_rope_new.shape={khash_rope_new.shape}')  # torch.Size([4218, 8])
+                if self.khash_zeros_full == None or self.khash_zeros_full.numel() < khash_rope_new.numel():
+                    self.khash_zeros_full = torch.zeros(khash_rope_new.shape, dtype=khash_rope_new.dtype).to(device=device, non_blocking=True)
+                khash_zeros = self.khash_zeros_full[:khash_rope_new.shape[0]]
+                # print(f'khash_zeros.shape={khash_zeros.shape}')        # torch.Size([4218, 8])
+                khash_rope_new_pad = torch.cat((khash_rope_new, khash_zeros), dim=-1).contiguous()
+                # print(f'khash_rope_new_pad.shape={khash_rope_new_pad.shape}')  # torch.Size([4218, 16])
+
+                torch.ops._C_ascend.npu_reshape_and_cache_bnsd(
+                    khash_nope_new,
+                    self.khash_nope_cache,
+                    prefill_slots,
+                    attn_metadata.num_prefill_tokens_device,
+                    self.khash_nope_cache
+                )
+                # print(f'self.khash_nope_cache.shape={self.khash_nope_cache.shape}')  # torch.Size([168667, 1, 128, 64])
+                # print(f'self.khash_nope_cache={self.khash_nope_cache[1, 0, 0, :]}')
+
+                torch.ops._C_ascend.npu_reshape_and_cache_bnsd(
+                    khash_rope_new_pad,
+                    self.khash_rope_cache,
+                    prefill_slots,
+                    attn_metadata.num_prefill_tokens_device,
+                    self.khash_rope_cache
+                )
+                # print(f'self.khash_rope_cache.shape={self.khash_rope_cache.shape}')  # torch.Size([168667, 1, 128, 16])
+                # print(f'self.khash_rope_cache={self.khash_rope_cache[1, 0, 0, :]}')
+
         return PrefillMLAPreprocessResult(prefill_q_nope, prefill_q_pe,
                                           prefill_k_nope, prefill_k_pe,
                                           prefill_value)
 
-    def mla_preprocess_decode(self, q_c, kv_no_split, kv_cache, attn_metadata):
+    def mla_preprocess_decode(self, q_c, kv_no_split, kv_cache, attn_metadata, layer_name):
         num_decode_tokens = attn_metadata.num_decode_tokens
         decode_q_c = q_c[:num_decode_tokens]
         cos = attn_metadata.decode.cos
@@ -1385,6 +1680,61 @@ class AscendMLAImpl(MLAAttentionImpl):
         decode_kv_no_split = kv_no_split[:num_decode_tokens]
         decode_k_pe, decode_k_nope = self.exec_kv_decode(
             decode_kv_no_split, cos, sin, kv_cache, decode_slots)
+
+        # kvcomp
+        layer_id = int(layer_name.split(".")[2])
+        if ENABLE_KVCOMP and layer_id not in KVCOMP_FULLKV_LAYERS:
+            num_decode_tokens_device = attn_metadata.num_decode_tokens_device
+            k_nope = decode_k_nope.view(-1, decode_k_nope.shape[2], decode_k_nope.shape[3])[decode_slots]
+            k_rope = decode_k_pe.view(-1, decode_k_pe.shape[2], decode_k_pe.shape[3])[decode_slots]
+            # print(f'k_nope.shape={k_nope.shape}')  # torch.Size([1, 1, 512])
+            # print(f'k_rope.shape={k_rope.shape}')  # torch.Size([1, 1, 64])
+            if layer_id in KVCOMP_COMPUTE_HAMMING_LAYERS:
+                # print(f'decode khash layer_id={layer_id}')
+                device = attn_metadata.slot_mapping.device
+
+                # print(f'num_decode_tokens_device={num_decode_tokens_device}')
+                
+                khash_nope = self.hash_encoder_nope.compute_hash(k_nope)
+                # print(f'khash_nope.shape={khash_nope.shape}')  # torch.Size([1, 1, 64])
+                khash_rope = self.hash_encoder_rope.compute_hash(k_rope)
+                # print(f'khash_rope.shape={khash_rope.shape}')  # torch.Size([1, 1, 8])
+
+                # print(f'attn_metadata.slot_mapping.shape: {attn_metadata.slot_mapping.shape}')
+                # print(f'attn_metadata.slot_mapping={attn_metadata.slot_mapping}')
+
+                khash_nope_new = khash_nope.transpose(0, 1).reshape(-1, khash_nope.shape[-1]).contiguous()  # 融合num_kv_head维
+                # print(f'khash_nope_new.shape={khash_nope_new.shape}')  # torch.Size([1, 64])
+
+                khash_rope_new = khash_rope.transpose(0, 1).reshape(-1, khash_rope.shape[-1]).contiguous()  # 融合num_kv_head维
+                # print(f'khash_rope_new.shape={khash_rope_new.shape}')  # torch.Size([1, 8])
+                if self.khash_zeros_full == None or self.khash_zeros_full.numel() < khash_rope_new.numel():
+                    self.khash_zeros_full = torch.zeros(khash_rope_new.shape, dtype=khash_rope_new.dtype).to(device=device, non_blocking=True)
+                khash_zeros = self.khash_zeros_full[:khash_rope_new.shape[0]]
+                # print(f'khash_zeros.shape={khash_zeros.shape}')        # torch.Size([1, 8])
+                khash_rope_new_pad = torch.cat((khash_rope_new, khash_zeros), dim=-1).contiguous()
+                # print(f'khash_rope_new_pad.shape={khash_rope_new_pad.shape}')  # torch.Size([1, 16])
+
+                torch.ops._C_ascend.npu_reshape_and_cache_bnsd(
+                    khash_nope_new,
+                    self.khash_nope_cache,
+                    decode_slots,
+                    num_decode_tokens_device,
+                    self.khash_nope_cache
+                )
+                # print(f'self.khash_nope_cache.shape={self.khash_nope_cache.shape}')  # torch.Size([168667, 1, 128, 64])
+                # print(f'self.khash_nope_cache={self.khash_nope_cache[1, 0, 0, :]}')
+
+                torch.ops._C_ascend.npu_reshape_and_cache_bnsd(
+                    khash_rope_new_pad,
+                    self.khash_rope_cache,
+                    decode_slots,
+                    num_decode_tokens_device,
+                    self.khash_rope_cache
+                )
+                # print(f'self.khash_rope_cache.shape={self.khash_rope_cache.shape}')  # torch.Size([168667, 1, 128, 16])
+                # print(f'self.khash_rope_cache={self.khash_rope_cache[1, 0, 0, :]}')
+
         return DecodeMLAPreprocessResult(decode_ql_nope, decode_q_pe,
                                          decode_k_nope, decode_k_pe)
 
@@ -1434,11 +1784,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         # Preprocess for decode tokens
         if has_decode:
             decode_preprocess_res = self.mla_preprocess_decode(
-                q_c, kv_no_split, kv_cache, attn_metadata)
+                q_c, kv_no_split, kv_cache, attn_metadata, layer_name) # kvcomp
         # Preprocess for prefill tokens
         if has_prefill:
             prefill_preprocess_res = self.mla_preprocess_prefill(
-                q_c, kv_no_split, kv_cache, attn_metadata)
+                q_c, kv_no_split, kv_cache, attn_metadata, layer_name) # kvcomp
         return decode_preprocess_res, prefill_preprocess_res
 
     def get_num_actual_tokens(self, attn_metadata: M):
@@ -1460,6 +1810,28 @@ class AscendMLAImpl(MLAAttentionImpl):
                     self.vllm_config, self.o_proj):
                 reach_layer_for_shared_weight_series(self.o_proj)
             return output.fill_(0)
+
+        # kcomp
+        layer_id = int(layer_name.split(".")[2]) 
+        if ENABLE_KVCOMP and self.kvcomp_initialized == False:
+            device = kv_cache[0].device
+            # print(f'device: {device}')
+            kv_cache_nope_shape = kv_cache[0].shape
+            kv_cache_rope_shape = kv_cache[1].shape
+            # print(f'kv_cache_nope_shape: {kv_cache_nope_shape}')  # torch.Size([21767, 128, 1, 512])
+            # print(f'kv_cache_rope_shape: {kv_cache_rope_shape}')  # torch.Size([21767, 128, 1, 64])
+            self.kvcomp_initialized = True
+            self.kvcomp_indices_full = torch.zeros([self.kvcomp_max_batch, self.kvcomp_max_block_per_seq], dtype=torch.int32, device=device)
+            self.kvcomp_chunk_size_full = torch.zeros([self.kvcomp_max_batch], dtype=torch.int32, device=device)
+            self.kvcomp_chunk_size_full.fill_(self.kvcomp_chunk_size)
+            if layer_id in KVCOMP_COMPUTE_HAMMING_LAYERS:
+                # print(f'init khash cache for layer_id {layer_id}')
+                self.khash_nope_cache = torch.empty([kv_cache_nope_shape[0], kv_cache_nope_shape[2], kv_cache_nope_shape[1], kv_cache_nope_shape[3]//8], dtype=torch.uint8, device=device)
+                # print(f'self.khash_nope_cache.shape={self.khash_nope_cache.shape}')  # (num_blocks, num_kv_heads, block_size, compressed_head_dim_nope)
+                self.khash_rope_cache = torch.empty([kv_cache_rope_shape[0], kv_cache_rope_shape[2], kv_cache_rope_shape[1], kv_cache_rope_shape[3]//8*2], dtype=torch.uint8, device=device)
+                # print(f'self.khash_rope_cache.shape={self.khash_rope_cache.shape}')  # (num_blocks, num_kv_heads, block_size, compressed_head_dim_rope)
+                self.hash_encoder_nope = HashEncoder(input_dim=kv_cache_nope_shape[3], hash_bits=kv_cache_nope_shape[3], dtype=torch.float16, device=device, is_orthogonal_matrix=True)
+                self.hash_encoder_rope = HashEncoder(input_dim=kv_cache_rope_shape[3], hash_bits=kv_cache_rope_shape[3], dtype=torch.float16, device=device, is_orthogonal_matrix=True)
 
         forward_context = get_forward_context()
         num_actual_tokens = self.get_num_actual_tokens(attn_metadata)
@@ -1494,7 +1866,9 @@ class AscendMLAImpl(MLAAttentionImpl):
                                                  decode_preprocess_res.k_nope,
                                                  decode_preprocess_res.k_pe,
                                                  kv_cache[0].shape[1],
-                                                 attn_metadata)
+                                                 attn_metadata,
+                                                 layer_id=layer_id, # kvcomp
+                                                 )
 
             o_proj_input[:num_decode_tokens] = output_decode
 

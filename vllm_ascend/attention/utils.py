@@ -13,6 +13,8 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_config,
                                get_ascend_device_type)
+import os
+from vllm_ascend.attention.kv_compress import AscendKvcompSparseMetadata
 
 
 def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
@@ -154,6 +156,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
 
     prefill_context_parallel_metadata: Optional[
         AscendPrefillContextParallelMetadata] = None
+    kv_comp_sparse_metadata: Optional[
+        AscendKvcompSparseMetadata] = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int,

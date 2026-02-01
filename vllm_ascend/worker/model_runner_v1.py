@@ -358,7 +358,8 @@ class NPUModelRunner(GPUModelRunner):
 
         if os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1":
             from vllm_ascend.worker.kvcomp_utils import KVCompConfig, HashEncoder
-            from vllm.utils import cdiv
+            from vllm.utils.math_utils import cdiv
+            from vllm_ascend.attention.kv_compress import AscendKvcompSparseMetadata
             self.kvcomp_config = KVCompConfig.from_json(os.getenv("VLLM_ASCEND_KVCOMP_CONFIG_PATH"))
             
             if self.vllm_config.model_config.use_mla:
@@ -375,7 +376,9 @@ class NPUModelRunner(GPUModelRunner):
             self.topk_for_hamming_full_cpu = torch.full([self.max_num_reqs], fill_value=self.kvcomp_config.vllm_hash_attention_topk // self.block_size, dtype=torch.int32, device="cpu")
             self.seq_lens_for_hamming = torch.zeros([self.max_num_reqs], dtype=torch.int32, device=self.device)
             self.hamming_output = torch.zeros([self.max_num_reqs, self.model_config.get_num_kv_heads(self.parallel_config), cdiv(self.vllm_config.model_config.max_model_len, self.block_size)] , dtype=torch.int32, device=self.device)
-
+            self.kvcomp_metadata = AscendKvcompSparseMetadata(hash_topk_config=self.kvcomp_config, hash_encoder=self.hash_encoder, hashk_cache=self.hashk_caches)
+        else:
+            self.kvcomp_metadata = None
     def _init_device_properties(self) -> None:
         self.num_sms = None
 
@@ -1020,6 +1023,7 @@ class NPUModelRunner(GPUModelRunner):
                 decode_token_per_req=self.decode_token_per_req,
                 prefill_context_parallel_metadata=self.long_seq_metadata,
                 max_seq_len=0,
+                kv_comp_sparse_metadata=self.kvcomp_metadata,
             )
 
             if self.speculative_config and self.pcp_size * self.dcp_size > 1:
@@ -2279,9 +2283,10 @@ class NPUModelRunner(GPUModelRunner):
                 hashk_caches = {}
             for layer_name, kv_cache in kv_caches.items():
                 layer_index = extract_layer_index(layer_name, num_attn_module)
-                is_rollback_layer = layer_index in self.vllm_hash_attention_rollback_layers
-                is_skip_layer = layer_index in self.vllm_hash_attention_skip_layers
-                if is_rollback_layer or is_skip_layer:
+                is_rollback_layer = layer_index in self.kvcomp_config.vllm_hash_attention_rollback_layers
+                is_skip_layer = layer_index in self.kvcomp_config.vllm_hash_attention_skip_layers
+                # if is_rollback_layer or is_skip_layer:
+                if is_rollback_layer:
                     if self.vllm_config.model_config.use_mla:
                         hashk_caches_nope[layer_name] = None
                         hashk_caches_rope[layer_name] = None
@@ -2297,6 +2302,15 @@ class NPUModelRunner(GPUModelRunner):
                         hashk_cache_rope = torch.zeros((num_blocks_rope, num_kv_heads_rope, block_size_rope, head_size_rope // 8),
                                             dtype=torch.uint8,
                                             device=self.device)
+                    else:
+                        num_blocks, block_size, num_kv_heads, head_size = kv_cache[0].shape
+                        # hashk_cache = torch.zeros((num_blocks, num_kv_heads, block_size, head_size // 8),
+                        #                         dtype=torch.uint8,
+                        #                         device=self.device)
+                        hashk_cache = torch.zeros((num_blocks, block_size, num_kv_heads, head_size // 8),
+                                                dtype=torch.uint8,
+                                                device=self.device)
+                        hashk_caches[layer_name] = hashk_cache
             
             # bind hashk cache to forward context and model runner
             if self.vllm_config.model_config.use_mla:

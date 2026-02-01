@@ -370,8 +370,8 @@ class NPUPlatform(Platform):
     def get_attn_backend_cls(cls, selected_backend, attn_selector_config):
         # enable kvcomp sparse attention according to environment variable VLLM_ASCEND_ENABLE_KVCOMP_SPARSE
         # (ldeng) it has higher priority than the attn_selector_config.use_sparse currently, we can later discuss about the priority.
-        if os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1":
-            return "vllm_ascend.attention.kvcomp_sparse_attention_v1.AscendKvcompSparseAttentionBackend"
+        # if os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1":
+        #     return "vllm_ascend.attention.kvcomp_sparse_attention_v1.AscendKvcompSparseAttentionBackend"
         
         backend_map = {
             (True, False): "vllm_ascend.attention.mla_v1.AscendMLABackend",

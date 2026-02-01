@@ -6,10 +6,164 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional
 import torch_npu
-
+from typing import AsyncGenerator, List, Tuple, Optional
 import numpy as np
 import logging
 logger = logging.getLogger(__name__)
+
+
+class HashEncoder:
+    """
+    HashEncoder converts a float tensor to a binary hash code tensor,
+    and it packs every 8 bits into a uint8 number.
+    """
+
+    def __init__(
+        self, input_dim: int, hash_bits: int, dtype: torch.dtype, device: torch.device
+    ) -> None:
+        self.input_dim = input_dim
+
+        if hash_bits % 8 != 0:
+            raise ValueError("hash_bits must be a multiple of 8")
+
+        self.hash_bits = hash_bits
+
+        # number of uint8 numbers to store hash_bits bits
+        self.hash_numbers = self.hash_bits // 8
+
+        self.dtype = dtype
+        self.device = device
+
+        assert self.device.type == "npu"
+
+        if dtype not in [torch.float16, torch.float32, torch.float64]:
+            logger.warning(
+                "NPU only supports float16, float32 and float64 for hash_weights"
+            )
+            logger.warning("automatically using float16 for hash_weights now")
+            self.dtype = torch.float16
+
+        self._init_hash_weights()
+
+
+    def _init_hash_weights(self):
+        # Step 1: 随机高斯矩阵
+        random_weights = torch.normal(
+            mean=0,
+            std=2,
+            size=(self.input_dim, self.hash_bits),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        # Step 2: QR分解
+        Q, R = torch.linalg.qr(random_weights)
+
+        # Step 3: 调整符号，保证Haar 分布
+        d = torch.sign(torch.diag(R))
+        self.hash_weights = Q * d
+
+    def set_hash_weight(self, hash_weights: torch.Tensor) -> None:
+        if hash_weights.shape != (self.input_dim, self.hash_bits):
+            raise ValueError(
+                f"hash_weights shape {hash_weights.shape} does not match required shape {(self.input_dim, self.hash_bits)}"
+            )
+        if hash_weights.dtype != self.dtype:
+            raise ValueError(
+                f"hash_weights dtype {hash_weights.dtype} does not match required dtype {self.dtype}"
+            )
+        if hash_weights.device != self.device:
+            raise ValueError(
+                f"hash_weights device {hash_weights.device} does not match required device {self.device}"
+            )
+
+        self.hash_weights.copy_(hash_weights)
+
+
+
+    def compute_hash(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the hash code for input tensor x.
+        Args:
+            x: input tensor of shape (..., input_dim)
+        Returns:
+            A tensor of shape (..., hash_numbers=hash_bits // 8) representing the hash codes.
+            Each element is a uint8 number representing 8 bits of the hash code.
+        """
+        if x.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"x must be of shape (..., {self.input_dim}), but got {x.shape}"
+            )
+        if x.device != self.device:
+            raise ValueError(
+                f"x device {x.device} does not match required device {self.device}"
+            )
+
+        # original shape without the last dimension
+        # e.g. x.shape=[s1,s2,s3,input_dim], orig_shape=[s1,s2,s3]
+        orig_shape = x.shape[:-1]
+
+        # [N, input_dim], e.g., N = s1*s2*s3
+        x_flat = x.reshape(-1, self.input_dim)
+
+        if x_flat.dtype != self.dtype:
+            x_flat = x_flat.to(self.dtype)
+
+        # [N, hash_bits]
+        xW = torch.matmul(x_flat, self.hash_weights)
+        # [N * hash_bits]
+        xW_flat = xW.view(-1)
+        # [N*hash_numbers], where hash_numbers = hash_bits // 8
+        packed_codes_flat = torch_npu.npu_sign_bits_pack(xW_flat, size=1)
+
+        # e.g., [s1, s2, s3, hash_numbers]
+        out_shape = orig_shape + (self.hash_numbers,)
+        packed_codes = packed_codes_flat.view(out_shape)
+
+        return packed_codes
+
+    def _unpack_hash(self, packed_codes: torch.Tensor) -> torch.Tensor:
+        """
+        Unpack the hash codes to +1 or -1 bits.
+        Args:
+            packed_codes: input tensor of shape (..., hash_numbers), dtype=torch.uint8
+        Returns:
+            A tensor of shape (..., hash_bits=hash_numbers*8) representing the unpacked bits.
+            Each element is either -1 or 1.
+        """
+        if packed_codes.shape[-1] != self.hash_numbers:
+            raise ValueError(
+                f"packed_codes must be of shape (..., {self.hash_numbers}), but got {packed_codes.shape}"
+            )
+        if packed_codes.device != self.device:
+            raise ValueError(
+                f"packed_codes device {packed_codes.device} does not match required device {self.device}"
+            )
+        if packed_codes.dtype != torch.uint8:
+            raise ValueError(
+                f"packed_codes dtype {packed_codes.dtype} is not torch.uint8"
+            )
+
+        # e.g., packed_codes.shape=[s1, s2, s3, hash_numbers]
+        # orig_shape = [s1, s2, s3]
+        orig_shape = packed_codes.shape[:-1]
+
+        # [N * hash_numbers], e.g., N = s1*s2*s3
+        packed_codes_flat = packed_codes.view(-1)
+
+        # [N * hash_bits]
+        unpacked_bits_flat = torch_npu.npu_sign_bits_unpack(
+            packed_codes_flat, size=1, dtype=torch.float16
+        )
+    
+
+        out_shape = orig_shape + (self.hash_bits,)
+        unpacked_bits = unpacked_bits_flat.view(out_shape)
+
+        return unpacked_bits
+
+
+
+
 
 # largely follow vllm.v1.worker.utils.bind_kv_cache
 def bind_hashk_cache(
@@ -135,7 +289,126 @@ def bind_hashk_cache_rope(
         # NOTE: Use list because of v0 PP virtual engine.
         forward_context[layer_name].hashk_cache_rope = [hashk_cache_rope]
 
+def update_hashk_cache(
+    key: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
+    hashk_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, hash_bits//16]
+    slot_mapping: torch.Tensor,  # [num_tokens]
+    hash_encoder: HashEncoder,
+) -> None:
+    """
+    Update hash cache with new key hash codes.
+    
+    Args:
+        key: New key tensor
+        hashk_cache: Hashk cache to update
+        slot_mapping: Slot mapping for cache indices
+        hash_encoder: Hash encoder instance (Uint8 version)
+    """
+    if hashk_cache == None:
+        return
+    num_tokens = key.shape[0]
+    head_size = key.shape[-1]
+    
+    # Encode new keys
+    key_flat = key.view(-1, head_size)  # [num_tokens * num_kv_heads, head_size]
+    key_hash = hash_encoder.compute_hash(key_flat)  # [num_tokens * num_kv_heads, hash_bits//16]
+    key_hash = key_hash.view(num_tokens, -1, key_hash.shape[-1])  # [num_tokens, num_kv_heads, hash_bits//16]
 
+    
+    # suppose that slot_mapping are input correctly    
+    # Compute block and slot indices
+    block_indices = slot_mapping // hashk_cache.shape[1]
+    slot_in_block = slot_mapping % hashk_cache.shape[1]
+    
+    # Update cache using advanced indexing
+    # print(f"============ update_hashk_cache hashk_cache:{hashk_cache.shape} ===========")  # [11875,128,1,16]
+    # print(f"============ update_hashk_cache key_hash:{key_hash.shape} ===========") # [1,1,16]
+    # print(f"============ update_hashk_cache block_indices:{block_indices} {block_indices.shape}===========")
+    # print(f"============ update_hashk_cache slot_in_block:{slot_in_block} {slot_in_block.shape}===========")
+    hashk_cache[block_indices, slot_in_block] = key_hash
+
+def update_block_table_from_topn_chunks_equal(
+    chunk_topn_indices: torch.Tensor,   # [batch_size, num_kv_heads, max_q_seqlen, MAX_N]
+    block_table: torch.Tensor,          # [max_num_reqs, max_num_blocks_per_req]
+    seq_lens: torch.Tensor,             # [BS]
+    top_n: torch.Tensor,                # [BS] top-n for chunks for each request, e.g., top_n = [32, 35], note that top_n.max() < MAX_N
+    top_k: torch.Tensor,                # [BS] top-k for blocks for each request, e.g., top_k = [3, 5] 
+    block_size: int,                    # scalar, PA's block size
+    chunk_size: int                     # scalar, chuck size, could be 1,8,16
+) -> Tuple[torch.Tensor, torch.Tensor]: # new_block_table: [BS, max_top_k] where max_top_k = top_k.max() and use block 0 for padding 
+                                        # new_seq_len:     [BS]
+    # start_time = time.perf_counter()
+    batch_size = seq_lens.shape[0]
+    max_num_blocks_per_req = block_table.shape[1]
+
+    # start_time = time.perf_counter()
+    # 规避overflow的chunk_index，前提是输入不存在chunkid=chunk_num+[1,10]的无效数
+    mask_invalid_chunk_ids = (chunk_topn_indices < 0) | (chunk_topn_indices > seq_lens.max() // chunk_size + 1)
+    chunk_topn_indices[mask_invalid_chunk_ids] = 0
+    
+    # 规避出现多个0的chunkid
+    zero_mask = (chunk_topn_indices == 0)
+    invalid_values, invalid_index = torch.topk(chunk_topn_indices[:batch_size,0,0,:], k=2, largest=False)
+    invalid_index, _ = torch.sort(invalid_index)
+    valid_top_n = torch.where(invalid_values[:,1] == 0, invalid_index[:,1], top_n)
+    
+    # 生成列索引网络，处理topk大于有效topn的情况
+    valid_top_k = torch.min(top_k, valid_top_n)
+    max_k = top_k.max()
+    valid_chunk_top_indices = chunk_topn_indices[:batch_size, 0, 0, :][:, :max_k]
+    col_indices = torch.arange(max_k, device=chunk_topn_indices.device).expand(batch_size, -1)
+    mask = col_indices < valid_top_k.unsqueeze(1)
+    valid_chunk_top_indices[~mask] = max_num_blocks_per_req-1
+
+    # 生成new_block_table，将超出topk的部分置为0
+    index, _ = torch.sort(valid_chunk_top_indices)
+    new_block_table = torch.gather(block_table, dim=1, index=index)
+    new_block_table = new_block_table * mask
+
+    # 生成new_seq_len
+    num_valid_blocks = (seq_lens + block_size -1) // block_size
+    is_last_block_retained = ( valid_chunk_top_indices == (num_valid_blocks-1).unsqueeze(1)).any(dim=1)
+    # print(f"is_last_block_retained={is_last_block_retained}")
+    num_tokens_in_last_block = torch.where(
+            is_last_block_retained, 
+            seq_lens % block_size, 
+            torch.full_like(seq_lens, block_size)
+    )
+    
+    new_seq_lens = (valid_top_k - 1)*block_size + num_tokens_in_last_block
+
+    return new_block_table, new_seq_lens
+    
+def hashk_cache_reshape_vectorise(
+    hashk_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> torch.Tensor:
+    batch_size = seq_lens.shape[0]
+    block_size = hashk_cache.shape[1]
+    num_kv_heads = hashk_cache.shape[2]
+    hash_bits_div_8 = hashk_cache.shape[3]
+    max_kv_seq = torch.max(seq_lens).item()
+    
+    block_indices = torch.arange(max_kv_seq, device=block_table.device) // block_size
+    block_indices = block_indices.unsqueeze(0).expand(batch_size, -1)
+    block_indices = torch.gather(block_table, 1, block_indices)  # [batch_size, max_kv_seq]
+    
+    # TODO check if we have values < 0, if no - rm this code line
+    # block_indices = torch.where(block_indices > 0, block_indices, 0)
+    
+    offset_indices = torch.arange(max_kv_seq, device=hashk_cache.device) % block_size
+    offset_indices = offset_indices.unsqueeze(0).expand(batch_size, -1)
+    
+    seq_range = torch.arange(max_kv_seq, device=seq_lens.device).unsqueeze(0)
+    seq_lens_expanded = seq_lens.unsqueeze(1)
+    mask = seq_range < seq_lens_expanded
+    
+    new_hashk_cache = hashk_cache[block_indices, offset_indices, :, :]  # [batch_size, max_kv_seq, num_kv_heads, hash_bits_div_8]
+    new_hashk_cache[~mask] = 0
+    new_hashk_cache = new_hashk_cache.transpose(1, 2)
+    
+    return new_hashk_cache
 
 @dataclass
 class KVCompConfig:
@@ -162,6 +435,7 @@ class KVCompConfig:
 
     head_dim: int = 128
     hash_bits: int = 128
+    is_layer_sensitive: bool = True
 
     top_k_ratio_per_layer: List[float] = field(default_factory=lambda: [0.3] * 36)
     top_k_index_reuse: List[int] = field(default_factory=lambda: [-1] * 36)
@@ -380,156 +654,4 @@ class KVCompConfig:
         with open(file_path, "r") as f:
             config_dict = json.load(f)
         return cls(**config_dict)
-
-
-class HashEncoder:
-    """
-    HashEncoder converts a float tensor to a binary hash code tensor,
-    and it packs every 8 bits into a uint8 number.
-    """
-
-    def __init__(
-        self, input_dim: int, hash_bits: int, dtype: torch.dtype, device: torch.device
-    ) -> None:
-        self.input_dim = input_dim
-
-        if hash_bits % 8 != 0:
-            raise ValueError("hash_bits must be a multiple of 8")
-
-        self.hash_bits = hash_bits
-
-        # number of uint8 numbers to store hash_bits bits
-        self.hash_numbers = self.hash_bits // 8
-
-        self.dtype = dtype
-        self.device = device
-
-        assert self.device.type == "npu"
-
-        if dtype not in [torch.float16, torch.float32, torch.float64]:
-            logger.warning(
-                "NPU only supports float16, float32 and float64 for hash_weights"
-            )
-            logger.warning("automatically using float16 for hash_weights now")
-            self.dtype = torch.float16
-
-        self._init_hash_weights()
-
-
-    def _init_hash_weights(self):
-        # Step 1: 随机高斯矩阵
-        random_weights = torch.normal(
-            mean=0,
-            std=2,
-            size=(self.input_dim, self.hash_bits),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        # Step 2: QR分解
-        Q, R = torch.linalg.qr(random_weights)
-
-        # Step 3: 调整符号，保证Haar 分布
-        d = torch.sign(torch.diag(R))
-        self.hash_weights = Q * d
-
-    def set_hash_weight(self, hash_weights: torch.Tensor) -> None:
-        if hash_weights.shape != (self.input_dim, self.hash_bits):
-            raise ValueError(
-                f"hash_weights shape {hash_weights.shape} does not match required shape {(self.input_dim, self.hash_bits)}"
-            )
-        if hash_weights.dtype != self.dtype:
-            raise ValueError(
-                f"hash_weights dtype {hash_weights.dtype} does not match required dtype {self.dtype}"
-            )
-        if hash_weights.device != self.device:
-            raise ValueError(
-                f"hash_weights device {hash_weights.device} does not match required device {self.device}"
-            )
-
-        self.hash_weights.copy_(hash_weights)
-
-
-
-    def compute_hash(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the hash code for input tensor x.
-        Args:
-            x: input tensor of shape (..., input_dim)
-        Returns:
-            A tensor of shape (..., hash_numbers=hash_bits // 8) representing the hash codes.
-            Each element is a uint8 number representing 8 bits of the hash code.
-        """
-        if x.shape[-1] != self.input_dim:
-            raise ValueError(
-                f"x must be of shape (..., {self.input_dim}), but got {x.shape}"
-            )
-        if x.device != self.device:
-            raise ValueError(
-                f"x device {x.device} does not match required device {self.device}"
-            )
-
-        # original shape without the last dimension
-        # e.g. x.shape=[s1,s2,s3,input_dim], orig_shape=[s1,s2,s3]
-        orig_shape = x.shape[:-1]
-
-        # [N, input_dim], e.g., N = s1*s2*s3
-        x_flat = x.reshape(-1, self.input_dim)
-
-        if x_flat.dtype != self.dtype:
-            x_flat = x_flat.to(self.dtype)
-
-        # [N, hash_bits]
-        xW = torch.matmul(x_flat, self.hash_weights)
-        # [N * hash_bits]
-        xW_flat = xW.view(-1)
-        # [N*hash_numbers], where hash_numbers = hash_bits // 8
-        packed_codes_flat = torch_npu.npu_sign_bits_pack(xW_flat, size=1)
-
-        # e.g., [s1, s2, s3, hash_numbers]
-        out_shape = orig_shape + (self.hash_numbers,)
-        packed_codes = packed_codes_flat.view(out_shape)
-
-        return packed_codes
-
-    def _unpack_hash(self, packed_codes: torch.Tensor) -> torch.Tensor:
-        """
-        Unpack the hash codes to +1 or -1 bits.
-        Args:
-            packed_codes: input tensor of shape (..., hash_numbers), dtype=torch.uint8
-        Returns:
-            A tensor of shape (..., hash_bits=hash_numbers*8) representing the unpacked bits.
-            Each element is either -1 or 1.
-        """
-        if packed_codes.shape[-1] != self.hash_numbers:
-            raise ValueError(
-                f"packed_codes must be of shape (..., {self.hash_numbers}), but got {packed_codes.shape}"
-            )
-        if packed_codes.device != self.device:
-            raise ValueError(
-                f"packed_codes device {packed_codes.device} does not match required device {self.device}"
-            )
-        if packed_codes.dtype != torch.uint8:
-            raise ValueError(
-                f"packed_codes dtype {packed_codes.dtype} is not torch.uint8"
-            )
-
-        # e.g., packed_codes.shape=[s1, s2, s3, hash_numbers]
-        # orig_shape = [s1, s2, s3]
-        orig_shape = packed_codes.shape[:-1]
-
-        # [N * hash_numbers], e.g., N = s1*s2*s3
-        packed_codes_flat = packed_codes.view(-1)
-
-        # [N * hash_bits]
-        unpacked_bits_flat = torch_npu.npu_sign_bits_unpack(
-            packed_codes_flat, size=1, dtype=torch.float16
-        )
-    
-
-        out_shape = orig_shape + (self.hash_bits,)
-        unpacked_bits = unpacked_bits_flat.view(out_shape)
-
-        return unpacked_bits
-
-
 
