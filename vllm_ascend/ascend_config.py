@@ -47,6 +47,9 @@ class AscendConfig:
         eplb_config = additional_config.get("eplb_config", {})
         self.eplb_config = EplbConfig(eplb_config)
 
+        expert_offload_config = additional_config.get("expert_offload_config", {})
+        self.expert_offload_config = ExpertOffloadConfig(expert_offload_config)
+
         weight_prefetch_config = additional_config.get("weight_prefetch_config", {})
         self.weight_prefetch_config = WeightPrefetchConfig(weight_prefetch_config)
 
@@ -565,6 +568,50 @@ class EplbConfig:
         logger.info("The number of redundant experts is %s", self.config["num_redundant_experts"])
 
 
+class ExpertOffloadConfig:
+    """
+    Configuration Object for expert_offload_config from additional_config
+    """
+
+    _defaults = {
+        "expert_offload": False,
+        "num_device_experts": 32,
+        "expert_map_path": None,
+    }
+
+    def __init__(self, user_config: dict | None = None):
+        if user_config is None:
+            user_config = {}
+        self.config = self._defaults.copy()
+        if user_config and isinstance(user_config, dict):
+            for key, value in user_config.items():
+                if key in self.config:
+                    self.config[key] = value
+                else:
+                    raise ValueError(f"Config has no attribute '{key}'")
+
+        self._validate_config()
+
+    def __getattr__(self, key):
+        if key in self.config:
+            return self.config[key]
+        raise AttributeError(f"Config has no attribute '{key}'")
+
+    def _validate_config(self):
+        if self.expert_map_path is not None:
+            logger.info("The expert_map is %s", self.expert_map_path)
+            if not self.expert_map_path.endswith(".json"):
+                raise TypeError("The expert_map is not json.")
+            if not (os.path.exists(self.expert_map_path) and os.access(self.expert_map_path, os.R_OK)):
+                raise ValueError("The expert_map is not exist.")
+        if not isinstance(self.config["num_device_experts"], int):
+            raise TypeError("num_device_experts must be an integer")
+        if self.config["num_device_experts"] < 0:
+            raise ValueError(f"num_device_experts must >= 0; got {self.config['num_device_experts']} instead")
+        if not isinstance(self.config["expert_offload"], bool):
+            raise TypeError("expert_offload must be a boolean")
+
+
 _ASCEND_CONFIG: AscendConfig | None = None
 
 
@@ -578,7 +625,7 @@ def _is_ascend_config_initialized(config: AscendConfig | None) -> bool:
     """
     if config is None:
         return False
-    return hasattr(config, "ascend_compilation_config") and hasattr(config, "eplb_config")
+    return hasattr(config, "ascend_compilation_config") and hasattr(config, "eplb_config") and hasattr(config, "expert_offload_config")
 
 
 def init_ascend_config(vllm_config):

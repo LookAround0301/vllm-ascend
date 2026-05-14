@@ -166,6 +166,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     topk_ids=topk_ids,
                 )
 
+        # Expert offload: page in needed experts based on topk_ids
+        if getattr(layer, 'enable_expert_offload', False):
+            from vllm_ascend.expert_offload import ExpertOffloadManager
+            ExpertOffloadManager.get_instance().update_weights(layer, topk_ids)
+
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
                 expert_indices=topk_ids,
@@ -375,6 +380,13 @@ class AscendFusedMoE(FusedMoE):
         self.global_num_experts = num_experts + self.global_redundant_expert_num
         self.dynamic_eplb = eplb_config.dynamic_eplb and (self.log2phy is not None)
         self.local_num_experts = self.global_num_experts // self.ep_size
+
+        # Expert offload: enable if configured and num_device_experts < local_num_experts
+        offload_config = ascend_config.expert_offload_config
+        self.enable_expert_offload = (offload_config.expert_offload
+                                      and offload_config.num_device_experts > 0
+                                      and offload_config.num_device_experts < self.local_num_experts)
+
         if self._expert_map is not None:
             logger.info_once(
                 "[EP Rank %s/%s] Expert parallelism is enabled. Local/global"
@@ -398,6 +410,9 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.num_experts = self.global_num_experts
         self.moe_config.num_local_experts = self.local_num_experts
         self.moe_config.global_redundant_expert_num = self.global_redundant_expert_num
+
+        if self.enable_expert_offload:
+            self._wrap_weight_loader_for_offload()
 
         moe_quant_params = {
             "num_experts": self.local_num_experts,
@@ -442,6 +457,30 @@ class AscendFusedMoE(FusedMoE):
                 return result
 
             self.quant_method.process_weights_after_loading = wrapped_process_weights  # type: ignore
+
+    def _wrap_weight_loader_for_offload(self):
+        """Wrap weight_loader to intercept w13/w2 weights and store them on CPU."""
+        from vllm_ascend.expert_offload import ExpertOffloadManager
+        mgr = ExpertOffloadManager.get_instance()
+        layer_moe_idx = self.moe_instance_id
+        orig_wl = self.weight_loader
+        ndev = mgr.num_device_experts
+
+        def _offload_weight_loader(param, loaded_weight, weight_name, shard_id,
+                                   expert_id, **kwargs):
+            # Always copy expert weights to CPU
+            if shard_id in ("w1", "w3"):
+                mgr.load_w13(layer_moe_idx, expert_id, loaded_weight, shard_id)
+            elif shard_id == "w2":
+                mgr.load_w2(layer_moe_idx, expert_id, loaded_weight)
+            # Only load to device if expert_id < num_device_experts
+            # (shared experts and other params like gate/routing go through normal path)
+            if shard_id in ("w1", "w2", "w3") and expert_id >= ndev:
+                return None
+            return orig_wl(param, loaded_weight, weight_name, shard_id,
+                           expert_id, **kwargs)
+
+        self.weight_loader = _offload_weight_loader
 
     def _validate_shared_expert_consistency(self):
         """Validate that split shared expert computation matches integrated

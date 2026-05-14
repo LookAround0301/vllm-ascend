@@ -272,6 +272,9 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        if self.ascend_config.expert_offload_config.expert_offload:
+            from vllm_ascend.expert_offload import ExpertOffloadManager
+            self.offload_manager = ExpertOffloadManager()
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
@@ -3000,6 +3003,8 @@ class NPUModelRunner(GPUModelRunner):
             if self.eplb_enable:
                 self.vllm_config.parallel_config.enable_eplb = True
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            if hasattr(self, 'offload_manager'):
+                self._register_offload_layers()
             if self.dynamic_eplb:
                 model_register(self.model)
             if self.drafter:
@@ -3035,6 +3040,29 @@ class NPUModelRunner(GPUModelRunner):
                 use_eagle=self.use_eagle,
                 enable_enpu=self.enable_enpu,
             )
+
+    def _register_offload_layers(self):
+        """Find all AscendFusedMoE layers and register with ExpertOffloadManager."""
+        from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
+
+        moe_layers = [m for m in self.model.modules()
+                      if isinstance(m, AscendFusedMoE)]
+        if not moe_layers:
+            return
+        first = moe_layers[0]
+        w13_up_dim = (first.w13_weight.shape[2] if hasattr(first, 'w13_weight')
+                      else first.intermediate_size_per_partition * 2)
+        self.offload_manager.create_weights(
+            num_moe_layers=len(moe_layers),
+            num_total_experts=first.global_num_experts,
+            w13_up_dim=w13_up_dim,
+            hidden_size=first.hidden_size,
+            intermediate_size_per_partition=first.intermediate_size_per_partition,
+            params_dtype=first.params_dtype,
+        )
+        for layer in moe_layers:
+            self.offload_manager.register_moe_layer(layer)
+        self.offload_manager.init_device_experts()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
