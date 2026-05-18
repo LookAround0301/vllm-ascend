@@ -169,6 +169,14 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # Expert offload: incrementally page in needed experts, update log2phy
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
+            # Non-pool layers share pool's device tensors — sync log2phy
+            # to the pool's current state before update.
+            _pool_idx = getattr(layer, '_offload_pool_idx', -1)
+            if _pool_idx >= 0:
+                from vllm_ascend.expert_offload.expert_offload_manager import _device_pool
+                cur_log2phy = _device_pool[_pool_idx].log2phy
+                if layer.log2phy is not cur_log2phy:
+                    layer.log2phy = cur_log2phy
             ExpertOffloadManager.get_instance().update_weights(
                 layer, topk_ids, layer.log2phy)
             log2phy = layer.log2phy = layer.log2phy.to(topk_ids.device)
@@ -422,6 +430,16 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.num_local_experts = self.local_num_experts
         self.moe_config.global_redundant_expert_num = self.global_redundant_expert_num
 
+        # --- Device tensor pool sharing ---
+        # Must be set BEFORE _wrap_weight_loader_for_offload so the
+        # closure captures the correct _offload_skip_device_load value.
+        self._offload_pool_idx = -1
+        if self.enable_expert_offload:
+            _ndl = get_ascend_config().expert_offload_config.num_device_layers
+            if self.moe_instance_id >= _ndl:
+                self._offload_pool_idx = self.moe_instance_id % _ndl
+                self._offload_skip_device_load = True
+
         if self.enable_expert_offload:
             self._wrap_weight_loader_for_offload()
 
@@ -435,7 +453,62 @@ class AscendFusedMoE(FusedMoE):
         # need full intermediate size pre-sharding for WNA16 act order
         if self.quant_method.__class__.__name__ in ("GPTQMarlinMoEMethod", "CompressedTensorsWNA16MoEMethod"):
             moe_quant_params["intermediate_size_full"] = intermediate_size
-        self.quant_method.create_weights(layer=self, **moe_quant_params)
+
+        if self._offload_pool_idx >= 0:
+            # Non-pool layer: borrow device tensors from pool layer.
+            # The pool layer was already constructed (layers are built in order).
+            from vllm_ascend.expert_offload.expert_offload_manager import _device_pool
+            pool_layer = _device_pool[self._offload_pool_idx]
+
+            # Wrap pool layer's tensor data in new nn.Parameters so they
+            # are properly registered on this module (required by weight
+            # loader's params_dict lookup).  Same underlying tensor memory,
+            # so all layers sharing a pool see in-place updates.
+            self.w13_weight = torch.nn.Parameter(
+                pool_layer.w13_weight.data, requires_grad=False)
+            self.w2_weight = torch.nn.Parameter(
+                pool_layer.w2_weight.data, requires_grad=False)
+            # Use THIS layer's own wrapped weight_loader (NOT pool's).
+            # Each layer's _wrap_weight_loader_for_offload creates a
+            # closure with the correct layer_moe_idx.
+            for _name in ('w13_weight', 'w2_weight'):
+                self_p = getattr(self, _name)
+                self_p.weight_loader = self.weight_loader
+                pool_p = getattr(pool_layer, _name)
+                if hasattr(pool_p, 'quant_method'):
+                    self_p.quant_method = pool_p.quant_method
+            import logging as _dlog
+            _dlog.getLogger(__name__).warning(
+                "[DEBUG] nonpool l=%d w13.param_weight_loader=%s self.weight_loader_is_wrapped=%s",
+                self.moe_instance_id, getattr(self.w13_weight, 'weight_loader', None),
+                self.weight_loader)
+            # Scale/offset params were already created by upstream
+            # FusedMoE.__init__ with the ORIGINAL weight_loader. Patch
+            # their weight_loader to this layer's wrapped version, and
+            # redirect their .data to the pool's tensor.
+            for _name in ('w13_weight_scale', 'w2_weight_scale',
+                          'w13_weight_offset', 'w2_weight_offset'):
+                if not hasattr(self, _name):
+                    continue
+                _p = getattr(self, _name)
+                _p.weight_loader = self.weight_loader
+                # Redirect .data to pool's post-processed tensor.
+                # The pool's .data was replaced by process_weights
+                # _after_loading, so do this in _register_offload_layers.
+            self.log2phy = pool_layer.log2phy
+            # Mark this layer as device-skip so the offload weight loader
+            # stores ALL experts to CPU only (never writes to device).
+            # Skip process_weights_after_loading — pool layer already did
+            # NZ cast on the shared tensor. Redundant NZ cast would double
+            # allocate and OOM.
+            if hasattr(self.quant_method, 'process_weights_after_loading'):
+                self.quant_method.process_weights_after_loading = \
+                    lambda _layer: None
+        else:
+            self.quant_method.create_weights(layer=self, **moe_quant_params)
+            if self.enable_expert_offload:
+                from vllm_ascend.expert_offload.expert_offload_manager import _device_pool
+                _device_pool[self.moe_instance_id % _offload_cfg.num_device_layers] = self
 
         if self.enable_expert_offload and self.moe_instance_id == 0:
             import logging as _log
@@ -491,6 +564,8 @@ class AscendFusedMoE(FusedMoE):
         layer_moe_idx = self.moe_instance_id
         orig_wl = self.weight_loader
         ndev = mgr.num_device_experts
+        # Non-pool layers share pool's device tensors; skip all device writes.
+        _skip_dev = getattr(self, '_offload_skip_device_load', False)
 
         def _offload_weight_loader(param, loaded_weight, weight_name, shard_id,
                                    expert_id, **kwargs):
@@ -500,14 +575,14 @@ class AscendFusedMoE(FusedMoE):
                                        "w13_weight_scale" if shard_id in ("w1", "w3")
                                        else "w2_weight_scale",
                                        shard_id, loaded_weight)
-                if expert_id >= ndev:
+                if _skip_dev or expert_id >= ndev:
                     return None
             elif "weight_offset" in weight_name:
                 mgr._add_pending_scale(layer_moe_idx, expert_id,
                                        "w13_weight_offset" if shard_id in ("w1", "w3")
                                        else "w2_weight_offset",
                                        shard_id, loaded_weight)
-                if expert_id >= ndev:
+                if _skip_dev or expert_id >= ndev:
                     return None
             else:
                 # --- Handle weight params (existing logic) ---
@@ -516,7 +591,8 @@ class AscendFusedMoE(FusedMoE):
                 elif shard_id == "w2":
                     mgr.load_w2(layer_moe_idx, expert_id, loaded_weight)
                 # Only load to device if expert_id < num_device_experts
-                if shard_id in ("w1", "w2", "w3") and expert_id >= ndev:
+                # and this is not a non-pool layer.
+                if _skip_dev or (shard_id in ("w1", "w2", "w3") and expert_id >= ndev):
                     return None
             return orig_wl(param, loaded_weight, weight_name, shard_id,
                            expert_id, **kwargs)

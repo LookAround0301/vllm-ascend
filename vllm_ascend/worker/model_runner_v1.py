@@ -3009,14 +3009,9 @@ class NPUModelRunner(GPUModelRunner):
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             if self.eplb_enable:
                 self.vllm_config.parallel_config.enable_eplb = True
-            t0 = time.perf_counter()
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
-            t1 = time.perf_counter()
-            logger.info("get_model took %.2f seconds (including weight loading)", t1 - t0)
             if hasattr(self, 'offload_manager'):
                 self._register_offload_layers()
-                t2 = time.perf_counter()
-                logger.info("_register_offload_layers took %.2f seconds", t2 - t1)
             if self.dynamic_eplb:
                 model_register(self.model)
             if self.drafter:
@@ -3064,7 +3059,6 @@ class NPUModelRunner(GPUModelRunner):
         first = moe_layers[0]
         w13_up_dim = (first.w13_weight.shape[2] if hasattr(first, 'w13_weight')
                       else first.intermediate_size_per_partition * 2)
-        t_a = time.perf_counter()
         self.offload_manager.create_weights(
             num_moe_layers=len(moe_layers),
             num_total_experts=first.global_num_experts,
@@ -3073,15 +3067,46 @@ class NPUModelRunner(GPUModelRunner):
             intermediate_size_per_partition=first.intermediate_size_per_partition,
             params_dtype=first.params_dtype,
         )
-        t_b = time.perf_counter()
         for i, layer in enumerate(moe_layers):
             self.offload_manager.register_moe_layer(layer)
             self.offload_manager.maybe_create_scale_buffers(layer, i)
-        t_c = time.perf_counter()
+        # process_weights_after_loading on pool layers replaces .data with
+        # NZ-cast tensors.  Non-pool layers created their nn.Parameters
+        # BEFORE that replacement, so they still wrap the old pre-NZ data.
+        # Re-create their Parameters now to share the pool's post-NZ data.
+        ndl = self.offload_manager.offload_config.num_device_layers
+        _param_names = ('w13_weight', 'w2_weight', 'w13_weight_scale',
+                        'w2_weight_scale', 'w13_weight_offset', 'w2_weight_offset')
+        for i, layer in enumerate(moe_layers):
+            if i < ndl:
+                continue
+            pool = moe_layers[i % ndl]
+            for name in _param_names:
+                if not hasattr(pool, name):
+                    continue
+                pool_val = getattr(pool, name)
+                old = layer._parameters.pop(name, None)
+                if old is not None:
+                    del old
+                # Directly share pool's Parameter (not wrap). Pool already
+                # completed process_weights_after_loading (NZ cast etc).
+                setattr(layer, name, pool_val)
+            # Sync fp32 scale
+            if hasattr(pool, 'w13_weight_scale_fp32'):
+                layer.w13_weight_scale_fp32 = pool.w13_weight_scale_fp32
+        import gc
+        gc.collect()
+        try:
+            torch.npu.empty_cache()
+        except Exception:
+            pass
+        logger.warning("offload: npu memory after pool setup: %.2f GiB allocated | %.2f GiB reserved",
+                       torch.npu.memory_allocated() / (1024**3),
+                       torch.npu.memory_reserved() / (1024**3))
         self.offload_manager.init_device_experts()
-        t_d = time.perf_counter()
-        logger.info("offload steps: create_weights=%.1fs  scale_buffers=%.1fs  init_device=%.1fs",
-                     t_b - t_a, t_c - t_b, t_d - t_c)
+        logger.info("_register_offload_layers: %d moe layers, %d device experts, %d device layers (pool)",
+                     len(moe_layers), self.offload_manager.num_device_experts,
+                     self.offload_manager.offload_config.num_device_layers)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """

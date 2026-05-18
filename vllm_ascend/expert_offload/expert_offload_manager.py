@@ -3,6 +3,10 @@
 import torch
 from vllm.config import VllmConfig
 
+# Device tensor pool for layer sharing.
+# Keys are pool indices (0..num_device_layers-1), values are pool MoE layers.
+_device_pool: dict[int, object] = {}
+
 
 class ExpertOffloadManager:
     """Singleton manager for expert weight offloading.
@@ -140,6 +144,9 @@ class ExpertOffloadManager:
                 continue
             dev_tensor = getattr(layer, attr_name)
             per_expert_shape = dev_tensor.shape[1:]
+            # Flatten trailing dims (e.g., (3072,1) → (3072,))
+            if len(per_expert_shape) > 1:
+                per_expert_shape = (dev_tensor[0].numel(),)
             dtype = dev_tensor.dtype
             buffer_dict: dict = getattr(self, buffer_dict_name)
             if attr_name not in buffer_dict:
@@ -222,12 +229,16 @@ class ExpertOffloadManager:
             del self._pending_scales[key]
 
     def init_device_experts(self):
-        """Refresh derived fp32 scale after weight loading.
+        """Refresh derived fp32 scale for pool layers only.
 
         Device experts are already loaded by the weight loader and
-        process_weights_after_loading. Only refresh w13_weight_scale_fp32.
+        process_weights_after_loading for pool layers. Non-pool layers
+        share pool layers' device tensors (no separate init needed).
         """
+        ndl = self.offload_config.num_device_layers
         for i, layer in enumerate(self.moe_layers):
+            if i >= ndl:
+                continue  # non-pool layer, shares pool's tensors
             ndev = min(self.num_device_experts, layer.w13_weight.shape[0])
             if hasattr(layer, 'w13_weight_scale_fp32'):
                 for j in range(ndev):
@@ -270,10 +281,19 @@ class ExpertOffloadManager:
                 slot_owner[s] = eid
 
         on_device = set(slot_owner.values())
-        already_there = needed & on_device           # no-op
-        need_to_load = needed - already_there          # CPU→NPU copy
-        reusable_slots = [s for s, e in slot_owner.items()
-                          if e not in needed]          # slots to recycle
+        # With pool sharing, different layers have different expert weights
+        # even for the same expert_id. Always reload from the current
+        # layer's CPU buffer to ensure correct per-layer expert weights.
+        ndl = self.offload_config.num_device_layers
+        if ndl < len(self.moe_layers):
+            already_there = set()
+            need_to_load = sorted(needed)  # deterministic order
+            reusable_slots = list(slot_owner.keys())
+        else:
+            already_there = needed & on_device
+            need_to_load = needed - already_there
+            reusable_slots = [s for s, e in slot_owner.items()
+                              if e not in needed]
 
         # Debug: print routing info for first 30 calls
         if not hasattr(self, '_dbg_call'):
@@ -299,50 +319,98 @@ class ExpertOffloadManager:
         dt = layer.w13_weight.dtype
         n_copies = 0
 
+        reused_slots: set[int] = set()
+        # Pre-compute expert frequencies for eviction tie-breaking and
+        # for filling remaining slots with the most relevant experts.
+        from collections import Counter
+        id_counts = Counter(unique_experts)
+
         for eid in need_to_load:
             if not reusable_slots:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "[UPDATE-W] l=%d NO SLOTS: %d experts could not be loaded, missed=%s",
-                    layer_idx, len(need_to_load) - n_copies,
-                    sorted(list(need_to_load))[n_copies:][:20])
-                break  # no free slots — should not happen in normal usage
+                # Evict least-frequently-used on-device expert to make room.
+                candidates = [e for e in on_device if e in needed]
+                if not candidates:
+                    break
+                evict_eid = min(candidates, key=lambda e: (id_counts.get(e, 0), e))
+                matching = [s for s, e in slot_owner.items() if e == evict_eid]
+                if not matching:
+                    break
+                evict_slot = matching[0]
+                log2phy[evict_eid] = -1
+                on_device.discard(evict_eid)
+                del slot_owner[evict_slot]
+                reusable_slots = [evict_slot]
             slot = reusable_slots.pop()
-            # Copy weights from CPU to NPU
-            layer.w13_weight.data[slot].copy_(
-                self.w13_weights_cpu[layer_idx][eid].to(dev).to(dt))
-            layer.w2_weight.data[slot].copy_(
-                self.w2_weights_cpu[layer_idx][eid].to(dev).to(dt))
-            # Copy scales/offsets from CPU to NPU
-            for attr_name, buffers in self.scale_cpu_buffers.items():
-                if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
-                    continue
-                dev_tensor = getattr(layer, attr_name, None)
-                if dev_tensor is None:
-                    continue
-                dev_tensor.data[slot].copy_(buffers[layer_idx][eid].to(dev))
-            for attr_name, buffers in self.offset_cpu_buffers.items():
-                if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
-                    continue
-                dev_tensor = getattr(layer, attr_name, None)
-                if dev_tensor is None:
-                    continue
-                dev_tensor.data[slot].copy_(buffers[layer_idx][eid].to(dev))
-            # Refresh derived fp32 scale if present (W8A8_DYNAMIC)
-            if hasattr(layer, 'w13_weight_scale_fp32'):
-                layer.w13_weight_scale_fp32[slot].copy_(
-                    layer.w13_weight_scale.data[slot].to(torch.float32))
-            # Update mapping
-            log2phy[slot_owner[slot]] = -1   # evict old occupant
-            log2phy[eid] = slot               # assign slot to new expert
+            reused_slots.add(slot)
+            self._copy_one_expert(layer, layer_idx, eid, slot, dev, dt)
+            # Update mapping (handle case where slot was already evicted)
+            if slot in slot_owner:
+                log2phy[slot_owner[slot]] = -1
+            log2phy[eid] = slot
             slot_owner[slot] = eid
+            # Remove old slot mapping for this expert (prevent duplicates)
+            for s in list(slot_owner.keys()):
+                if s != slot and slot_owner[s] == eid:
+                    del slot_owner[s]
+            on_device.add(eid)
             n_copies += 1
+
+        # Pool sharing: fill ALL remaining slots with the current layer's
+        # expert weights so that no slot ever holds stale data from a
+        # different layer.  Even with correct log2phy, the Ascend NZ-format
+        # fused MoE operator may access unused slots.
+        if ndl < len(self.moe_layers) and reusable_slots:
+            total_experts = len(self.w13_weights_cpu[layer_idx])
+            # Pick remaining experts ordered by routing frequency in the
+            # current batch (most frequent first, then by ID for determinism).
+            remaining_experts = sorted(
+                [e for e in range(total_experts) if e not in on_device],
+                key=lambda e: (id_counts.get(e, 0), e),
+                reverse=True)
+            for eid in remaining_experts:
+                slot = reusable_slots.pop()
+                self._copy_one_expert(layer, layer_idx, eid, slot, dev, dt)
+                log2phy[eid] = slot
+                # Remove old slot mapping for this expert (prevent duplicates)
+                for s in list(slot_owner.keys()):
+                    if slot_owner[s] == eid:
+                        del slot_owner[s]
+                slot_owner[slot] = eid
+                on_device.add(eid)
+                n_copies += 1
+                if not reusable_slots:
+                    break
 
         return n_copies
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #
     # ------------------------------------------------------------------ #
+
+    def _copy_one_expert(self, layer, layer_idx: int, eid: int,
+                         slot: int, dev, dt):
+        """Copy weights + scales + offsets for one expert from CPU to NPU."""
+        layer.w13_weight.data[slot].copy_(
+            self.w13_weights_cpu[layer_idx][eid].to(dev).to(dt))
+        layer.w2_weight.data[slot].copy_(
+            self.w2_weights_cpu[layer_idx][eid].to(dev).to(dt))
+        for attr_name, buffers in self.scale_cpu_buffers.items():
+            if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
+                continue
+            dev_tensor = getattr(layer, attr_name, None)
+            if dev_tensor is None:
+                continue
+            dev_tensor.data[slot].copy_(buffers[layer_idx][eid])
+        for attr_name, buffers in self.offset_cpu_buffers.items():
+            if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
+                continue
+            dev_tensor = getattr(layer, attr_name, None)
+            if dev_tensor is None:
+                continue
+            dev_tensor.data[slot].copy_(buffers[layer_idx][eid])
+        if hasattr(layer, 'w13_weight_scale_fp32'):
+            layer.w13_weight_scale_fp32[slot].copy_(
+                layer.w13_weight_scale.data[slot].to(torch.float32))
 
     def _drain_pending_weights(self):
         if not self._pending_weights:
