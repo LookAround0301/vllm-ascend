@@ -248,16 +248,44 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         topk_weights = topk_weights.to(self.in_dtype)
 
         # Expert offload: incrementally page in needed experts, update log2phy
+        use_prefill_pool = False
+        prefill_slot = -1
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
-            ExpertOffloadManager.get_instance().update_weights(
-                layer, topk_ids, log2phy)
+            mgr = ExpertOffloadManager.get_instance()
+            num_tokens = topk_ids.size(0)
+            mgr.update_weights(layer, topk_ids, log2phy)
+            if num_tokens > mgr.offload_threshold and mgr._prefill_initialized and not mgr._skip_prefill:
+                use_prefill_pool = True
+                try:
+                    layer_idx = mgr.moe_layers.index(layer)
+                except ValueError:
+                    layer_idx = 0
+                prefill_slot = layer_idx % len(mgr._prefill_w13)
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         fused_scale_flag = (
             _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2 and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1
         )
-        if self.dynamic_eplb:
+        if use_prefill_pool:
+            from vllm_ascend.expert_offload import ExpertOffloadManager
+            mgr = ExpertOffloadManager.get_instance()
+            w1 = [mgr._prefill_w13[prefill_slot]]
+            w1_scale = [mgr._prefill_w13_scale_fp32[prefill_slot]]
+            w2 = [mgr._prefill_w2[prefill_slot]]
+            w2_scale = [mgr._prefill_w2_scale[prefill_slot]]
+            # Override local expert count so kernel groupList matches prefill pool
+            _saved_nle = layer.moe_config.num_local_experts
+            _saved_lne = layer.local_num_experts
+            ntotal = mgr.num_total_experts
+            layer.moe_config.num_local_experts = ntotal
+            layer.local_num_experts = ntotal
+            # Also patch token dispatcher (cached with old num_experts_local)
+            _saved_td_nel = moe_comm_method.token_dispatcher.num_experts_local
+            moe_comm_method.token_dispatcher.num_experts_local = ntotal
+            # Use prefill-specific identity log2phy (don't pollute decode path)
+            log2phy = mgr._prefill_log2phy
+        elif self.dynamic_eplb:
             w1 = layer.w13_weight_list
             w1_scale = layer.fused_w1_scale_list if fused_scale_flag else layer.w13_weight_scale_fp32_list
             w2 = layer.w2_weight_list
@@ -290,6 +318,11 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
+        # Restore decode-path expert count after prefill override
+        if use_prefill_pool:
+            layer.moe_config.num_local_experts = _saved_nle
+            layer.local_num_experts = _saved_lne
+            moe_comm_method.token_dispatcher.num_experts_local = _saved_td_nel
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):

@@ -576,6 +576,7 @@ class ExpertOffloadConfig:
     _defaults = {
         "expert_offload": False,
         "num_device_experts": 32,
+        "num_device_layers": 2,
         "expert_map_path": None,
     }
 
@@ -608,6 +609,10 @@ class ExpertOffloadConfig:
             raise TypeError("num_device_experts must be an integer")
         if self.config["num_device_experts"] < 0:
             raise ValueError(f"num_device_experts must >= 0; got {self.config['num_device_experts']} instead")
+        if not isinstance(self.config["num_device_layers"], int):
+            raise TypeError("num_device_layers must be an integer")
+        if self.config["num_device_layers"] < 1:
+            raise ValueError(f"num_device_layers must >= 1; got {self.config['num_device_layers']} instead")
         if not isinstance(self.config["expert_offload"], bool):
             raise TypeError("expert_offload must be a boolean")
 

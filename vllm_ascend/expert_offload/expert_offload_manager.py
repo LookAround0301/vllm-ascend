@@ -58,9 +58,24 @@ class ExpertOffloadManager:
         # maybe_create_scale_buffers runs.
         self._pending_scales: dict[tuple, dict[str, torch.Tensor]] = {}
 
+        self.num_device_layers = self.offload_config.num_device_layers
+        self.num_total_experts = None  # set in create_weights
+
         ExpertOffloadManager._instance = self
 
         self.load_stream = torch_npu.npu.Stream()
+
+        # Prefill pool: ndl layers × all experts on NPU, shared round-robin
+        self._prefill_w13: list[torch.Tensor] = []
+        self._prefill_w2: list[torch.Tensor] = []
+        self._prefill_w13_scale: list[torch.Tensor] = []       # W8A8
+        self._prefill_w13_scale_fp32: list[torch.Tensor] = []   # W8A8
+        self._prefill_w13_offset: list[torch.Tensor] = []       # W8A8
+        self._prefill_w2_scale: list[torch.Tensor] = []         # W8A8
+        self._prefill_w2_offset: list[torch.Tensor] = []        # W8A8
+        self._prefill_log2phy: torch.Tensor = None              # identity [0..127]
+        self._prefill_initialized: bool = False
+        self._skip_prefill: bool = False  # set during profile runs
 
     # ------------------------------------------------------------------ #
     #  Lifecycle: called from NPUModelRunner during model loading         #
@@ -89,6 +104,8 @@ class ExpertOffloadManager:
             self.w13_weights_cpu.append(w13_list)
             self.w2_weights_cpu.append(w2_list)
         self._drain_pending_weights()
+
+        self.num_total_experts = num_total_experts
 
         # update weights related buffers
         self.topk_ids_h = torch.zeros([self.offload_threshold, self.topk], dtype=torch.int32, device='cpu', pin_memory=True)
@@ -252,6 +269,191 @@ class ExpertOffloadManager:
                     layer.w13_weight_scale_fp32[j].copy_(
                         layer.w13_weight_scale.data[j].to(torch.float32))
 
+    def create_prefill_pool(self):
+        """Allocate prefill pool tensors on NPU with full expert count.
+
+        Called from _register_offload_layers after decode buffers are set up.
+        Creates ndl device tensors each holding all experts (e.g. 128).
+        These are used when num_tokens > offload_threshold (large-batch
+        prefill), loaded via full-overwrite in _prefill_load_layer.
+        """
+        if self._prefill_initialized:
+            return
+        if not self.moe_layers:
+            return
+        ndl = self.num_device_layers
+        pool_layer = self.moe_layers[0]
+        dev = pool_layer.w13_weight.device
+        dt = pool_layer.w13_weight.dtype
+        ntotal = self.num_total_experts
+
+        for _ in range(ndl):
+            # w13: [ntotal, hidden_size, w13_up_dim] — match decode layer shape
+            w13_shape = (ntotal,) + tuple(pool_layer.w13_weight.shape[1:])
+            self._prefill_w13.append(
+                torch.empty(w13_shape, dtype=dt, device=dev))
+
+            # w2: [ntotal, hidden_size, intermediate_size_per_partition]
+            w2_shape = (ntotal,) + tuple(pool_layer.w2_weight.shape[1:])
+            self._prefill_w2.append(
+                torch.empty(w2_shape, dtype=dt, device=dev))
+
+            # W8A8 scale/offset (optional)
+            if hasattr(pool_layer, 'w13_weight_scale'):
+                s13_shape = (ntotal,) + tuple(pool_layer.w13_weight_scale.shape[1:])
+                self._prefill_w13_scale.append(
+                    torch.empty(s13_shape, dtype=pool_layer.w13_weight_scale.dtype, device=dev))
+            if hasattr(pool_layer, 'w13_weight_scale_fp32'):
+                fp32_13_shape = (ntotal,) + tuple(pool_layer.w13_weight_scale_fp32.shape[1:])
+                self._prefill_w13_scale_fp32.append(
+                    torch.empty(fp32_13_shape, dtype=torch.float32, device=dev))
+            if hasattr(pool_layer, 'w13_weight_offset'):
+                o13_shape = (ntotal,) + tuple(pool_layer.w13_weight_offset.shape[1:])
+                self._prefill_w13_offset.append(
+                    torch.empty(o13_shape, dtype=pool_layer.w13_weight_offset.dtype, device=dev))
+            if hasattr(pool_layer, 'w2_weight_scale'):
+                s2_shape = (ntotal,) + tuple(pool_layer.w2_weight_scale.shape[1:])
+                self._prefill_w2_scale.append(
+                    torch.empty(s2_shape, dtype=pool_layer.w2_weight_scale.dtype, device=dev))
+            if hasattr(pool_layer, 'w2_weight_offset'):
+                o2_shape = (ntotal,) + tuple(pool_layer.w2_weight_offset.shape[1:])
+                self._prefill_w2_offset.append(
+                    torch.empty(o2_shape, dtype=pool_layer.w2_weight_offset.dtype, device=dev))
+
+        # Cast prefill pool weight tensors to NZ format (W8A8 kernel requires it).
+        # Must happen BEFORE loading data — same order as decode path:
+        # create → NZ-cast → copy_(cpu → npu)
+        if dt == torch.int8:
+            from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+            for i in range(ndl):
+                self._prefill_w13[i] = torch_npu.npu_format_cast(
+                    self._prefill_w13[i], ACL_FORMAT_FRACTAL_NZ)
+                self._prefill_w2[i] = torch_npu.npu_format_cast(
+                    self._prefill_w2[i], ACL_FORMAT_FRACTAL_NZ)
+
+        # Prefill log2phy: identity — all experts mapped to their slots
+        self._prefill_log2phy = torch.arange(ntotal, dtype=torch.int32, device=dev)
+
+        # Pre-initialize all pool slots with layer 0 weights so that
+        # profile_run / _dummy_run (which may use prefill path) has
+        # valid data.  Subsequent _prefill_load_layer calls will
+        # overwrite with the correct per-layer weights.
+        self._init_prefill_pool_data(dev, ntotal, ndl)
+        self._prefill_initialized = True
+        logger.warning("[PREFILL_POOL] allocated %d layers × %d experts, "
+                       "w13[0].shape=%s w2[0].shape=%s",
+                       ndl, ntotal,
+                       tuple(self._prefill_w13[0].shape),
+                       tuple(self._prefill_w2[0].shape))
+
+    def _init_prefill_pool_data(self, dev, ntotal: int, ndl: int):
+        """Load layer 0 weights into all prefill pool slots.
+
+        Prefill pool tensors are already NZ-cast at this point (done in
+        create_prefill_pool). Use simple per-expert copy_() — same pattern
+        as the decode path's _update_weights.
+        """
+        has_scales = bool(self._prefill_w13_scale)
+        has_offsets = bool(self._prefill_w13_offset)
+
+        for slot in range(ndl):
+            for eid in range(min(ntotal, len(self.w13_weights_cpu[0]))):
+                self._prefill_w13[slot][eid].copy_(
+                    self.w13_weights_cpu[0][eid].to(dev))
+                self._prefill_w2[slot][eid].copy_(
+                    self.w2_weights_cpu[0][eid].to(dev))
+
+            # Initialize scale/offset buffers with layer 0 data (W8A8)
+            if has_scales:
+                for scale_name, prefill_list, cpu_buffers in [
+                    ("w13_weight_scale", self._prefill_w13_scale, self.scale_cpu_buffers),
+                    ("w2_weight_scale", self._prefill_w2_scale, self.scale_cpu_buffers),
+                ]:
+                    if (scale_name in cpu_buffers and
+                            0 < len(cpu_buffers[scale_name])):
+                        for eid in range(min(ntotal, len(cpu_buffers[scale_name][0]))):
+                            prefill_list[slot][eid].copy_(
+                                cpu_buffers[scale_name][0][eid].to(dev))
+            if has_offsets:
+                for offset_name, prefill_list, cpu_buffers in [
+                    ("w13_weight_offset", self._prefill_w13_offset, self.offset_cpu_buffers),
+                    ("w2_weight_offset", self._prefill_w2_offset, self.offset_cpu_buffers),
+                ]:
+                    if (offset_name in cpu_buffers and
+                            0 < len(cpu_buffers[offset_name])):
+                        for eid in range(min(ntotal, len(cpu_buffers[offset_name][0]))):
+                            prefill_list[slot][eid].copy_(
+                                cpu_buffers[offset_name][0][eid].to(dev))
+            # Initialize fp32 scale (convert from scale)
+            if has_scales and slot < len(self._prefill_w13_scale_fp32):
+                for eid in range(min(ntotal, self._prefill_w13_scale[slot].shape[0])):
+                    self._prefill_w13_scale_fp32[slot][eid].copy_(
+                        self._prefill_w13_scale[slot][eid].to(torch.float32))
+
+    def _prefill_load_layer(self, layer_idx: int, log2phy: torch.Tensor):
+        """Load ALL experts for model layer layer_idx into the prefill pool.
+
+        For W8A8: loads into normal-format scratch, then casts to NZ.
+        For unquantized: loads directly into pool tensors via copy_().
+        Full-overwrite into pool_slot = layer_idx % ndl.  No slot_owner
+        tracking needed — log2phy is set to identity for prefill.
+        """
+        ndl = self.num_device_layers
+        pool_slot = layer_idx % ndl
+        dev = self._prefill_w13[pool_slot].device
+        ntotal = self.num_total_experts
+        is_w8a8 = self._prefill_w13[pool_slot].dtype == torch.int8
+
+        import logging
+        _dbg = logging.getLogger(__name__)
+        _dbg.warning("[PREFILL_LOAD] layer=%d pool_slot=%d ntotal=%d is_w8a8=%s",
+                     layer_idx, pool_slot, ntotal, is_w8a8)
+
+        from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+
+        with torch_npu.npu.stream(self.load_stream):
+            for eid in range(ntotal):
+                self._prefill_w13[pool_slot][eid].copy_(
+                    self.w13_weights_cpu[layer_idx][eid].to(dev))
+                self._prefill_w2[pool_slot][eid].copy_(
+                    self.w2_weights_cpu[layer_idx][eid].to(dev))
+
+            # W8A8 scale/offset — load into prefill buffers
+            for scale_name, prefill_list, cpu_buffers in [
+                ("w13_weight_scale", self._prefill_w13_scale, self.scale_cpu_buffers),
+                ("w2_weight_scale", self._prefill_w2_scale, self.scale_cpu_buffers),
+            ]:
+                if pool_slot < len(prefill_list):
+                    if (scale_name in cpu_buffers and
+                            layer_idx < len(cpu_buffers[scale_name])):
+                        for eid in range(min(ntotal, len(cpu_buffers[scale_name][layer_idx]))):
+                            prefill_list[pool_slot][eid].copy_(
+                                cpu_buffers[scale_name][layer_idx][eid].to(dev))
+            for offset_name, prefill_list, cpu_buffers in [
+                ("w13_weight_offset", self._prefill_w13_offset, self.offset_cpu_buffers),
+                ("w2_weight_offset", self._prefill_w2_offset, self.offset_cpu_buffers),
+            ]:
+                if pool_slot < len(prefill_list):
+                    if (offset_name in cpu_buffers and
+                            layer_idx < len(cpu_buffers[offset_name])):
+                        for eid in range(min(ntotal, len(cpu_buffers[offset_name][layer_idx]))):
+                            prefill_list[pool_slot][eid].copy_(
+                                cpu_buffers[offset_name][layer_idx][eid].to(dev))
+
+            # Refresh fp32 scale for prefill pool
+            if (pool_slot < len(self._prefill_w13_scale_fp32) and
+                    pool_slot < len(self._prefill_w13_scale)):
+                # Copy scale data from freshly loaded scale to fp32
+                for eid in range(min(ntotal, self._prefill_w13_scale[pool_slot].shape[0])):
+                    self._prefill_w13_scale_fp32[pool_slot][eid].copy_(
+                        self._prefill_w13_scale[pool_slot][eid].to(torch.float32))
+
+            self.load_stream.synchronize()
+
+        # NOTE: Do NOT modify the layer's own log2phy here — decode path
+        # relies on it staying with 32-expert mapping.  Prefill path in
+        # apply() explicitly uses self._prefill_log2phy instead.
+
     # ------------------------------------------------------------------ #
     #  Forward path: page in experts based on topk_ids                    #
     # ------------------------------------------------------------------ #
@@ -260,23 +462,31 @@ class ExpertOffloadManager:
                         log2phy: torch.Tensor) -> int:
         """Incrementally page in needed experts, overwriting unused slots.
 
-        Only copies experts that are NOT already on device.  Experts
-        already mapped to a device slot (log2phy[eid] >= 0) are left
-        untouched.  Reusable slots come from experts not in the current
-        topk_ids set.
+        Routes to prefill pool (full-overwrite) when num_tokens exceeds
+        offload_threshold, otherwise uses per-expert paging (decode path).
 
         Args:
             layer: AscendFusedMoE instance.
             topk_ids: [num_tokens, top_k] routed expert indices.
             log2phy: [global_num_experts] CPU tensor, modified in-place.
 
-        Returns: number of CPU→NPU copies performed.
+        Returns: number of CPU→NPU copies performed (decode path),
+                 0 for prefill path (full-overwrite via pool).
         """
         num_tokens = topk_ids.size(0)
         if num_tokens > self.offload_threshold:
-            # Prefill case, should not happen, return directly
-            logger.warning(f'num_tokens = {num_tokens}, unable to do sparse moe onload, pass.')
-            return 0
+            # Prefill: layerwise reuse + full-overwrite of all experts
+            if (self._prefill_initialized
+                    and not self._skip_prefill):
+                try:
+                    layer_idx = self.moe_layers.index(layer)
+                except ValueError:
+                    return 0
+                self._prefill_load_layer(layer_idx, log2phy)
+                return 0
+            else:
+                # Profile run or pool not ready — bail out gracefully
+                return 0
 
         try:
             layer_idx = self.moe_layers.index(layer)

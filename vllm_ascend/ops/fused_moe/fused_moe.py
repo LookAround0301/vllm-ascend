@@ -167,10 +167,20 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 )
 
         # Expert offload: incrementally page in needed experts, update log2phy
+        use_prefill_pool = False
+        prefill_slot = -1
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
-            ExpertOffloadManager.get_instance().update_weights(
-                layer, topk_ids, log2phy)
+            mgr = ExpertOffloadManager.get_instance()
+            num_tokens = topk_ids.size(0)
+            mgr.update_weights(layer, topk_ids, log2phy)
+            if num_tokens > mgr.offload_threshold and mgr._prefill_initialized and not mgr._skip_prefill:
+                use_prefill_pool = True
+                try:
+                    layer_idx = mgr.moe_layers.index(layer)
+                except ValueError:
+                    layer_idx = 0
+                prefill_slot = layer_idx % len(mgr._prefill_w13)
 
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
@@ -190,26 +200,41 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
-        # NOTE: In the MoECommType.FUSED_MC2 branch, we wrap weights (w1, w2) into lists
-        # and provide dummy scales (w1_scale, w2_scale). This is required because:
-        # The underlying Ascend fused operator (e.g., dispatch_ffn_combine) expects
-        # inputs in a list format.
-        # TODO: Passing an empty tensor as scale for float (BF16) cases is semantically
-        # incorrect. The ideal solution is to pass None. However, if the underlying
-        # dispatch_ffn_combine C++ operator does not support None for the scale argument
-        # (due to signature constraints), we are forced to use a placeholder empty tensor.
-        # This TODO tracks the requirement to update the C++ operator to accept Optional[Tensor]
-        # or None for scales in non-quantized scenarios.
-        if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
-            w1 = [layer.w13_weight]
-            w1_scale = [torch.tensor([], dtype=torch.int64)]
-            w2 = [layer.w2_weight]
-            w2_scale = [torch.tensor([], dtype=torch.int64)]
+        if use_prefill_pool:
+            from vllm_ascend.expert_offload import ExpertOffloadManager
+            mgr = ExpertOffloadManager.get_instance()
+            # Override local expert count so kernel groupList matches prefill pool
+            _saved_nle = layer.moe_config.num_local_experts
+            _saved_lne = layer.local_num_experts
+            ntotal = mgr.num_total_experts
+            layer.moe_config.num_local_experts = ntotal
+            layer.local_num_experts = ntotal
+            # Also patch token dispatcher (cached with old num_experts_local)
+            _saved_td_nel = moe_comm_method.token_dispatcher.num_experts_local
+            moe_comm_method.token_dispatcher.num_experts_local = ntotal
+            # Use prefill-specific identity log2phy (don't pollute decode path)
+            log2phy = mgr._prefill_log2phy
+            if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
+                w1 = [mgr._prefill_w13[prefill_slot]]
+                w1_scale = [torch.tensor([], dtype=torch.int64)]
+                w2 = [mgr._prefill_w2[prefill_slot]]
+                w2_scale = [torch.tensor([], dtype=torch.int64)]
+            else:
+                w1 = mgr._prefill_w13[prefill_slot]
+                w1_scale = None
+                w2 = mgr._prefill_w2[prefill_slot]
+                w2_scale = None
         else:
-            w1 = layer.w13_weight
-            w1_scale = None
-            w2 = layer.w2_weight
-            w2_scale = None
+            if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
+                w1 = [layer.w13_weight]
+                w1_scale = [torch.tensor([], dtype=torch.int64)]
+                w2 = [layer.w2_weight]
+                w2_scale = [torch.tensor([], dtype=torch.int64)]
+            else:
+                w1 = layer.w13_weight
+                w1_scale = None
+                w2 = layer.w2_weight
+                w2_scale = None
 
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
@@ -235,6 +260,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
+        # Restore decode-path expert count after prefill override
+        if use_prefill_pool:
+            layer.moe_config.num_local_experts = _saved_nle
+            layer.local_num_experts = _saved_lne
+            moe_comm_method.token_dispatcher.num_experts_local = _saved_td_nel
         return final_hidden_states
 
 
@@ -396,7 +426,7 @@ class AscendFusedMoE(FusedMoE):
             from vllm_ascend.expert_offload.utils import init_log2phy_for_offload
             self.log2phy = init_log2phy_for_offload(
                 self.global_num_experts, _offload_cfg.num_device_experts)
-
+        print(f"{self.moe_instance_id=}")
         if self._expert_map is not None:
             logger.info_once(
                 "[EP Rank %s/%s] Expert parallelism is enabled. Local/global"
@@ -493,6 +523,11 @@ class AscendFusedMoE(FusedMoE):
 
         def _offload_weight_loader(param, loaded_weight, weight_name, shard_id,
                                    expert_id, **kwargs):
+            # print(f"{param=}")
+            # print(f"{loaded_weight.shape=}")
+            # print(f"{weight_name=}")
+            # print(f"{shard_id=}")
+            # print(f"{expert_id=}")
             # --- Handle scale/offset params (quantized models) ---
             if "weight_scale" in weight_name:
                 mgr._add_pending_scale(layer_moe_idx, expert_id,

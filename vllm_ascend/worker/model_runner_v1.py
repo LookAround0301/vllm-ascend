@@ -2978,13 +2978,24 @@ class NPUModelRunner(GPUModelRunner):
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
             mc2_tokens_capacity, self.vllm_config
         ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
+            # Disable prefill pool during profile run — the kernel is
+            # configured for decode expert counts and cannot handle
+            # full-expert-count prefill tensors.
+            if hasattr(self, 'offload_manager'):
+                self.offload_manager._skip_prefill = True
             self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
+            if hasattr(self, 'offload_manager'):
+                self.offload_manager._skip_prefill = False
         origin_max_num_tokens = self.max_num_tokens
         # in the pcp scenario, the split sequence needs to be used for profile run
         # TODO: after the vllm pcp function is launched, this logic needs to be brought up to the community
         if self.pcp_size > 1:
             self.max_num_tokens = math.ceil(self.max_num_tokens / (self.pcp_size * 2)) * 2
+        if hasattr(self, 'offload_manager'):
+            self.offload_manager._skip_prefill = True
         super().profile_run()
+        if hasattr(self, 'offload_manager'):
+            self.offload_manager._skip_prefill = False
         self.max_num_tokens = origin_max_num_tokens
 
     def eplb_warmup(self):
@@ -3080,8 +3091,13 @@ class NPUModelRunner(GPUModelRunner):
         t_c = time.perf_counter()
         self.offload_manager.init_device_experts()
         t_d = time.perf_counter()
-        logger.info("offload steps: create_weights=%.1fs  scale_buffers=%.1fs  init_device=%.1fs",
-                     t_b - t_a, t_c - t_b, t_d - t_c)
+        # Create prefill pool for large-batch (num_tokens > threshold) path
+        t_e = time.perf_counter()
+        self.offload_manager.create_prefill_pool()
+        t_f = time.perf_counter()
+        logger.info("offload steps: create_weights=%.1fs  scale_buffers=%.1fs  "
+                     "init_device=%.1fs  prefill_pool=%.1fs",
+                     t_b - t_a, t_c - t_b, t_d - t_c, t_f - t_e)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
