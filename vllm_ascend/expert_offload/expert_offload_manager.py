@@ -156,6 +156,8 @@ class ExpertOffloadManager:
     def process_weights_after_loading(self):
         first_w13 = self.w13_weights_cpu[0][0]
         first_w2 = self.w2_weights_cpu[0][0]
+        self.w13_expert_size_bytes = first_w13.nelement() * first_w13.element_size()
+        self.w2_expert_size_bytes = first_w2.nelement() * first_w2.element_size()
         if first_w13.dtype != torch.int8:
             return
         # for w8a8, npu weight tensor is cast to NZ format,
@@ -164,8 +166,6 @@ class ExpertOffloadManager:
         # to avoid implicit format conversion during h2d.
         num_moe_layers = len(self.w13_weights_cpu)
         num_experts = len(self.w13_weights_cpu[0])
-        self.w13_element_num = first_w13.nelement()
-        self.w2_element_num = first_w2.nelement()
         for layer_id in range(num_moe_layers):
             w13 = torch.stack(self.w13_weights_cpu[layer_id]).to('npu')
             w13_nz = torch_npu.npu_format_cast(w13, ACL_FORMAT_FRACTAL_NZ)
@@ -175,10 +175,10 @@ class ExpertOffloadManager:
             w2_nz_storage = w2_nz.untyped_storage()
             for expert_id in range(num_experts):
                 self.w13_weights_cpu[layer_id][expert_id].untyped_storage().copy_(
-                    w13_nz_storage[expert_id * self.w13_element_num : (expert_id + 1) * self.w13_element_num]
+                    w13_nz_storage[expert_id * self.w13_expert_size_bytes : (expert_id + 1) * self.w13_expert_size_bytes]
                 )
                 self.w2_weights_cpu[layer_id][expert_id].untyped_storage().copy_(
-                    w2_nz_storage[expert_id * self.w2_element_num : (expert_id + 1) * self.w2_element_num]
+                    w2_nz_storage[expert_id * self.w2_expert_size_bytes : (expert_id + 1) * self.w2_expert_size_bytes]
                 )
 
     def register_moe_layer(self, layer):
@@ -427,10 +427,10 @@ class ExpertOffloadManager:
 
         for slot in range(ndl):
             for eid in range(min(ntotal, len(self.w13_weights_cpu[0]))):
-                self._prefill_w13[slot].untyped_storage()[eid * self.w13_element_num : (eid + 1) * self.w13_element_num].copy_(
+                self._prefill_w13[slot].untyped_storage()[eid * self.w13_expert_size_bytes : (eid + 1) * self.w13_expert_size_bytes].copy_(
                     self.w13_weights_cpu[0][eid].untyped_storage()
                 )
-                self._prefill_w2[slot].untyped_storage()[eid * self.w2_element_num : (eid + 1) * self.w2_element_num].copy_(
+                self._prefill_w2[slot].untyped_storage()[eid * self.w2_expert_size_bytes : (eid + 1) * self.w2_expert_size_bytes].copy_(
                     self.w2_weights_cpu[0][eid].untyped_storage()
                 )
 
@@ -484,10 +484,10 @@ class ExpertOffloadManager:
 
         with torch_npu.npu.stream(self.load_stream):
             for eid in range(ntotal):
-                self._prefill_w13[pool_slot].untyped_storage()[eid * self.w13_element_num : (eid + 1) * self.w13_element_num].copy_(
+                self._prefill_w13[pool_slot].untyped_storage()[eid * self.w13_expert_size_bytes : (eid + 1) * self.w13_expert_size_bytes].copy_(
                     self.w13_weights_cpu[layer_idx][eid].untyped_storage()
                 )
-                self._prefill_w2[pool_slot].untyped_storage()[eid * self.w2_element_num : (eid + 1) * self.w2_element_num].copy_(
+                self._prefill_w2[pool_slot].untyped_storage()[eid * self.w2_expert_size_bytes : (eid + 1) * self.w2_expert_size_bytes].copy_(
                     self.w2_weights_cpu[layer_idx][eid].untyped_storage()
                 )
 
@@ -678,10 +678,10 @@ class ExpertOffloadManager:
                         sorted(list(need_to_load))[n_copies:][:20])
                     break  # no free slots — should not happen in normal usage
                 # Copy weights from CPU to NPU
-                layer.w13_weight.data.untyped_storage()[slot * self.w13_element_num : (slot + 1) * self.w13_element_num].copy_(
+                layer.w13_weight.data.untyped_storage()[slot * self.w13_expert_size_bytes : (slot + 1) * self.w13_expert_size_bytes].copy_(
                     self.w13_weights_cpu[layer_idx][eid].untyped_storage()
                 )
-                layer.w2_weight.data.untyped_storage()[slot * self.w2_element_num : (slot + 1) * self.w2_element_num].copy_(
+                layer.w2_weight.data.untyped_storage()[slot * self.w2_expert_size_bytes : (slot + 1) * self.w2_expert_size_bytes].copy_(
                     self.w2_weights_cpu[layer_idx][eid].untyped_storage()
                 )
                 # Copy scales/offsets from CPU to NPU
