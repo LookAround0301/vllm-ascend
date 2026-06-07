@@ -120,6 +120,11 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.eplb.utils import model_register
+from vllm_ascend.expert_offload.expert_offload_manager import (
+    maybe_init_expert_offload_manager,
+    has_expert_offload_manager,
+    get_expert_offload_manager,
+)
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -291,6 +296,12 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+
+        if self.ascend_config.expert_offload_config.expert_offload:
+            maybe_init_expert_offload_manager(self.vllm_config)
+            if has_expert_offload_manager():
+                self.offload_manager = get_expert_offload_manager()
+
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
@@ -3276,13 +3287,24 @@ class NPUModelRunner(GPUModelRunner):
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
             mc2_tokens_capacity, self.vllm_config
         ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
+            # Disable prefill pool during profile run — the kernel is
+            # configured for decode expert counts and cannot handle
+            # full-expert-count prefill tensors.
+            if hasattr(self, 'offload_manager'):
+                self.offload_manager._skip_prefill = True
             self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
+            if hasattr(self, 'offload_manager'):
+                self.offload_manager._skip_prefill = False
         origin_max_num_tokens = self.max_num_tokens
         # in the pcp scenario, the split sequence needs to be used for profile run
         # TODO: after the vllm pcp function is launched, this logic needs to be brought up to the community
         if self.pcp_size > 1:
             self.max_num_tokens = math.ceil(self.max_num_tokens / (self.pcp_size * 2)) * 2
+        if hasattr(self, 'offload_manager'):
+            self.offload_manager._skip_prefill = True
         super().profile_run()
+        if hasattr(self, 'offload_manager'):
+            self.offload_manager._skip_prefill = False
         self.max_num_tokens = origin_max_num_tokens
 
     def eplb_warmup(self):
@@ -3311,6 +3333,8 @@ class NPUModelRunner(GPUModelRunner):
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            if hasattr(self, 'offload_manager'):
+                self._register_offload_layers()
             if self.dynamic_eplb:
                 model_register(self.model)
             if self.drafter:
@@ -3364,6 +3388,41 @@ class NPUModelRunner(GPUModelRunner):
             self._debugger_started = False
 
         self.debugger.step(**kwargs)
+
+    def _register_offload_layers(self):
+        """Find all AscendFusedMoE layers and register with ExpertOffloadManager."""
+        from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
+
+        moe_layers = [m for m in self.model.modules()
+                      if isinstance(m, AscendFusedMoE)]
+        if not moe_layers:
+            return
+        first = moe_layers[0]
+        w13_up_dim = (first.w13_weight.shape[2] if hasattr(first, 'w13_weight')
+                      else first.intermediate_size_per_partition * 2)
+        t_a = time.perf_counter()
+        self.offload_manager.create_weights(
+            num_moe_layers=len(moe_layers),
+            num_total_experts=first.global_num_experts,
+            w13_up_dim=w13_up_dim,
+            hidden_size=first.hidden_size,
+            intermediate_size_per_partition=first.intermediate_size_per_partition,
+            params_dtype=first.w13_weight.data.dtype,
+        )
+        t_b = time.perf_counter()
+        for i, layer in enumerate(moe_layers):
+            self.offload_manager.register_moe_layer(layer)
+            self.offload_manager.maybe_create_scale_buffers(layer, i)
+        t_c = time.perf_counter()
+        self.offload_manager.init_device_experts()
+        t_d = time.perf_counter()
+        # Create prefill pool for large-batch (num_tokens > threshold) path
+        t_e = time.perf_counter()
+        self.offload_manager.create_prefill_pool()
+        t_f = time.perf_counter()
+        logger.info("offload steps: create_weights=%.1fs  scale_buffers=%.1fs  "
+                     "init_device=%.1fs  prefill_pool=%.1fs",
+                     t_b - t_a, t_c - t_b, t_d - t_c, t_f - t_e)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
