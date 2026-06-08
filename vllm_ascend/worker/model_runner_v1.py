@@ -3419,6 +3419,7 @@ class NPUModelRunner(GPUModelRunner):
         # Create prefill pool for large-batch (num_tokens > threshold) path
         t_e = time.perf_counter()
         self.offload_manager.create_prefill_pool()
+        self.offload_manager.register_gate_copies()
         t_f = time.perf_counter()
         logger.info("offload steps: create_weights=%.1fs  scale_buffers=%.1fs  "
                      "init_device=%.1fs  prefill_pool=%.1fs",

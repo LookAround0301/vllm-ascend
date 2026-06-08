@@ -257,6 +257,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             mgr = ExpertOffloadManager.get_instance()
             num_tokens = topk_ids.size(0)
             mgr.update_weights(layer, topk_ids, log2phy, topk_weights)
+            mgr.lookahead_after_update_weights(layer, num_tokens)
             if num_tokens > mgr.offload_threshold and mgr._prefill_initialized and not mgr._skip_prefill:
                 use_prefill_pool = True
                 try:

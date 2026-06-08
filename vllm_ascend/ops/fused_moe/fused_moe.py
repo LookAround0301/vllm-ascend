@@ -188,6 +188,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             mgr = ExpertOffloadManager.get_instance()
             num_tokens = topk_ids.size(0)
             mgr.update_weights(layer, topk_ids, log2phy, topk_weights)
+            mgr.lookahead_after_update_weights(layer, num_tokens)
             if num_tokens > mgr.offload_threshold and mgr._prefill_initialized and not mgr._skip_prefill:
                 use_prefill_pool = True
                 try:
@@ -693,6 +694,10 @@ class AscendFusedMoE(FusedMoE):
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
     ) -> torch.Tensor | FusedMoEResult:
         assert self.quant_method is not None
+
+        if getattr(self, "enable_expert_offload", False):
+            from vllm_ascend.expert_offload import ExpertOffloadManager
+            ExpertOffloadManager.get_instance().lookahead_forward_entry(self, hidden_states)
 
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice (compilation + capture),
