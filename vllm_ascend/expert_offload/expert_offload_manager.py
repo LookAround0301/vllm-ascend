@@ -6,6 +6,7 @@ from vllm.config import VllmConfig
 from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.expert_offload.gate_registry import GateLookaheadRegistry
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
@@ -87,6 +88,116 @@ class ExpertOffloadManager:
         self._prefill_initialized: bool = False
         self._skip_prefill: bool = False  # set during profile runs
 
+        # Lookahead prefetch: predict next-layer experts and H2D on load_stream
+        self.gate_registry: GateLookaheadRegistry | None = None
+        self.log2phy_staging_per_layer: list[torch.Tensor] = []
+        self._lookahead_pending: dict[int, set[int]] = {}
+        self._lookahead_prefetch_pending: set[int] = set()
+        if self.offload_config.lookahead_prefetch_enabled:
+            self.gate_registry = GateLookaheadRegistry()
+
+    def lookahead_enabled(self) -> bool:
+        return (
+            self.offload_config.lookahead_prefetch_enabled
+            and self.gate_registry is not None
+            and bool(self.moe_layers)
+        )
+
+    def _lookahead_active(self, num_tokens: int) -> bool:
+        return (
+            self.lookahead_enabled()
+            and num_tokens <= self.offload_threshold
+            and not self._skip_prefill
+            and not _EXTRA_CTX.capturing
+        )
+
+    def register_gate_copies(self) -> None:
+        if self.gate_registry is not None and self.moe_layers:
+            self.gate_registry.register_from_moe_layers(self.moe_layers)
+
+    def maybe_wait_lookahead_prefetch(self, layer, num_tokens: int) -> None:
+        """Wait for a prior layer's async prefetch targeting this layer."""
+        if not self._lookahead_active(num_tokens):
+            return
+        try:
+            layer_idx = self.moe_layers.index(layer)
+        except ValueError:
+            return
+        if layer_idx not in self._lookahead_prefetch_pending:
+            return
+        self.load_stream.synchronize()
+        dst_layer = self.moe_layers[layer_idx]
+        staging = self.log2phy_staging_per_layer[layer_idx]
+        dst_layer.log2phy.copy_(staging, non_blocking=False)
+        self._lookahead_prefetch_pending.discard(layer_idx)
+
+    def maybe_schedule_lookahead_prediction(
+        self,
+        src_layer,
+        hidden_states: torch.Tensor,
+        num_tokens: int,
+    ) -> None:
+        """Predict next-layer experts using the destination gate copy."""
+        if not self._lookahead_active(num_tokens):
+            return
+        try:
+            src_idx = self.moe_layers.index(src_layer)
+        except ValueError:
+            return
+        dst_idx = src_idx + 1
+        if dst_idx >= len(self.moe_layers):
+            return
+        assert self.gate_registry is not None
+        predicted = self.gate_registry.predict_expert_ids(dst_idx, hidden_states)
+        if predicted:
+            self._lookahead_pending[dst_idx] = predicted
+
+    def maybe_submit_lookahead_prefetch(self, src_layer, num_tokens: int) -> None:
+        """Queue async H2D for the next layer after the current layer pages weights."""
+        if not self._lookahead_active(num_tokens):
+            return
+        try:
+            src_idx = self.moe_layers.index(src_layer)
+        except ValueError:
+            return
+        dst_idx = src_idx + 1
+        needed = self._lookahead_pending.pop(dst_idx, None)
+        if not needed:
+            return
+
+        dst_layer = self.moe_layers[dst_idx]
+        staging = self.log2phy_staging_per_layer[dst_idx]
+        staging.copy_(dst_layer.log2phy, non_blocking=False)
+        log2phy_np = staging.numpy()
+
+        on_device = {eid for eid, slot in enumerate(log2phy_np) if slot >= 0}
+        if needed.issubset(on_device):
+            return
+
+        prefetch_topk = torch.tensor(
+            [sorted(needed)], dtype=torch.int32, device="cpu", pin_memory=True)
+        self._update_weights((
+            prefetch_topk,
+            log2phy_np,
+            dst_layer,
+            dst_idx,
+            None,
+            False,
+        ))
+        self._lookahead_prefetch_pending.add(dst_idx)
+
+    def lookahead_forward_entry(self, layer, hidden_states: torch.Tensor) -> None:
+        if not self.lookahead_enabled():
+            return
+        num_tokens = hidden_states.shape[0]
+        self.maybe_wait_lookahead_prefetch(layer, num_tokens)
+        self.maybe_schedule_lookahead_prediction(layer, hidden_states, num_tokens)
+
+    def lookahead_after_update_weights(self, layer, num_tokens: int) -> None:
+        if not self.lookahead_enabled():
+            return
+        self.maybe_submit_lookahead_prefetch(layer, num_tokens)
+
     # ------------------------------------------------------------------ #
     #  Lifecycle: called from NPUModelRunner during model loading         #
     # ------------------------------------------------------------------ #
@@ -152,6 +263,11 @@ class ExpertOffloadManager:
         )
         self.log2phy_h = torch.zeros(num_total_experts, dtype=torch.int32, device='cpu', pin_memory=True)
         self.log2phy_np = self.log2phy_h.numpy()
+        if self.offload_config.lookahead_prefetch_enabled:
+            self.log2phy_staging_per_layer = [
+                torch.zeros(num_total_experts, dtype=torch.int32, device="cpu", pin_memory=True)
+                for _ in range(num_moe_layers)
+            ]
 
     def process_weights_after_loading(self):
         first_w13 = self.w13_weights_cpu[0][0]
@@ -603,15 +719,26 @@ class ExpertOffloadManager:
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
     
     def _update_weights(self, args):
-        (
-            topk_ids_h,
-            log2phy_np,
-            layer,
-            layer_idx,
-            topk_weights_h,
-        ) = args
+        sync_at_end = True
+        if len(args) == 6:
+            (
+                topk_ids_h,
+                log2phy_np,
+                layer,
+                layer_idx,
+                topk_weights_h,
+                sync_at_end,
+            ) = args
+        else:
+            (
+                topk_ids_h,
+                log2phy_np,
+                layer,
+                layer_idx,
+                topk_weights_h,
+            ) = args
         with torch_npu.npu.stream(self.load_stream):
-            if self.cache_policy is not None:
+            if sync_at_end and self.cache_policy is not None:
                 router_scores = topk_weights_h.tolist() if topk_weights_h is not None else None
                 needed = self.cache_policy.observe(
                     layer_idx,
@@ -619,7 +746,7 @@ class ExpertOffloadManager:
                     router_scores=router_scores,
                 )
             else:
-                needed = set(topk_ids_h.unique().tolist())
+                needed = set(topk_ids_h.reshape(-1).tolist())
 
             # Build reverse map: slot → expert_id currently occupying it
             slot_owner: dict[int, int] = {}
@@ -630,12 +757,12 @@ class ExpertOffloadManager:
             on_device = set(slot_owner.values())
             already_there = needed & on_device           # no-op
             need_to_load = needed - already_there          # CPU→NPU copy
-            if self.cache_policy is not None:
+            if sync_at_end and self.cache_policy is not None:
                 self._record_cache_stats(layer_idx, already_there, need_to_load, needed, on_device)
             reusable_slots = [s for s, e in slot_owner.items()
                             if e not in needed]          # slots to recycle
 
-            if self.cache_policy is not None and self._debug_update_weights:
+            if sync_at_end and self.cache_policy is not None and self._debug_update_weights:
                 import logging
                 _dbg = logging.getLogger(__name__)
                 _dbg.warning(
@@ -653,7 +780,6 @@ class ExpertOffloadManager:
                                 layer_idx, len(need_to_load), len(reusable_slots),
                                 sorted(need_to_load)[:20])
 
-            dev = layer.w13_weight.device
             n_copies = 0
             for eid in need_to_load:
                 if self.cache_policy is not None:
@@ -713,7 +839,8 @@ class ExpertOffloadManager:
                     reusable_slots.remove(slot)
                 n_copies += 1
 
-            self.load_stream.synchronize()
+            if sync_at_end:
+                self.load_stream.synchronize()
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #
