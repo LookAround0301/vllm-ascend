@@ -186,7 +186,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
             num_tokens = topk_ids.size(0)
-            mgr.update_weights(layer, topk_ids, log2phy, topk_weights)
+            mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
+                               hidden_states=x)
             if num_tokens > mgr.offload_threshold and mgr._prefill_initialized and not mgr._skip_prefill:
                 use_prefill_pool = True
                 try:
@@ -299,6 +300,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
+        # Trigger next-layer expert prefetch AFTER GMM kernel submission
+        # so compute_event captures real GMM work for true overlap.
+        if getattr(layer, 'enable_expert_offload', False) and not use_prefill_pool:
+            mgr.trigger_next_layer_prefetch(layer, x)
         # Restore decode-path expert count after prefill override
         if use_prefill_pool:
             layer.moe_config.num_local_experts = _saved_nle

@@ -791,6 +791,7 @@ class ExpertOffloadConfig:
         "cache_age_weight": 0.01,
         "cache_stats_log_interval": 1000,
         "cache_debug_log_updates": False,
+        "expert_prefetch_enabled": False,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -851,6 +852,8 @@ class ExpertOffloadConfig:
             raise ValueError("cache_stats_log_interval must >= 0")
         if not isinstance(self.config["cache_debug_log_updates"], bool):
             raise TypeError("cache_debug_log_updates must be a boolean")
+        if not isinstance(self.config["expert_prefetch_enabled"], bool):
+            raise TypeError("expert_prefetch_enabled must be a boolean")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

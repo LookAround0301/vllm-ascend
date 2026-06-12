@@ -1,7 +1,12 @@
 """Expert Offload Manager — manages CPU-side expert weights and NPU paging."""
 
+import queue
+import threading
+import time
+
 import torch
 import torch_npu
+import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.logger import logger
 
@@ -86,6 +91,20 @@ class ExpertOffloadManager:
         self._prefill_log2phy: torch.Tensor = None              # identity [0..127]
         self._prefill_initialized: bool = False
         self._skip_prefill: bool = False  # set during profile runs
+
+        # Next-layer expert prefetch infrastructure
+        self._prefetch_stream = torch_npu.npu.Stream()
+        self._gate_weights_cpu: list[torch.Tensor | None] = []
+
+        # Threaded prefetch: daemon thread processes prefetch requests
+        # so the main forward-pass thread is never blocked by H2D copies.
+        self._prefetch_queue: queue.Queue = queue.Queue()
+        self._prefetch_thread_ready: threading.Event = threading.Event()
+        self._prefetch_state_lock = threading.Lock()
+        self._prefetch_layer_done: dict[int, threading.Event] = {}
+        self._prefetch_layer_npu_event: dict[int, torch_npu.npu.Event] = {}
+        self._prefetch_thread: threading.Thread | None = None
+        self._npu_device: torch.device | None = None
 
     # ------------------------------------------------------------------ #
     #  Lifecycle: called from NPUModelRunner during model loading         #
@@ -183,6 +202,22 @@ class ExpertOffloadManager:
 
     def register_moe_layer(self, layer):
         self.moe_layers.append(layer)
+
+    def register_gate_weights(self, model):
+        """Store fp32 CPU copies of gate.weight for each MoE layer.
+
+        Called from _register_offload_layers() after all MoE layers are
+        registered.  The gate weights are used by predict_next_layer_experts()
+        to predict which experts the next layer will need.
+        """
+        from vllm_ascend.models.deepseek_v4 import DeepseekV4MoE
+        moe_wrappers = [m for m in model.modules()
+                        if isinstance(m, DeepseekV4MoE)]
+        for wrapper in moe_wrappers:
+            gate_cpu = wrapper.gate.weight.data.cpu().float().clone()
+            self._gate_weights_cpu.append(gate_cpu)
+        logger.info("[PREFETCH] registered gate weights for %d MoE layers",
+                    len(self._gate_weights_cpu))
 
     def load_w13(self, layer_moe_idx: int, expert_id: int,
                  loaded_weight: torch.Tensor, shard_id: str):
@@ -533,7 +568,8 @@ class ExpertOffloadManager:
 
     def update_weights(self, layer, topk_ids: torch.Tensor,
                         log2phy: torch.Tensor,
-                        topk_weights: torch.Tensor | None = None) -> int:
+                        topk_weights: torch.Tensor | None = None,
+                        hidden_states: torch.Tensor | None = None) -> int:
         """Incrementally page in needed experts, overwriting unused slots.
 
         Routes to prefill pool (full-overwrite) when num_tokens exceeds
@@ -543,6 +579,9 @@ class ExpertOffloadManager:
             layer: AscendFusedMoE instance.
             topk_ids: [num_tokens, top_k] routed expert indices.
             log2phy: [global_num_experts] CPU tensor, modified in-place.
+            topk_weights: Optional routing weights for cache policy.
+            hidden_states: Optional [num_tokens, hidden_dim] tensor used
+                           for next-layer expert prefetch prediction.
 
         Returns: number of CPU→NPU copies performed (decode path),
                  0 for prefill path (full-overwrite via pool).
@@ -566,6 +605,18 @@ class ExpertOffloadManager:
             layer_idx = self.moe_layers.index(layer)
         except ValueError:
             return 0
+
+        # Wait for any pending threaded prefetch for this layer to complete
+        layer_done = self._prefetch_layer_done.get(layer_idx)
+        if layer_done is not None:
+            layer_done.wait()           # Block until prefetch thread finishes
+            layer_done.clear()
+            del self._prefetch_layer_done[layer_idx]
+            with self._prefetch_state_lock:
+                npu_event = self._prefetch_layer_npu_event.pop(layer_idx,
+                                                                None)
+            if npu_event is not None:
+                npu_event.synchronize()  # Block until NPU DMA copies complete
 
         topk_ids_h = self.topk_ids_h[:num_tokens]
         topk_weights_h = None
@@ -601,7 +652,7 @@ class ExpertOffloadManager:
             self._update_weights(args)
 
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
-    
+
     def _update_weights(self, args):
         (
             topk_ids_h,
@@ -638,16 +689,16 @@ class ExpertOffloadManager:
             if self.cache_policy is not None and self._debug_update_weights:
                 import logging
                 _dbg = logging.getLogger(__name__)
-                _dbg.warning(
-                    "[UPDATE-W] l=%d call=%d topk_shape=%s |needed|=%d |on_dev|=%d "
-                    "|to_load|=%d reusable=%d needed=%s",
-                    layer_idx, self.cache_calls[layer_idx], tuple(topk_ids_h.shape),
-                    len(needed), len(on_device),
-                    len(need_to_load), len(reusable_slots),
-                    sorted(needed)[:30],
-                )
-                _dbg.warning("[UPDATE-W] l=%d cache_hit=%s cache_miss=%s",
-                             layer_idx, sorted(already_there), sorted(need_to_load))
+                # _dbg.warning(
+                #     "[UPDATE-W] l=%d call=%d topk_shape=%s |needed|=%d |on_dev|=%d "
+                #     "|to_load|=%d reusable=%d needed=%s",
+                #     layer_idx, self.cache_calls[layer_idx], tuple(topk_ids_h.shape),
+                #     len(needed), len(on_device),
+                #     len(need_to_load), len(reusable_slots),
+                #     sorted(needed)[:30],
+                # )
+                _dbg.warning("[UPDATE-W] l=%d cache_hit=%s cache_miss=%s hit_rate=%.2f",
+                             layer_idx, sorted(already_there), sorted(need_to_load),len(already_there) / 6)
                 if need_to_load and len(need_to_load) > len(reusable_slots):
                     _dbg.warning("[UPDATE-W] l=%d SHORTFALL: need %d load but only %d slots, to_load=%s",
                                 layer_idx, len(need_to_load), len(reusable_slots),
@@ -714,6 +765,275 @@ class ExpertOffloadManager:
                 n_copies += 1
 
             self.load_stream.synchronize()
+
+    # ------------------------------------------------------------------ #
+    #  Next-layer expert prefetch                                          #
+    # ------------------------------------------------------------------ #
+
+    def predict_next_layer_experts(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+    ) -> set[int] | None:
+        """Predict which experts layer layer_idx+1 will need.
+
+        Uses the current layer's hidden_states as an approximation of
+        the next layer's input, multiplied by the next layer's gate weight
+        to get predicted router logits.  A simplified softmax + topk is
+        used instead of the full grouped_topk for speed; misses are
+        handled by the reactive fallback in update_weights().
+
+        Args:
+            layer_idx: Current layer index.
+            hidden_states: [num_tokens, hidden_dim] NPU tensor.
+
+        Returns:
+            Set of predicted expert IDs, or None if prediction is not
+            possible (e.g. last layer, no gate weight).
+        """
+        next_idx = layer_idx + 1
+        if next_idx >= len(self.moe_layers):
+            return None  # last layer — nothing to prefetch
+
+        if next_idx >= len(self._gate_weights_cpu):
+            return None
+        gate_w = self._gate_weights_cpu[next_idx]
+        if gate_w is None:
+            return None
+
+        # Move hidden_states to CPU for prediction (tiny in decode: 1-8 tokens)
+        hs_cpu = hidden_states.float().cpu()
+        router_logits = F.linear(hs_cpu, gate_w)  # [num_tokens, n_experts]
+
+        # Simplified routing: softmax + topk (approximation)
+        probs = router_logits.softmax(dim=-1)
+        _, topk_ids = probs.topk(self.topk, dim=-1)
+        return set(topk_ids.flatten().tolist())
+
+    # ------------------------------------------------------------------ #
+    #  Threaded prefetch: background thread for expert weight loading     #
+    # ------------------------------------------------------------------ #
+
+    def _start_prefetch_thread(self):
+        """Start the background prefetch thread (called once, lazily)."""
+        self._npu_device = torch_npu.npu.current_stream().device
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_worker,
+            daemon=True,
+            name="ExpertPrefetch",
+        )
+        self._prefetch_thread.start()
+        self._prefetch_thread_ready.wait()
+
+    def _prefetch_worker(self):
+        """Background thread: processes prefetch requests from the queue.
+
+        Each request is a tuple of (layer_idx, hidden_states, compute_event).
+        The thread waits for the current layer's GMM kernel to complete
+        (via compute_event), then predicts the next layer's needed experts
+        and loads them from CPU to NPU.
+        """
+        torch.npu.set_device(self._npu_device)
+        self._prefetch_thread_ready.set()
+
+        while True:
+            request = self._prefetch_queue.get()
+            if request is None:
+                break
+
+            layer_idx, hidden_states, compute_event = request
+            next_idx = layer_idx + 1
+
+            # Wait for current layer's GMM kernel to complete before
+            # reading hidden_states and touching next layer's weights.
+            compute_event.synchronize()
+
+            # Predict which experts the next layer needs
+            predicted = self.predict_next_layer_experts(layer_idx,
+                                                        hidden_states)
+            if predicted is None or next_idx >= len(self.moe_layers):
+                # No prediction possible — signal done immediately
+                done = self._prefetch_layer_done.get(next_idx)
+                if done is not None:
+                    done.set()
+                continue
+
+            # Execute the prefetch (H2D copies)
+            completion_event = self._do_prefetch(next_idx, predicted)
+
+            # Store NPU completion event and signal threading.Event
+            with self._prefetch_state_lock:
+                if completion_event is not None:
+                    self._prefetch_layer_npu_event[next_idx] = completion_event
+            done = self._prefetch_layer_done.get(next_idx)
+            if done is not None:
+                done.set()
+
+    def _do_prefetch(
+        self,
+        next_idx: int,
+        predicted_experts: set[int],
+    ) -> torch_npu.npu.Event | None:
+        """Load predicted experts for layer next_idx from CPU to NPU.
+
+        Runs on the prefetch thread using self._prefetch_stream.
+        Returns an NPU Event that signals when all copies are complete,
+        or None if no copies were needed.
+        """
+        next_layer = self.moe_layers[next_idx]
+
+        # Snapshot next layer's current log2phy to CPU
+        log2phy_np = next_layer.log2phy.cpu().numpy().copy()
+
+        # Determine which predicted experts are not already on device
+        slot_owner: dict[int, int] = {}
+        for eid, slot in enumerate(log2phy_np):
+            if slot >= 0:
+                slot_owner[slot] = eid
+        on_device = set(slot_owner.values())
+        need_to_load = predicted_experts - on_device
+
+        if not need_to_load:
+            return None
+
+        # Protected set: experts we must not evict
+        protected = set(predicted_experts)
+        reusable_slots = [s for s, e in slot_owner.items()
+                          if e not in protected]
+        if not reusable_slots:
+            return None  # all resident experts are protected — skip
+
+        with torch_npu.npu.stream(self._prefetch_stream):
+            for eid in need_to_load:
+                # Use cache_policy.choose_victim() for eviction, same as
+                # _update_weights.  Pass next_idx so it queries L+1's
+                # hotness statistics.
+                if self.cache_policy is not None:
+                    victim = self.cache_policy.choose_victim(
+                        next_idx,
+                        slot_owner,
+                        protected=protected,
+                        loading=need_to_load,
+                    )
+                    slot = (int(log2phy_np[victim])
+                            if victim is not None else -1)
+                elif reusable_slots:
+                    slot = reusable_slots.pop()
+                    victim = slot_owner[slot]
+                else:
+                    slot = -1
+                    victim = None
+
+                if slot < 0:
+                    logger.warning(
+                        "[PREFETCH] l=%d NO SLOTS: %d experts could not "
+                        "be prefetched", next_idx - 1, next_idx,
+                        len(need_to_load))
+                    break
+
+                # CPU → NPU async copy w13 weights
+                next_layer.w13_weight.data.untyped_storage()[
+                    slot * self.w13_expert_size_bytes
+                    : (slot + 1) * self.w13_expert_size_bytes
+                ].copy_(
+                    self.w13_weights_cpu[next_idx][eid].untyped_storage())
+
+                time.sleep(0.00025)  # 0.25ms delay
+
+                # CPU → NPU async copy w2 weights
+                next_layer.w2_weight.data.untyped_storage()[
+                    slot * self.w2_expert_size_bytes
+                    : (slot + 1) * self.w2_expert_size_bytes
+                ].copy_(
+                    self.w2_weights_cpu[next_idx][eid].untyped_storage())
+
+                # Copy scales/offsets from CPU to NPU (W8A8)
+                for attr_name, buffers in self.scale_cpu_buffers.items():
+                    if next_idx >= len(buffers):
+                        continue
+                    if eid >= len(buffers[next_idx]):
+                        continue
+                    dev_tensor = getattr(next_layer, attr_name, None)
+                    if dev_tensor is not None:
+                        dev_tensor.data[slot].copy_(
+                            buffers[next_idx][eid])
+                for attr_name, buffers in self.offset_cpu_buffers.items():
+                    if next_idx >= len(buffers):
+                        continue
+                    if eid >= len(buffers[next_idx]):
+                        continue
+                    dev_tensor = getattr(next_layer, attr_name, None)
+                    if dev_tensor is not None:
+                        dev_tensor.data[slot].copy_(
+                            buffers[next_idx][eid])
+
+                # Refresh fp32 scale (W8A8_DYNAMIC)
+                if hasattr(next_layer, 'w13_weight_scale_fp32'):
+                    next_layer.w13_weight_scale_fp32[slot].copy_(
+                        next_layer.w13_weight_scale.data[slot].to(
+                            torch.float32))
+
+                # Update log2phy mapping
+                if victim is None:
+                    victim = slot_owner[slot]
+                log2phy_np[victim] = -1
+                log2phy_np[eid] = slot
+                slot_owner[slot] = eid
+                if slot in reusable_slots:
+                    reusable_slots.remove(slot)
+
+            # Write modified log2phy back to next layer's NPU tensor
+            next_layer.log2phy.copy_(
+                torch.from_numpy(log2phy_np).to(
+                    device=next_layer.log2phy.device))
+
+            # Record prefetch completion event
+            completion_event = torch_npu.npu.Event()
+            self._prefetch_stream.record_event(completion_event)
+            return completion_event
+
+    def trigger_next_layer_prefetch(self, layer,
+                                    hidden_states: torch.Tensor):
+        """在 GMM kernel 提交后触发下一层专家预加载。
+
+        必须在 fused_experts() 之后调用，使 compute_event 捕获
+        GMM kernel 的 NPU 工作，实现预加载与计算的真正并行。
+
+        将预测和 H2D 拷贝提交到后台线程，主线程立即返回，
+        不被 aclrtMemcpy 阻塞。
+
+        Args:
+            layer: 当前 MoE 层的 AscendFusedMoE 实例。
+            hidden_states: [num_tokens, hidden_dim] NPU tensor。
+        """
+        if not self.offload_config.expert_prefetch_enabled:
+            return
+        if _EXTRA_CTX.capturing:
+            return
+
+        # Lazy-start the prefetch thread on first call
+        if self._prefetch_thread is None:
+            self._start_prefetch_thread()
+
+        try:
+            layer_idx = self.moe_layers.index(layer)
+        except ValueError:
+            return
+
+        next_idx = layer_idx + 1
+        if next_idx >= len(self.moe_layers):
+            return
+
+        # Record compute event on main thread's compute stream
+        # (captures GMM kernel progress so prefetch waits for it)
+        compute_event = torch_npu.npu.Event()
+        torch_npu.npu.current_stream().record_event(compute_event)
+
+        # Create per-layer threading.Event for completion signaling
+        self._prefetch_layer_done[next_idx] = threading.Event()
+
+        # Submit to background thread — returns immediately!
+        self._prefetch_queue.put((layer_idx, hidden_states, compute_event))
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #

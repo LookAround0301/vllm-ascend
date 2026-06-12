@@ -3728,6 +3728,9 @@ class NPUModelRunner(GPUModelRunner):
         t_e = time.perf_counter()
         self.offload_manager.create_prefill_pool()
         t_f = time.perf_counter()
+        # Register gate weights for next-layer expert prefetch prediction
+        if self.offload_manager.offload_config.expert_prefetch_enabled:
+            self.offload_manager.register_gate_weights(self.model)
         logger.info("offload steps: create_weights=%.1fs  scale_buffers=%.1fs  "
                      "init_device=%.1fs  prefill_pool=%.1fs",
                      t_b - t_a, t_c - t_b, t_d - t_c, t_f - t_e)
