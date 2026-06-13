@@ -3639,7 +3639,7 @@ class NPUModelRunner(GPUModelRunner):
                     self._has_sinks = True
                     break
             if hasattr(self, 'offload_manager'):
-                self._register_offload_layers()
+                self._finalize_offload_setup()
             if self.dynamic_eplb:
                 model_register(self.model)
             if self.drafter:
@@ -3697,43 +3697,12 @@ class NPUModelRunner(GPUModelRunner):
 
         self.debugger.step(**kwargs)
 
-    def _register_offload_layers(self):
-        """Find all AscendFusedMoE layers and register with ExpertOffloadManager."""
-        from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
-
-        moe_layers = [m for m in self.model.modules()
-                      if isinstance(m, AscendFusedMoE)]
-        if not moe_layers:
-            return
-        first = moe_layers[0]
-        w13_up_dim = (first.w13_weight.shape[2] if hasattr(first, 'w13_weight')
-                      else first.intermediate_size_per_partition * 2)
+    def _finalize_offload_setup(self):
+        """Post-weight-loading finalization for expert offload."""
         t_a = time.perf_counter()
-        self.offload_manager.create_weights(
-            num_moe_layers=len(moe_layers),
-            num_total_experts=first.global_num_experts,
-            w13_up_dim=w13_up_dim,
-            hidden_size=first.hidden_size,
-            intermediate_size_per_partition=first.intermediate_size_per_partition,
-            params_dtype=first.w13_weight.data.dtype,
-        )
+        self.offload_manager._finalize_offload(self.model)
         t_b = time.perf_counter()
-        for i, layer in enumerate(moe_layers):
-            self.offload_manager.register_moe_layer(layer)
-            self.offload_manager.maybe_create_scale_buffers(layer, i)
-        t_c = time.perf_counter()
-        self.offload_manager.init_device_experts()
-        t_d = time.perf_counter()
-        # Create prefill pool for large-batch (num_tokens > threshold) path
-        t_e = time.perf_counter()
-        self.offload_manager.create_prefill_pool()
-        t_f = time.perf_counter()
-        # Register gate weights for next-layer expert prefetch prediction
-        if self.offload_manager.offload_config.expert_prefetch_enabled:
-            self.offload_manager.register_gate_weights(self.model)
-        logger.info("offload steps: create_weights=%.1fs  scale_buffers=%.1fs  "
-                     "init_device=%.1fs  prefill_pool=%.1fs",
-                     t_b - t_a, t_c - t_b, t_d - t_c, t_f - t_e)
+        logger.info("offload finalize: %.1fs", t_b - t_a)
 
     def initialize_kv_cache(
         self,

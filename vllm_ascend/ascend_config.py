@@ -790,7 +790,7 @@ class ExpertOffloadConfig:
         "cache_router_weight": 0.3,
         "cache_age_weight": 0.01,
         "cache_stats_log_interval": 1000,
-        "cache_debug_log_updates": False,
+        "moe_offload_debug": False,
         "expert_prefetch_enabled": False,
     }
 
@@ -850,8 +850,8 @@ class ExpertOffloadConfig:
             raise TypeError("cache_stats_log_interval must be an integer")
         if self.config["cache_stats_log_interval"] < 0:
             raise ValueError("cache_stats_log_interval must >= 0")
-        if not isinstance(self.config["cache_debug_log_updates"], bool):
-            raise TypeError("cache_debug_log_updates must be a boolean")
+        if not isinstance(self.config["moe_offload_debug"], bool):
+            raise TypeError("moe_offload_debug must be a boolean")
         if not isinstance(self.config["expert_prefetch_enabled"], bool):
             raise TypeError("expert_prefetch_enabled must be a boolean")
 

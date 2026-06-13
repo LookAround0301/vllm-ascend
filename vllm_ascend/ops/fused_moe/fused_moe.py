@@ -532,6 +532,11 @@ class AscendFusedMoE(FusedMoE):
             moe_quant_params["intermediate_size_full"] = intermediate_size
         self.quant_method.create_weights(layer=self, **moe_quant_params)
 
+        if self.enable_expert_offload:
+            from vllm_ascend.expert_offload import ExpertOffloadManager
+            ExpertOffloadManager.get_instance().init_layer_cpu_buffers(
+                self, self.moe_instance_id)
+
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
         self.enable_npugraph_ex_static_kernel = ascend_config.ascend_compilation_config.enable_static_kernel
 
@@ -583,17 +588,17 @@ class AscendFusedMoE(FusedMoE):
                                    expert_id, **kwargs):
             # --- Handle scale/offset params (quantized models) ---
             if "weight_scale" in weight_name:
-                mgr._add_pending_scale(layer_moe_idx, expert_id,
-                                       "w13_weight_scale" if shard_id in ("w1", "w3")
-                                       else "w2_weight_scale",
-                                       shard_id, loaded_weight)
+                mgr._load_scale_shard(layer_moe_idx, expert_id,
+                                      "w13_weight_scale" if shard_id in ("w1", "w3")
+                                      else "w2_weight_scale",
+                                      shard_id, loaded_weight)
                 if expert_id >= ndev:
                     return None
             elif "weight_offset" in weight_name:
-                mgr._add_pending_scale(layer_moe_idx, expert_id,
-                                       "w13_weight_offset" if shard_id in ("w1", "w3")
-                                       else "w2_weight_offset",
-                                       shard_id, loaded_weight)
+                mgr._load_scale_shard(layer_moe_idx, expert_id,
+                                      "w13_weight_offset" if shard_id in ("w1", "w3")
+                                      else "w2_weight_offset",
+                                      shard_id, loaded_weight)
                 if expert_id >= ndev:
                     return None
             else:
