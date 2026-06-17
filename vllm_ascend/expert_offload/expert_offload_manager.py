@@ -124,6 +124,9 @@ class ExpertOffloadManager:
         # Next-layer expert prefetch infrastructure
         self._prefetch_stream = torch_npu.npu.Stream()
         self._gate_weights_cpu: list[torch.Tensor | None] = []
+        # NPU copy of gate weights for graph-capturable on-device prediction.
+        # Kept in fp32 to match the CPU prediction path.
+        self._gate_weights_npu: list[torch.Tensor | None] = []
 
         # Threaded prefetch: daemon thread processes prefetch requests
         # so the main forward-pass thread is never blocked by H2D copies.
@@ -134,6 +137,16 @@ class ExpertOffloadManager:
         self._prefetch_layer_npu_event: dict[int, torch_npu.npu.Event] = {}
         self._prefetch_thread: threading.Thread | None = None
         self._npu_device: torch.device | None = None
+
+        # Pinned CPU staging buffers for graph-mode prefetch prediction.
+        # Allocated lazily in _finalize_offload (hidden_dim / num_total_experts
+        # are only known after MoE layers are registered).  Mirror
+        # update_weights' non_blocking D2H + stream-order-ready pattern: the
+        # graph host callback reads these (already-ready) buffers instead of
+        # doing a blocking .cpu() on a live graph tensor.
+        self._prefetch_hs_h: torch.Tensor | None = None
+        self._prefetch_log2phy_h: torch.Tensor | None = None
+        self._prefetch_log2phy_np = None
 
     # ------------------------------------------------------------------ #
     #  Lifecycle: called during model init and after weight loading       #
@@ -274,6 +287,20 @@ class ExpertOffloadManager:
         t6 = time.perf_counter()
         if self.offload_config.expert_prefetch_enabled:
             self.register_gate_weights(model)
+            # Pinned staging buffers for graph-mode host-callback prefetch.
+            # The callback runs on the compute stream's host thread during
+            # graph replay, where blocking .cpu() on a live graph tensor would
+            # deadlock (see md_anlysis/2026-0615-1416-...).  These buffers let
+            # trigger_next_layer_prefetch stage the data with non_blocking D2H
+            # *before* launching the callback, exactly like update_weights.
+            hidden_dim = self.moe_layers[0].hidden_size
+            self._prefetch_hs_h = torch.zeros(
+                [self.offload_threshold, hidden_dim],
+                dtype=torch.float32, device='cpu', pin_memory=True)
+            self._prefetch_log2phy_h = torch.zeros(
+                self.num_total_experts, dtype=torch.int32,
+                device='cpu', pin_memory=True)
+            self._prefetch_log2phy_np = self._prefetch_log2phy_h.numpy()
         t7 = time.perf_counter()
         logger.info(
             "[OFFLOAD] finalize breakdown: process_weights=%.1fs "
@@ -418,6 +445,28 @@ class ExpertOffloadManager:
     # ------------------------------------------------------------------ #
     #  Weight-load entry points (called by the safetensors loader)        #
     # ------------------------------------------------------------------ #
+
+    def register_gate_weights(self, model):
+        """Store fp32 CPU and NPU copies of gate.weight for each MoE layer.
+
+        Called from _register_offload_layers() after all MoE layers are
+        registered.  The CPU gate weights are used by the legacy
+        predict_next_layer_experts(); the NPU copies are used by
+        predict_next_layer_experts_npu() so prediction can run on-device
+        and be captured in a CUDA/NPU graph.
+        """
+        from vllm_ascend.models.deepseek_v4 import DeepseekV4MoE
+        moe_wrappers = [m for m in model.modules()
+                        if isinstance(m, DeepseekV4MoE)]
+        for wrapper in moe_wrappers:
+            gate_param = wrapper.gate.weight.data
+            gate_cpu = gate_param.cpu().float().clone()
+            self._gate_weights_cpu.append(gate_cpu)
+            # Place on the same NPU device as the parameter for on-device
+            # graph-capturable prediction.
+            self._gate_weights_npu.append(gate_cpu.to(gate_param.device))
+        logger.info("[PREFETCH] registered gate weights for %d MoE layers",
+                    len(self._gate_weights_cpu))
 
     def load_w13(self, layer_moe_idx: int, expert_id: int,
                  loaded_weight: torch.Tensor, shard_id: str):
@@ -728,24 +777,28 @@ class ExpertOffloadManager:
         except ValueError:
             return 0
 
-        # Wait for any pending threaded prefetch for this layer to complete
+        # Wait for any pending threaded prefetch for this layer to complete.
+        # In graph mode there is no background thread; only the NPU event
+        # stored by the host callback needs to be waited on.
         layer_done = self._prefetch_layer_done.get(layer_idx)
         if layer_done is not None:
             layer_done.wait()           # Block until prefetch thread finishes
             layer_done.clear()
             del self._prefetch_layer_done[layer_idx]
-            with self._prefetch_state_lock:
-                npu_event = self._prefetch_layer_npu_event.pop(layer_idx,
-                                                                None)
-            if npu_event is not None:
-                npu_event.synchronize()  # Block until NPU DMA copies complete
+
+        # Wait for prefetch NPU copies to complete before using the weights.
+        # Use stream wait (graphable) instead of host synchronize.
+        with self._prefetch_state_lock:
+            npu_event = self._prefetch_layer_npu_event.pop(layer_idx, None)
+        if npu_event is not None:
+            torch_npu.npu.current_stream().wait_event(npu_event)
 
         topk_ids_h = self.topk_ids_h[:num_tokens]
         topk_weights_h = None
-        if (self.cache_policy is not None and topk_weights is not None and not _EXTRA_CTX.capturing
+        if (self.cache_policy is not None and topk_weights is not None 
                 and self.offload_config.cache_router_weight != 0):
             topk_weights_h = self.topk_weights_h[:num_tokens]
-            topk_weights_h.copy_(topk_weights.to(dtype=torch.float32), non_blocking=False)
+            topk_weights_h.copy_(topk_weights.to(dtype=torch.float32), non_blocking=_EXTRA_CTX.capturing)
         log2phy_h = self.log2phy_h
         log2phy_np = self.log2phy_np
         topk_ids_h.copy_(topk_ids, non_blocking=_EXTRA_CTX.capturing)
@@ -808,7 +861,7 @@ class ExpertOffloadManager:
             reusable_slots = [s for s, e in slot_owner.items()
                             if e not in needed]          # slots to recycle
 
-            if self.cache_policy is not None and self._debug:
+            if self._debug:
                 logger.info("[UPDATE-W] l=%d expert_hit=%s expert_miss=%s hit_rate=%.2f",
                             layer_idx, sorted(already_there),
                             sorted(need_to_load), len(already_there) / 6)
@@ -912,18 +965,82 @@ class ExpertOffloadManager:
 
         if next_idx >= len(self._gate_weights_cpu):
             return None
+        if self._gate_weights_cpu[next_idx] is None:
+            return None
+
+        # Move hidden_states to CPU for prediction (tiny in decode: 1-8 tokens).
+        # This runs only on the background prefetch thread (_prefetch_worker),
+        # a standalone thread after compute_event.synchronize(), so the .cpu()
+        # is safe.  The graph-mode path uses _predict_next_layer_experts_cpu
+        # over pre-staged pinned memory and never touches a live graph tensor.
+        hs_cpu = hidden_states.float().cpu()
+        return self._predict_next_layer_experts_cpu(layer_idx, hs_cpu)
+
+    def _predict_next_layer_experts_cpu(
+        self,
+        layer_idx: int,
+        hs_cpu: torch.Tensor,
+    ) -> set[int] | None:
+        """Pure-CPU prediction from an already-CPU hidden_states tensor.
+
+        Same approximation as predict_next_layer_experts (simplified softmax +
+        topk), but takes a CPU tensor directly — no .cpu() / blocking D2H.
+        Used by the graph-mode host callback over the pre-staged pinned
+        buffer (_prefetch_hs_h).
+        """
+        next_idx = layer_idx + 1
+        if next_idx >= len(self.moe_layers):
+            return None  # last layer — nothing to prefetch
+
+        if next_idx >= len(self._gate_weights_cpu):
+            return None
         gate_w = self._gate_weights_cpu[next_idx]
         if gate_w is None:
             return None
 
-        # Move hidden_states to CPU for prediction (tiny in decode: 1-8 tokens)
-        hs_cpu = hidden_states.float().cpu()
+        # hs_cpu is already fp32 (staged that way); gate_w is fp32 on CPU.
         router_logits = F.linear(hs_cpu, gate_w)  # [num_tokens, n_experts]
 
         # Simplified routing: softmax + topk (approximation)
         probs = router_logits.softmax(dim=-1)
         _, topk_ids = probs.topk(self.topk, dim=-1)
         return set(topk_ids.flatten().tolist())
+
+    def predict_next_layer_experts_npu(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Predict which experts layer layer_idx+1 will need, on NPU.
+
+        Same approximation as predict_next_layer_experts (simplified
+        softmax + topk), but runs entirely on the NPU so it can be
+        captured in a CUDA/NPU graph.  The returned tensor lives on NPU.
+
+        Args:
+            layer_idx: Current layer index.
+            hidden_states: [num_tokens, hidden_dim] NPU tensor.
+
+        Returns:
+            [num_tokens * topk] NPU int64 tensor of predicted expert IDs,
+            or None if prediction is not possible.
+        """
+        next_idx = layer_idx + 1
+        if next_idx >= len(self.moe_layers):
+            return None  # last layer — nothing to prefetch
+
+        if next_idx >= len(self._gate_weights_npu):
+            return None
+        gate_w = self._gate_weights_npu[next_idx]
+        if gate_w is None:
+            return None
+
+        # On-device prediction: [num_tokens, hidden_dim] x [n_experts, hidden_dim]^T
+        router_logits = F.linear(hidden_states.float(), gate_w)
+        probs = router_logits.softmax(dim=-1)
+        _, topk_ids = probs.topk(self.topk, dim=-1)  # [num_tokens, topk]
+        predicted = topk_ids.flatten()               # [num_tokens * topk]
+        return predicted
 
     # ------------------------------------------------------------------ #
     #  Threaded prefetch: background thread for expert weight loading     #
@@ -973,8 +1090,16 @@ class ExpertOffloadManager:
                     done.set()
                 continue
 
+            # Snapshot next layer's current log2phy to CPU.  This runs on the
+            # standalone prefetch thread (after compute_event.synchronize()),
+            # so the blocking .cpu() is safe here — unlike the graph host
+            # callback, which stages this into a pinned buffer instead.
+            next_layer = self.moe_layers[next_idx]
+            log2phy_np = next_layer.log2phy.cpu().numpy().copy()
+
             # Execute the prefetch (H2D copies)
-            completion_event = self._do_prefetch(next_idx, predicted)
+            completion_event = self._do_prefetch(next_idx, predicted,
+                                                 log2phy_np)
 
             # Store NPU completion event and signal threading.Event
             with self._prefetch_state_lock:
@@ -988,17 +1113,35 @@ class ExpertOffloadManager:
         self,
         next_idx: int,
         predicted_experts: set[int],
+        log2phy_np,
+        use_sleep: bool = True,
     ) -> torch_npu.npu.Event | None:
         """Load predicted experts for layer next_idx from CPU to NPU.
 
-        Runs on the prefetch thread using self._prefetch_stream.
-        Returns an NPU Event that signals when all copies are complete,
-        or None if no copies were needed.
+        Runs on the prefetch thread (non-graph) or from the graph host
+        callback (graph mode), using self._prefetch_stream for the H2D
+        copies.  Returns an NPU Event that signals when all copies are
+        complete, or None if no copies were needed.
+
+        Args:
+            next_idx: Index of the layer to prefetch experts for.
+            predicted_experts: Set of expert IDs predicted to be needed.
+            log2phy_np: numpy view of next_idx's current log2phy (CPU,
+                int32).  Provided by the caller — the graph path stages it
+                into a pinned buffer before the callback so this function
+                never does a blocking .cpu() on a live graph tensor.
+            use_sleep: If True, insert a small delay between w13 and w2 copies
+                to avoid burst traffic.  Should be False when called from a
+                graph host callback to avoid blocking graph execution.
         """
         next_layer = self.moe_layers[next_idx]
 
-        # Snapshot next layer's current log2phy to CPU
-        log2phy_np = next_layer.log2phy.cpu().numpy().copy()
+        # Copy out so the async H2D write-back (next_layer.log2phy.copy_)
+        # reads an independent buffer.  In graph mode log2phy_np is the shared
+        # _prefetch_log2phy_np view; without this copy the async H2D would
+        # race the next layer's staging D2H that overwrites it.  Tiny:
+        # num_total_experts * 4 bytes.
+        log2phy_np = log2phy_np.copy()
 
         # Determine which predicted experts are not already on device
         slot_owner: dict[int, int] = {}
@@ -1007,6 +1150,7 @@ class ExpertOffloadManager:
                 slot_owner[slot] = eid
         on_device = set(slot_owner.values())
         need_to_load = predicted_experts - on_device
+        already_there = on_device & predicted_experts
 
         if not need_to_load:
             return None
@@ -1017,8 +1161,19 @@ class ExpertOffloadManager:
                           if e not in protected]
         if not reusable_slots:
             return None  # all resident experts are protected — skip
+        
+        if self._debug:
+                logger.info("[PREFETCH-W] l=%d prefetch_expert_hit=%s prefetch_expert_miss=%s hit_rate=%.2f",
+                            next_idx, sorted(already_there),
+                            sorted(need_to_load), len(already_there) / 6)
+                if need_to_load and len(need_to_load) > len(reusable_slots):
+                    logger.info("[PREFETCH-W] l=%d SHORTFALL: need %d load but only %d slots, "
+                                "to_load=%s",
+                                next_idx, len(need_to_load), len(reusable_slots),
+                                sorted(need_to_load)[:20])
 
         with torch_npu.npu.stream(self._prefetch_stream):
+            n_copies = 0
             for eid in need_to_load:
                 # Use cache_policy.choose_victim() for eviction, same as
                 # _update_weights.  Pass next_idx so it queries L+1's
@@ -1042,8 +1197,9 @@ class ExpertOffloadManager:
                 if slot < 0:
                     if self._debug:
                         logger.info(
-                            "[PREFETCH] l=%d NO SLOTS: %d experts could not "
-                            "be prefetched", next_idx - 1, len(need_to_load))
+                            "[PREFETCH] l=%d NO SLOTS: %d experts could not be prefetched, missed= %s", 
+                        next_idx , len(need_to_load)-n_copies,sorted(list(need_to_load))[n_copies:][:20]
+                        )
                     break
 
                 # CPU → NPU async copy w13 weights
@@ -1053,7 +1209,8 @@ class ExpertOffloadManager:
                 ].copy_(
                     self.w13_weights_cpu[next_idx][eid].untyped_storage())
 
-                time.sleep(0.00025)  # 0.25ms delay
+                if use_sleep:
+                    time.sleep(0.00025)  # 0.25ms delay, avoid burst in thread mode
 
                 # CPU → NPU async copy w2 weights
                 next_layer.w2_weight.data.untyped_storage()[
@@ -1096,6 +1253,7 @@ class ExpertOffloadManager:
                 slot_owner[slot] = eid
                 if slot in reusable_slots:
                     reusable_slots.remove(slot)
+                n_copies += 1
 
             # Write modified log2phy back to next layer's NPU tensor
             next_layer.log2phy.copy_(
@@ -1114,8 +1272,8 @@ class ExpertOffloadManager:
         必须在 fused_experts() 之后调用，使 compute_event 捕获
         GMM kernel 的 NPU 工作，实现预加载与计算的真正并行。
 
-        将预测和 H2D 拷贝提交到后台线程，主线程立即返回，
-        不被 aclrtMemcpy 阻塞。
+        图模式下通过 _launch_host_func 提交到 host callback 执行；
+        非图模式下提交到后台线程，主线程立即返回，不被 aclrtMemcpy 阻塞。
 
         Args:
             layer: 当前 MoE 层的 AscendFusedMoE 实例。
@@ -1123,12 +1281,6 @@ class ExpertOffloadManager:
         """
         if not self.offload_config.expert_prefetch_enabled:
             return
-        if _EXTRA_CTX.capturing:
-            return
-
-        # Lazy-start the prefetch thread on first call
-        if self._prefetch_thread is None:
-            self._start_prefetch_thread()
 
         try:
             layer_idx = self.moe_layers.index(layer)
@@ -1144,11 +1296,81 @@ class ExpertOffloadManager:
         compute_event = torch_npu.npu.Event()
         torch_npu.npu.current_stream().record_event(compute_event)
 
-        # Create per-layer threading.Event for completion signaling
-        self._prefetch_layer_done[next_idx] = threading.Event()
+        if _EXTRA_CTX.capturing:
+            # Graph mode: launch a host callback that runs prediction and
+            # H2D copies on the prefetch stream.  The callback itself is
+            # synchronous, but the copies it enqueues are asynchronous.
+            #
+            # Stage the data the callback needs into pinned CPU *before*
+            # launching it, with non_blocking D2H on the compute stream.
+            # _launch_host_func guarantees the callback runs only after the
+            # stream ops queued before it complete, so the callback reads
+            # already-ready memory and never does a blocking .cpu() on a live
+            # graph tensor (which would deadlock the stream's host thread).
+            # Mirrors update_weights' staging pattern exactly.
+            next_layer = self.moe_layers[next_idx]
+            num_tokens = hidden_states.size(0)
+            hs_h = self._prefetch_hs_h[:num_tokens]
+            # Cast to fp32 on-device first, then D2H into the fp32 pinned
+            # buffer — mirrors update_weights (topk_weights.to(float32)),
+            # keeping the captured op identical to the proven path rather
+            # than relying on a cross-dtype copy_.
+            hs_h.copy_(hidden_states.to(torch.float32),
+                       non_blocking=_EXTRA_CTX.capturing)
+            self._prefetch_log2phy_h.copy_(next_layer.log2phy,
+                                           non_blocking=_EXTRA_CTX.capturing)
+            args = (layer_idx, hs_h, compute_event)
+            torch_npu.npu._launch_host_func(
+                torch_npu.npu.current_stream(),
+                self._do_prefetch_host_callback,
+                args,
+            )
+        else:
+            # Non-graph mode: use the background prefetch thread.
+            if self._prefetch_thread is None:
+                self._start_prefetch_thread()
 
-        # Submit to background thread — returns immediately!
-        self._prefetch_queue.put((layer_idx, hidden_states, compute_event))
+            # Create per-layer threading.Event for completion signaling
+            self._prefetch_layer_done[next_idx] = threading.Event()
+
+            # Submit to background thread — returns immediately!
+            self._prefetch_queue.put((layer_idx, hidden_states, compute_event))
+
+    def _do_prefetch_host_callback(self, args):
+        """Host callback for graph-mode prefetch.
+
+        Runs on the CPU during graph replay (the compute stream's host
+        thread).  It predicts the next layer's experts, waits for the
+        current layer's GMM on the prefetch stream, and enqueues async H2D
+        copies.  The returned completion event is stored for
+        update_weights() to wait on.
+
+        Must NOT block or do any synchronous D2H: the data it needs
+        (hidden_states and next layer's log2phy) is pre-staged into pinned
+        buffers by trigger_next_layer_prefetch on the compute stream before
+        this callback is launched, so reads here are always ready.
+        """
+        layer_idx, hs_cpu, compute_event = args
+        next_idx = layer_idx + 1
+        if next_idx >= len(self.moe_layers):
+            return
+
+        # Pure-CPU prediction over the already-staged hidden_states — no .cpu().
+        predicted = self._predict_next_layer_experts_cpu(layer_idx, hs_cpu)
+        if predicted is None:
+            return
+
+        # Enqueue prefetch work on the prefetch stream after the GMM event.
+        with torch_npu.npu.stream(self._prefetch_stream):
+            self._prefetch_stream.wait_event(compute_event)
+            completion_event = self._do_prefetch(
+                next_idx, predicted, self._prefetch_log2phy_np,
+                use_sleep=False)
+
+        # Store completion event for update_weights() to wait on.
+        if completion_event is not None:
+            with self._prefetch_state_lock:
+                self._prefetch_layer_npu_event[next_idx] = completion_event
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #

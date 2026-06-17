@@ -384,7 +384,9 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             final_hidden_states += zero_expert_result
         # Trigger next-layer expert prefetch AFTER GMM kernel submission
         # so compute_event captures real GMM work for true overlap.
-        if getattr(layer, 'enable_expert_offload', False) and not use_prefill_pool:
+        if (getattr(layer, 'enable_expert_offload', False)
+                and not use_prefill_pool
+                and num_tokens <= mgr.offload_threshold):
             mgr.trigger_next_layer_prefetch(layer, x)
         # Restore decode-path expert count after prefill override
         if use_prefill_pool:
