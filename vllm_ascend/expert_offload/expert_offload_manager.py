@@ -165,13 +165,12 @@ class ExpertOffloadManager:
             f"MoE layers must have same expert count: {ntotal} vs {self.num_total_experts}"
 
         params_dtype = layer.w13_weight.dtype
-        # Use logical dimensions (layer.hidden_size / intermediate_size)
-        # rather than device tensor shapes.  Device tensor layout may be
-        # transposed before process_weights_after_loading (e.g. W8A8
-        # stores [intermediate, hidden] pre-transpose), confusing the
-        # per-expert shape derivation.
-        w13_shape = (layer.hidden_size, 2 * layer.intermediate_size_per_partition)
-        w2_shape = (layer.intermediate_size_per_partition, layer.hidden_size)
+        # Per-expert buffer holds the *transpose-after* layout (_copy_w13_shard
+        # stores owned.t()). Derive it from the device tensor shape so packed
+        # quant weights are handled: W8A8 -> (hidden, 2*inter),
+        # W4A8_MXFP -> (hidden//2, 2*inter). Swap the last two device dims.
+        w13_shape = (layer.w13_weight.shape[2], layer.w13_weight.shape[1])
+        w2_shape = (layer.w2_weight.shape[2], layer.w2_weight.shape[1])
 
         w13_list = [
             torch.empty(w13_shape, dtype=params_dtype, device="cpu", pin_memory=True)
@@ -213,8 +212,20 @@ class ExpertOffloadManager:
             # its process_weights_after_loading, which runs AFTER this alloc
             # (pre-flatten, shape [.., 1]). Allocate 1D so the buffer already
             # matches the post-flatten device slot — no reshape at copy time.
-            per_expert_shape = (dev_tensor[0].numel(),)
             dtype = dev_tensor.dtype
+            if dtype.itemsize == 1:
+                # W4A8_MXFP e8m0 weight-scale is 1 byte (uint8 / float8_e8m0fnu);
+                # after process the device slot is uint8 with the mxfp layout
+                # [k//2, n, 2]. Allocate the CPU buffer in that post-layout shape
+                # so decode copy_ matches the multidim slot directly (a 1D buffer
+                # cannot copy_ into the multidim slot). W8A8 stays 1D.
+                from vllm_ascend.quantization.methods.w4a8_mxfp4 import (
+                    apply_mxfp4_weight_scale_layout)
+                dtype = torch.uint8
+                per_expert_shape = tuple(
+                    apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8)).shape)
+            else:
+                per_expert_shape = (dev_tensor[0].numel(),)
             buffer_dict: dict = getattr(self, buffer_dict_name)
             if attr_name not in buffer_dict:
                 buffer_dict[attr_name] = []
@@ -309,35 +320,71 @@ class ExpertOffloadManager:
             t2 - t1, t3 - t2, t4 - t3, t5 - t4, t6 - t5, t7 - t6, t7 - t0)
 
     def process_weights_after_loading(self):
-        """Convert resident CPU expert buffers to fractal NZ format (W8A8).
+        """Convert resident CPU expert buffers to the on-device weight format.
 
-        For W8A8 the device weight lives in NZ format, so we mirror that on
-        the CPU side and page experts to the device with a raw copy_ on the
-        underlying storage (avoids an implicit format cast on every H2D).
+        W8A8 (int8): fractal NZ cast on the transpose-after buffer layout
+        (the device path transposes first, then casts NZ).
+        W4A8_MXFP (uint8): mirror the device process_weights_after_loading,
+        which casts29 (mxfp4) on the *pre-transpose* shape and then
+        transposes — so we restore the pre-transpose shape first, cast, and
+        transpose back to match the device slot layout byte-for-byte.
 
         After this runs each w13/w2 CPU tensor still reports its original
-        [hidden, ...] shape, but its storage holds NZ-format bytes — a "liar
-        tensor". Touch it only via untyped_storage() slicing, never through
-        the tensor view. No-op for non-int8 models.
+        shape but its storage holds on-device-format bytes — a "liar tensor".
+        Touch it only via untyped_storage() slicing, never through the tensor
+        view. No-op for non-quantized (other dtype) models.
         """
         first_w13 = self.w13_weights_cpu[0][0]
-        if first_w13.dtype != torch.int8:
-            return
+        if first_w13.dtype == torch.int8:
+            self._cast_cpu_weights_to_device_format(mxfp4=False)
+        elif first_w13.dtype == torch.uint8:
+            self._cast_cpu_weights_to_device_format(mxfp4=True)
+        # else: non-quantized model, no-op
+
+    def _cast_cpu_weights_to_device_format(self, mxfp4: bool):
+        """Relayout resident CPU w13/w2 expert buffers into the device format.
+
+        NZ (W8A8) and format-29 mxfp4 (W4A8_MXFP) are equal-length relayouts,
+        so per-expert on-device bytes == nelement * element_size; we still
+        recompute from the cast storage to stay correct if that ever changes.
+        """
         num_moe_layers = len(self.w13_weights_cpu)
         num_experts = len(self.w13_weights_cpu[0])
         for layer_id in range(num_moe_layers):
             w13 = torch.stack(self.w13_weights_cpu[layer_id]).to('npu')
-            w13_nz = torch_npu.npu_format_cast(w13, ACL_FORMAT_FRACTAL_NZ)
-            w13_nz_storage = w13_nz.untyped_storage()
             w2 = torch.stack(self.w2_weights_cpu[layer_id]).to('npu')
-            w2_nz = torch_npu.npu_format_cast(w2, ACL_FORMAT_FRACTAL_NZ)
-            w2_nz_storage = w2_nz.untyped_storage()
+            if mxfp4:
+                # Device casts the pre-transpose shape then transposes; the CPU
+                # buffer holds the transpose-after layout, so un-transpose first.
+                w13 = w13.transpose(1, 2).contiguous()
+                w2 = w2.transpose(1, 2).contiguous()
+                w13 = torch_npu.npu_format_cast(
+                    w13.view(torch.uint8), 29,
+                    customize_dtype=torch.float8_e4m3fn,
+                    input_dtype=torch_npu.float4_e2m1fn_x2,
+                )
+                w2 = torch_npu.npu_format_cast(
+                    w2.view(torch.uint8), 29,
+                    customize_dtype=torch.float8_e4m3fn,
+                    input_dtype=torch_npu.float4_e2m1fn_x2,
+                )
+                w13 = w13.transpose(1, 2)
+                w2 = w2.transpose(1, 2)
+            else:
+                w13 = torch_npu.npu_format_cast(w13, ACL_FORMAT_FRACTAL_NZ)
+                w2 = torch_npu.npu_format_cast(w2, ACL_FORMAT_FRACTAL_NZ)
+            w13_storage = w13.untyped_storage()
+            w2_storage = w2.untyped_storage()
+            per_w13 = w13_storage.nbytes() // num_experts
+            per_w2 = w2_storage.nbytes() // num_experts
+            self.w13_expert_size_bytes = per_w13
+            self.w2_expert_size_bytes = per_w2
             for expert_id in range(num_experts):
                 self.w13_weights_cpu[layer_id][expert_id].untyped_storage().copy_(
-                    w13_nz_storage[expert_id * self.w13_expert_size_bytes : (expert_id + 1) * self.w13_expert_size_bytes]
+                    w13_storage[expert_id * per_w13 : (expert_id + 1) * per_w13]
                 )
                 self.w2_weights_cpu[layer_id][expert_id].untyped_storage().copy_(
-                    w2_nz_storage[expert_id * self.w2_expert_size_bytes : (expert_id + 1) * self.w2_expert_size_bytes]
+                    w2_storage[expert_id * per_w2 : (expert_id + 1) * per_w2]
                 )
 
     def register_gate_weights(self, model):
@@ -435,11 +482,22 @@ class ExpertOffloadManager:
     @staticmethod
     def _copy_scale_assembled(target: torch.Tensor,
                               w1: torch.Tensor, w3: torch.Tensor) -> None:
-        assembled = torch.cat([w1, w3], dim=0).reshape(target.shape)
-        target.copy_(assembled)
+        assembled = torch.cat([w1, w3], dim=0)
+        if target.dtype == torch.uint8:
+            # W4A8_MXFP: store the post-layout bytes so the 1D buffer matches
+            # the post-process device slot element order (the device path
+            # applies reshape(...,k//2,2).transpose to the e8m0 scale).
+            from vllm_ascend.quantization.methods.w4a8_mxfp4 import (
+                apply_mxfp4_weight_scale_layout)
+            assembled = apply_mxfp4_weight_scale_layout(assembled.view(torch.uint8))
+        target.copy_(assembled.reshape(target.shape))
 
     @staticmethod
     def _copy_scale_direct(target: torch.Tensor, owned: torch.Tensor) -> None:
+        if target.dtype == torch.uint8:
+            from vllm_ascend.quantization.methods.w4a8_mxfp4 import (
+                apply_mxfp4_weight_scale_layout)
+            owned = apply_mxfp4_weight_scale_layout(owned.view(torch.uint8))
         target.copy_(owned.reshape(target.shape))
 
     # ------------------------------------------------------------------ #
@@ -596,9 +654,9 @@ class ExpertOffloadManager:
                 self._prefill_w2_offset.append(
                     torch.empty(o2_shape, dtype=pool_layer.w2_weight_offset.dtype, device=dev))
 
-        # Cast prefill pool weight tensors to NZ format (W8A8 kernel requires it).
-        # Must happen BEFORE loading data — same order as decode path:
-        # create → NZ-cast → copy_(cpu → npu)
+        # Cast prefill pool weight tensors to the on-device format (kernel
+        # requires it). Must happen BEFORE loading data — same order as decode
+        # path: create → format-cast → copy_(cpu → npu).
         if dt == torch.int8:
             from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
             for i in range(ndl):
@@ -606,6 +664,19 @@ class ExpertOffloadManager:
                     self._prefill_w13[i], ACL_FORMAT_FRACTAL_NZ)
                 self._prefill_w2[i] = torch_npu.npu_format_cast(
                     self._prefill_w2[i], ACL_FORMAT_FRACTAL_NZ)
+        elif dt == torch.uint8:
+            # W4A8_MXFP: mirror the device process (cast29 on the pre-transpose
+            # shape, then transpose) so the pool holds the same byte layout as
+            # the decode-path device slots.
+            for i in range(ndl):
+                for attr in ("_prefill_w13", "_prefill_w2"):
+                    t = getattr(self, attr)[i]
+                    t = torch_npu.npu_format_cast(
+                        t.transpose(1, 2).contiguous().view(torch.uint8), 29,
+                        customize_dtype=torch.float8_e4m3fn,
+                        input_dtype=torch_npu.float4_e2m1fn_x2,
+                    )
+                    getattr(self, attr)[i] = t.transpose(1, 2)
 
         # Prefill log2phy: identity — all experts mapped to their slots
         self._prefill_log2phy = torch.arange(ntotal, dtype=torch.int32, device=dev)
