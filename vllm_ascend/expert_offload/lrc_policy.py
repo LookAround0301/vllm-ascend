@@ -60,6 +60,19 @@ class LRCExpertCachePolicy:
         self.age_weight = age_weight
         self.layer_states = [self._new_state() for _ in range(num_layers)]
 
+    def add_layer(self) -> int:
+        """Append a fresh per-layer state and return its index.
+
+        Used when a MoE layer is registered after the policy was built —
+        e.g. an MTP draft layer loaded after the target model's
+        ``_finalize_offload``. The new layer shares the same
+        ``num_experts`` / ``cache_size`` / ``topk`` as the existing layers
+        and starts with empty statistics, so target- and draft-layer
+        hotness are tracked independently.
+        """
+        self.layer_states.append(self._new_state())
+        return len(self.layer_states) - 1
+
     def _new_state(self) -> LRCLayerState:
         return LRCLayerState(
             recent_queue=deque(),
