@@ -66,6 +66,7 @@ class ExpertOffloadManager:
         # Each value is a list of layers, each layer is a list of expert tensors.
         self.scale_cpu_buffers: dict[str, list[list[torch.Tensor]]] = {}
         self.offset_cpu_buffers: dict[str, list[list[torch.Tensor]]] = {}
+        self.scale_bias_cpu_buffers: dict[str, list[list[torch.Tensor]]] = {}
 
         # Temporary per-expert storage for w13 scale/offset shard assembly.
         # Key: (layer_moe_idx, expert_id, attr_name), value: first shard.
@@ -112,11 +113,16 @@ class ExpertOffloadManager:
         # Prefill pool: ndl layers × all experts on NPU, shared round-robin
         self._prefill_w13: list[torch.Tensor] = []
         self._prefill_w2: list[torch.Tensor] = []
-        self._prefill_w13_scale: list[torch.Tensor] = []       # W8A8
+        self._prefill_w13_scale: list[torch.Tensor] = []       # W8A8 / W4A8_DYNAMIC
         self._prefill_w13_scale_fp32: list[torch.Tensor] = []   # W8A8
         self._prefill_w13_offset: list[torch.Tensor] = []       # W8A8
-        self._prefill_w2_scale: list[torch.Tensor] = []         # W8A8
+        self._prefill_w2_scale: list[torch.Tensor] = []         # W8A8 / W4A8_DYNAMIC
         self._prefill_w2_offset: list[torch.Tensor] = []        # W8A8
+        # W4A8_DYNAMIC scale_bias (float32), per-channel new_quant_version only.
+        # Allocated lazily in create_prefill_pool when the layer has
+        # w13_scale_bias / w2_scale_bias parameters.
+        self._prefill_w13_scale_bias: list[torch.Tensor] = []
+        self._prefill_w2_scale_bias: list[torch.Tensor] = []
         self._prefill_log2phy: torch.Tensor = None              # identity [0..127]
         self._prefill_initialized: bool = False
         self._skip_prefill: bool = False  # set during profile runs
@@ -193,6 +199,36 @@ class ExpertOffloadManager:
         self._init_layer_scale_buffers(layer, layer_moe_idx, ntotal)
 
         self.moe_layers.append(layer)
+        # If the cache policy was already built (this layer is registered
+        # after _finalize_offload, e.g. an MTP draft MoE layer loaded after
+        # the target model), extend the policy and per-layer stats so LRC
+        # eviction applies uniformly to target and draft layers. Keeps the
+        # invariant that every registered MoE layer has a matching cache
+        # state and stats slot.
+        self._extend_cache_for_layer()
+
+    def _extend_cache_for_layer(self):
+        """Grow cache_policy and stats lists to cover one more MoE layer.
+
+        No-op before _finalize_offload has built the policy (the target
+        layers are all covered in one shot there). Afterwards each newly
+        registered layer (e.g. the MTP draft layer) gets its own fresh
+        LRC state, so draft-layer hotness is tracked independently from
+        the target layers.
+        """
+        if self.cache_policy is None:
+            return
+        new_idx = self.cache_policy.add_layer()
+        self.cache_requests.append(0)
+        self.cache_hits.append(0)
+        self.cache_misses.append(0)
+        self.cache_calls.append(0)
+        self.last_hit_experts.append([])
+        self.last_miss_experts.append([])
+        logger.info(
+            "[EXPERT-OFFLOAD-CACHE] extended cache policy to layer=%d "
+            "(total_layers=%d)",
+            new_idx, len(self.cache_policy.layer_states))
 
     def _init_layer_scale_buffers(self, layer, layer_moe_idx: int,
                                    ntotal: int):
@@ -202,23 +238,17 @@ class ExpertOffloadManager:
             ("scale_cpu_buffers", "w2_weight_scale"),
             ("offset_cpu_buffers", "w13_weight_offset"),
             ("offset_cpu_buffers", "w2_weight_offset"),
+            ("scale_bias_cpu_buffers", "w13_scale_bias"),
+            ("scale_bias_cpu_buffers", "w2_scale_bias"),
         ]
         for buffer_dict_name, attr_name in attr_specs:
             if not hasattr(layer, attr_name):
                 continue
             dev_tensor = getattr(layer, attr_name)
-            # Match the device slot shape the buffer is paged into. The W8A8
-            # path flattens each expert's scale/offset to 1D (.view(E, -1)) in
-            # its process_weights_after_loading, which runs AFTER this alloc
-            # (pre-flatten, shape [.., 1]). Allocate 1D so the buffer already
-            # matches the post-flatten device slot — no reshape at copy time.
             dtype = dev_tensor.dtype
-            if dtype.itemsize == 1:
-                # W4A8_MXFP e8m0 weight-scale is 1 byte (uint8 / float8_e8m0fnu);
-                # after process the device slot is uint8 with the mxfp layout
-                # [k//2, n, 2]. Allocate the CPU buffer in that post-layout shape
-                # so decode copy_ matches the multidim slot directly (a 1D buffer
-                # cannot copy_ into the multidim slot). W8A8 stays 1D.
+            if "scale_bias" in attr_name:
+                per_expert_shape = tuple(dev_tensor.shape[1:])
+            elif dtype.itemsize == 1:
                 from vllm_ascend.quantization.methods.w4a8_mxfp4 import (
                     apply_mxfp4_weight_scale_layout)
                 dtype = torch.uint8
@@ -324,6 +354,8 @@ class ExpertOffloadManager:
 
         W8A8 (int8): fractal NZ cast on the transpose-after buffer layout
         (the device path transposes first, then casts NZ).
+        W4A8_DYNAMIC (int8 cpu, int32 device): mirror the device path which
+        transposes, casts NZ, then packs 4 int8 → 1 int32.
         W4A8_MXFP (uint8): mirror the device process_weights_after_loading,
         which casts29 (mxfp4) on the *pre-transpose* shape and then
         transposes — so we restore the pre-transpose shape first, cast, and
@@ -335,18 +367,45 @@ class ExpertOffloadManager:
         view. No-op for non-quantized (other dtype) models.
         """
         first_w13 = self.w13_weights_cpu[0][0]
+        first_layer = self.moe_layers[0]
+        # Detect W4A8_DYNAMIC by scale dtype: process_scale converts float32
+        # to int64 on the device for both modelslim and compressed_tensors
+        # paths. The weight dtype is NOT a reliable signal — modelslim leaves
+        # it as int8 (no pack_to_int32) while compressed_tensors packs to
+        # int32. Without this check, modelslim W4A8 would be misrouted to the
+        # W8A8 branch, skipping scale encoding and producing garbled output.
+        is_w4a8 = (hasattr(first_layer, 'w13_weight_scale') and
+                   first_layer.w13_weight_scale.dtype == torch.int64)
         if first_w13.dtype == torch.int8:
-            self._cast_cpu_weights_to_device_format(mxfp4=False)
+            first_dev = first_layer.w13_weight
+            if first_dev.dtype == torch.int32:
+                # compressed_tensors W4A8: weight packed to int32
+                self._cast_cpu_weights_to_device_format(w4a8_dynamic=True)
+            else:
+                # W8A8 or modelslim W4A8: weight is int8, just NZ cast
+                self._cast_cpu_weights_to_device_format(mxfp4=False)
+            # Scale encoding for W4A8 (both modelslim and compressed_tensors).
+            # Must run AFTER _cast_cpu_weights_to_device_format so the CPU
+            # buffers are already in device byte layout.
+            if is_w4a8:
+                self._process_scale_bias_cpu_buffers()
+                self._encode_w4a8_dynamic_weight_scales()
         elif first_w13.dtype == torch.uint8:
             self._cast_cpu_weights_to_device_format(mxfp4=True)
         # else: non-quantized model, no-op
 
-    def _cast_cpu_weights_to_device_format(self, mxfp4: bool):
+    def _cast_cpu_weights_to_device_format(self, mxfp4: bool = False,
+                                            w4a8_dynamic: bool = False):
         """Relayout resident CPU w13/w2 expert buffers into the device format.
 
         NZ (W8A8) and format-29 mxfp4 (W4A8_MXFP) are equal-length relayouts,
         so per-expert on-device bytes == nelement * element_size; we still
         recompute from the cast storage to stay correct if that ever changes.
+
+        W4A8_DYNAMIC mirrors the device path: transpose → NZ cast →
+        pack 4 int8 into 1 int32 (view as int32).  The storage size is
+        preserved (4× fewer elements at 4× element size), so the CPU buffer
+        can hold the packed bytes without reallocation.
         """
         num_moe_layers = len(self.w13_weights_cpu)
         num_experts = len(self.w13_weights_cpu[0])
@@ -354,8 +413,6 @@ class ExpertOffloadManager:
             w13 = torch.stack(self.w13_weights_cpu[layer_id]).to('npu')
             w2 = torch.stack(self.w2_weights_cpu[layer_id]).to('npu')
             if mxfp4:
-                # Device casts the pre-transpose shape then transposes; the CPU
-                # buffer holds the transpose-after layout, so un-transpose first.
                 w13 = w13.transpose(1, 2).contiguous()
                 w2 = w2.transpose(1, 2).contiguous()
                 w13 = torch_npu.npu_format_cast(
@@ -370,6 +427,20 @@ class ExpertOffloadManager:
                 )
                 w13 = w13.transpose(1, 2)
                 w2 = w2.transpose(1, 2)
+            elif w4a8_dynamic:
+                # CPU buffer is already (E, H, dim2) — _copy_w13_shard stored
+                # owned.t(), matching the post-transpose device layout. The
+                # device path (process_weights_after_loading_modelslim) does
+                # transpose(1,2) → NZ cast → pack_to_int32, where transpose
+                # converts (E, dim2, H) → (E, H, dim2). Since the CPU buffer
+                # is already (E, H, dim2), we NZ-cast directly — NO extra
+                # transpose. A double transpose here would apply NZ blocking
+                # to (dim2, H) instead of (H, dim2), producing wrong block
+                # layout and garbled output.
+                w13 = torch_npu.npu_format_cast(w13, ACL_FORMAT_FRACTAL_NZ)
+                w2 = torch_npu.npu_format_cast(w2, ACL_FORMAT_FRACTAL_NZ)
+                w13 = w13.view(torch.int32)
+                w2 = w2.view(torch.int32)
             else:
                 w13 = torch_npu.npu_format_cast(w13, ACL_FORMAT_FRACTAL_NZ)
                 w2 = torch_npu.npu_format_cast(w2, ACL_FORMAT_FRACTAL_NZ)
@@ -386,6 +457,62 @@ class ExpertOffloadManager:
                 self.w2_weights_cpu[layer_id][expert_id].untyped_storage().copy_(
                     w2_storage[expert_id * per_w2 : (expert_id + 1) * per_w2]
                 )
+
+    def _process_scale_bias_cpu_buffers(self):
+        """Apply update_bias transformation to scale_bias CPU buffers.
+
+        Mirrors the device-side update_bias for W4A8_DYNAMIC new_quant_version:
+        w13_scale_bias: (D1, 1) -> transpose -> (1, D1) -> sum(axis=0) -> (D1,)
+        w2_scale_bias: (D1, D2) -> transpose -> (D2, D1) -> sum(axis=0) -> (D1,)
+        """
+        for attr_name, layer_buffers in self.scale_bias_cpu_buffers.items():
+            for layer_idx, expert_buffers in enumerate(layer_buffers):
+                new_buffers = []
+                for buf in expert_buffers:
+                    transformed = buf.transpose(0, 1).contiguous().sum(dim=0)
+                    new_buffers.append(transformed)
+                layer_buffers[layer_idx] = new_buffers
+
+    def _encode_w4a8_dynamic_weight_scales(self):
+        """Encode W4A8_DYNAMIC weight_scale CPU buffers to device int64 format.
+
+        The safetensors checkpoint stores ``w13_weight_scale`` /
+        ``w2_weight_scale`` as float32 tensors, but the device-side
+        ``AscendW4A8DynamicFusedMoEMethod.process_scale`` reinterprets the
+        float32 bytes as uint32 and zero-extends to int64 before storing it
+        on the NPU. The decode-path H2D ``copy_`` therefore must write
+        int64-encoded bytes — copying raw float32 into an int64 device tensor
+        would corrupt the kernel's scale decoding.
+
+        This method mirrors the per-channel branch of ``process_scale``
+        (the only branch supported by expert offload today): float32 →
+        uint32 bit-reinterpret → int64 zero-extension. Each expert buffer is
+        encoded independently (per-channel encoding is element-wise), so the
+        transformation is applied per-expert without cross-expert ops.
+
+        After this runs the CPU buffer dtype changes from float32 to int64,
+        matching ``layer.w13_weight_scale.dtype`` on the NPU.
+        """
+        import numpy as np
+        for attr_name in ("w13_weight_scale", "w2_weight_scale"):
+            if attr_name not in self.scale_cpu_buffers:
+                continue
+            for layer_idx, expert_buffers in enumerate(
+                    self.scale_cpu_buffers[attr_name]):
+                encoded_buffers = []
+                for buf in expert_buffers:
+                    # buf: float32, shape per-expert (e.g. (2*IN,) for w13)
+                    scale_np = np.ascontiguousarray(
+                        buf.cpu().numpy()).astype(np.float32)
+                    # Bit-reinterpret float32 bytes as uint32, then
+                    # zero-extend to int64 — identical to device process_scale
+                    # per-channel branch.
+                    scale_np.dtype = np.uint32
+                    encoded = scale_np.astype(np.int64)
+                    encoded_buf = torch.from_numpy(np.ascontiguousarray(
+                        encoded.copy()))
+                    encoded_buffers.append(encoded_buf)
+                self.scale_cpu_buffers[attr_name][layer_idx] = encoded_buffers
 
     def register_gate_weights(self, model):
         """Store fp32 CPU copies of gate.weight for each MoE layer.
@@ -465,6 +592,29 @@ class ExpertOffloadManager:
                 self._saved_num_threads = None
             self._weight_load_secs = time.perf_counter() - self._load_phase_start
 
+    # -- int4 packing helper for W4A8_DYNAMIC checkpoints -- #
+
+    @staticmethod
+    def _pack_int4_dim0(weight: torch.Tensor) -> torch.Tensor:
+        """Pack pairs of int4 values along dim 0.
+
+        W4A8_DYNAMIC (msModelSlim new_quant_version) checkpoint weights store
+        one int4 value per int8 element along the output dimension.  The
+        device tensor expects two int4 values packed into one int8 byte,
+        halving dim 0.  This helper performs that packing.
+
+        For w1/w3 shard ``(IN, H)`` -> ``(IN // 2, H)``.
+        For w2 ``(H, IN)`` -> ``(H // 2, IN)``.
+        """
+        if weight.dtype != torch.int8:
+            weight = weight.to(torch.int8)
+        assert weight.shape[0] % 2 == 0, (
+            f"dim 0 must be even for int4 packing, got {weight.shape[0]}")
+        pairs = weight.reshape(weight.shape[0] // 2, 2, *weight.shape[1:])
+        lo = pairs[:, 0] & 0x0F
+        hi = pairs[:, 1] & 0x0F
+        return ((hi << 4) | lo).contiguous()
+
     # -- worker copy kernels (static: no self, no shared mutable state) -- #
 
     @staticmethod
@@ -532,7 +682,11 @@ class ExpertOffloadManager:
         self._weight_load_calls += 1
         cpu = self.w13_weights_cpu[layer_moe_idx][expert_id]
         intermed = cpu.shape[1] // 2
-        # Own the bytes now (the mmap may unmap before the worker runs).
+        if loaded_weight.ndim > 0 and loaded_weight.shape[0] > intermed:
+            if loaded_weight.shape[0] == 2 * intermed:
+                loaded_weight = self._pack_int4_dim0(loaded_weight)
+            else:
+                loaded_weight = loaded_weight.narrow(0, 0, intermed)
         owned = loaded_weight.cpu().clone()
         fut = self._get_load_pool().submit(
             self._copy_w13_shard, cpu, owned, shard_id, intermed)
@@ -563,8 +717,12 @@ class ExpertOffloadManager:
         """
         self._weight_load_calls += 1
         assert shard_id in ("w1", "w2", "w3"), f"unexpected shard_id: {shard_id}"
-        target_dict = (self.scale_cpu_buffers if "scale" in attr_name
-                       else self.offset_cpu_buffers)
+        if "scale_bias" in attr_name:
+            target_dict = self.scale_bias_cpu_buffers
+        elif "scale" in attr_name:
+            target_dict = self.scale_cpu_buffers
+        else:
+            target_dict = self.offset_cpu_buffers
         target = target_dict[attr_name][layer_moe_idx][expert_id]
         if attr_name.startswith("w13_"):
             key = (layer_moe_idx, expert_id, attr_name)
@@ -653,6 +811,15 @@ class ExpertOffloadManager:
                 o2_shape = (ntotal,) + tuple(pool_layer.w2_weight_offset.shape[1:])
                 self._prefill_w2_offset.append(
                     torch.empty(o2_shape, dtype=pool_layer.w2_weight_offset.dtype, device=dev))
+            # W4A8_DYNAMIC scale_bias (optional, per-channel new_quant_version)
+            if hasattr(pool_layer, 'w13_scale_bias'):
+                sb13_shape = (ntotal,) + tuple(pool_layer.w13_scale_bias.shape[1:])
+                self._prefill_w13_scale_bias.append(
+                    torch.empty(sb13_shape, dtype=pool_layer.w13_scale_bias.dtype, device=dev))
+            if hasattr(pool_layer, 'w2_scale_bias'):
+                sb2_shape = (ntotal,) + tuple(pool_layer.w2_scale_bias.shape[1:])
+                self._prefill_w2_scale_bias.append(
+                    torch.empty(sb2_shape, dtype=pool_layer.w2_scale_bias.dtype, device=dev))
 
         # Cast prefill pool weight tensors to the on-device format (kernel
         # requires it). Must happen BEFORE loading data — same order as decode
@@ -664,6 +831,25 @@ class ExpertOffloadManager:
                     self._prefill_w13[i], ACL_FORMAT_FRACTAL_NZ)
                 self._prefill_w2[i] = torch_npu.npu_format_cast(
                     self._prefill_w2[i], ACL_FORMAT_FRACTAL_NZ)
+        elif dt == torch.int32:
+            # W4A8_DYNAMIC: the device path creates int8, NZ-casts, then views
+            # as int32 (pack_to_int32). An empty int32 tensor cannot be
+            # NZ-cast directly ("Cannot resize storage without base format"),
+            # so rebuild each pool tensor the device way: allocate the int8
+            # backing tensor with the expanded shape, NZ-cast it, then view as
+            # int32. The int8 last-dim is 4x the int32 last-dim.
+            from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+            for i in range(ndl):
+                t13 = self._prefill_w13[i]
+                t2 = self._prefill_w2[i]
+                i8_shape13 = t13.shape[:-1] + (t13.shape[-1] * 4,)
+                i8_shape2 = t2.shape[:-1] + (t2.shape[-1] * 4,)
+                t13_i8 = torch.empty(i8_shape13, dtype=torch.int8, device=dev)
+                t2_i8 = torch.empty(i8_shape2, dtype=torch.int8, device=dev)
+                t13_nz = torch_npu.npu_format_cast(t13_i8, ACL_FORMAT_FRACTAL_NZ)
+                t2_nz = torch_npu.npu_format_cast(t2_i8, ACL_FORMAT_FRACTAL_NZ)
+                self._prefill_w13[i] = t13_nz.view(torch.int32)
+                self._prefill_w2[i] = t2_nz.view(torch.int32)
         elif dt == torch.uint8:
             # W4A8_MXFP: mirror the device process (cast29 on the pre-transpose
             # shape, then transpose) so the pool holds the same byte layout as
@@ -702,6 +888,7 @@ class ExpertOffloadManager:
         """
         has_scales = bool(self._prefill_w13_scale)
         has_offsets = bool(self._prefill_w13_offset)
+        has_scale_bias = bool(self._prefill_w13_scale_bias)
 
         for slot in range(ndl):
             for eid in range(min(ntotal, len(self.w13_weights_cpu[0]))):
@@ -721,8 +908,9 @@ class ExpertOffloadManager:
                     if (scale_name in cpu_buffers and
                             0 < len(cpu_buffers[scale_name])):
                         for eid in range(min(ntotal, len(cpu_buffers[scale_name][0]))):
+                            src = cpu_buffers[scale_name][0][eid]
                             prefill_list[slot][eid].copy_(
-                                cpu_buffers[scale_name][0][eid])
+                                src.reshape(prefill_list[slot][eid].shape))
             if has_offsets:
                 for offset_name, prefill_list, cpu_buffers in [
                     ("w13_weight_offset", self._prefill_w13_offset, self.offset_cpu_buffers),
@@ -731,8 +919,23 @@ class ExpertOffloadManager:
                     if (offset_name in cpu_buffers and
                             0 < len(cpu_buffers[offset_name])):
                         for eid in range(min(ntotal, len(cpu_buffers[offset_name][0]))):
+                            src = cpu_buffers[offset_name][0][eid]
                             prefill_list[slot][eid].copy_(
-                                cpu_buffers[offset_name][0][eid])
+                                src.reshape(prefill_list[slot][eid].shape))
+            # Initialize scale_bias buffers with layer 0 data (W4A8_DYNAMIC)
+            if has_scale_bias:
+                for sb_name, prefill_list in [
+                    ("w13_scale_bias", self._prefill_w13_scale_bias),
+                    ("w2_scale_bias", self._prefill_w2_scale_bias),
+                ]:
+                    cpu_buffers = self.scale_bias_cpu_buffers
+                    if (sb_name in cpu_buffers and
+                            len(cpu_buffers[sb_name]) > 0 and
+                            slot < len(prefill_list)):
+                        for eid in range(min(ntotal, len(cpu_buffers[sb_name][0]))):
+                            src = cpu_buffers[sb_name][0][eid]
+                            prefill_list[slot][eid].copy_(
+                                src.reshape(prefill_list[slot][eid].shape))
             # Initialize fp32 scale (convert from scale)
             if has_scales and slot < len(self._prefill_w13_scale_fp32):
                 for eid in range(min(ntotal, self._prefill_w13_scale[slot].shape[0])):
@@ -777,8 +980,9 @@ class ExpertOffloadManager:
                     if (scale_name in cpu_buffers and
                             layer_idx < len(cpu_buffers[scale_name])):
                         for eid in range(min(ntotal, len(cpu_buffers[scale_name][layer_idx]))):
+                            src = cpu_buffers[scale_name][layer_idx][eid]
                             prefill_list[pool_slot][eid].copy_(
-                                cpu_buffers[scale_name][layer_idx][eid])
+                                src.reshape(prefill_list[pool_slot][eid].shape))
             for offset_name, prefill_list, cpu_buffers in [
                 ("w13_weight_offset", self._prefill_w13_offset, self.offset_cpu_buffers),
                 ("w2_weight_offset", self._prefill_w2_offset, self.offset_cpu_buffers),
@@ -787,8 +991,23 @@ class ExpertOffloadManager:
                     if (offset_name in cpu_buffers and
                             layer_idx < len(cpu_buffers[offset_name])):
                         for eid in range(min(ntotal, len(cpu_buffers[offset_name][layer_idx]))):
+                            src = cpu_buffers[offset_name][layer_idx][eid]
                             prefill_list[pool_slot][eid].copy_(
-                                cpu_buffers[offset_name][layer_idx][eid])
+                                src.reshape(prefill_list[pool_slot][eid].shape))
+
+            # W4A8_DYNAMIC scale_bias — load into prefill buffers
+            for sb_name, prefill_list in [
+                ("w13_scale_bias", self._prefill_w13_scale_bias),
+                ("w2_scale_bias", self._prefill_w2_scale_bias),
+            ]:
+                cpu_buffers = self.scale_bias_cpu_buffers
+                if pool_slot < len(prefill_list):
+                    if (sb_name in cpu_buffers and
+                            layer_idx < len(cpu_buffers[sb_name])):
+                        for eid in range(min(ntotal, len(cpu_buffers[sb_name][layer_idx]))):
+                            src = cpu_buffers[sb_name][layer_idx][eid]
+                            prefill_list[pool_slot][eid].copy_(
+                                src.reshape(prefill_list[pool_slot][eid].shape))
 
             # Refresh fp32 scale for prefill pool
             if (pool_slot < len(self._prefill_w13_scale_fp32) and
@@ -981,14 +1200,27 @@ class ExpertOffloadManager:
                     dev_tensor = getattr(layer, attr_name, None)
                     if dev_tensor is None:
                         continue
-                    dev_tensor.data[slot].copy_(buffers[layer_idx][eid])
+                    src = buffers[layer_idx][eid]
+                    dev_tensor.data[slot].copy_(
+                        src.reshape(dev_tensor.data[slot].shape))
                 for attr_name, buffers in self.offset_cpu_buffers.items():
                     if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
                         continue
                     dev_tensor = getattr(layer, attr_name, None)
                     if dev_tensor is None:
                         continue
-                    dev_tensor.data[slot].copy_(buffers[layer_idx][eid])
+                    src = buffers[layer_idx][eid]
+                    dev_tensor.data[slot].copy_(
+                        src.reshape(dev_tensor.data[slot].shape))
+                for attr_name, buffers in self.scale_bias_cpu_buffers.items():
+                    if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
+                        continue
+                    dev_tensor = getattr(layer, attr_name, None)
+                    if dev_tensor is None:
+                        continue
+                    src = buffers[layer_idx][eid]
+                    dev_tensor.data[slot].copy_(
+                        src.reshape(dev_tensor.data[slot].shape))
                 # Refresh derived fp32 scale if present (W8A8_DYNAMIC)
                 if hasattr(layer, 'w13_weight_scale_fp32'):
                     layer.w13_weight_scale_fp32[slot].copy_(
@@ -1298,8 +1530,9 @@ class ExpertOffloadManager:
                         continue
                     dev_tensor = getattr(next_layer, attr_name, None)
                     if dev_tensor is not None:
+                        src = buffers[next_idx][eid]
                         dev_tensor.data[slot].copy_(
-                            buffers[next_idx][eid])
+                            src.reshape(dev_tensor.data[slot].shape))
                 for attr_name, buffers in self.offset_cpu_buffers.items():
                     if next_idx >= len(buffers):
                         continue
@@ -1307,8 +1540,19 @@ class ExpertOffloadManager:
                         continue
                     dev_tensor = getattr(next_layer, attr_name, None)
                     if dev_tensor is not None:
+                        src = buffers[next_idx][eid]
                         dev_tensor.data[slot].copy_(
-                            buffers[next_idx][eid])
+                            src.reshape(dev_tensor.data[slot].shape))
+                for attr_name, buffers in self.scale_bias_cpu_buffers.items():
+                    if next_idx >= len(buffers):
+                        continue
+                    if eid >= len(buffers[next_idx]):
+                        continue
+                    dev_tensor = getattr(next_layer, attr_name, None)
+                    if dev_tensor is not None:
+                        src = buffers[next_idx][eid]
+                        dev_tensor.data[slot].copy_(
+                            src.reshape(dev_tensor.data[slot].shape))
 
                 # Refresh fp32 scale (W8A8_DYNAMIC)
                 if hasattr(next_layer, 'w13_weight_scale_fp32'):

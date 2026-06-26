@@ -551,7 +551,57 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
 
         topk_weights = topk_weights.to(x.dtype)
 
-        if self.dynamic_eplb:
+        # Expert offload: incrementally page in needed experts, update log2phy.
+        # Mirrors AscendW8A8DynamicFusedMoEMethod.apply and
+        # AscendW4A8MXFPDynamicFusedMoEMethod.apply — without this block the
+        # decode path would read stale slots for expert_id >= num_device_experts,
+        # producing garbled output (only the first num_device_experts are
+        # resident on NPU when offload is enabled).
+        use_prefill_pool = False
+        prefill_slot = -1
+        num_tokens = topk_ids.size(0)
+        if getattr(layer, 'enable_expert_offload', False):
+            from vllm_ascend.expert_offload import ExpertOffloadManager
+            mgr = ExpertOffloadManager.get_instance()
+            mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
+                               hidden_states=x)
+            if (num_tokens > mgr.offload_threshold
+                    and mgr._prefill_initialized
+                    and not mgr._skip_prefill):
+                use_prefill_pool = True
+                try:
+                    layer_idx = mgr.moe_layers.index(layer)
+                except ValueError:
+                    layer_idx = 0
+                prefill_slot = layer_idx % len(mgr._prefill_w13)
+
+        moe_comm_method = _EXTRA_CTX.moe_comm_method
+        if use_prefill_pool:
+            # Prefill pool holds all experts; swap weight references to the
+            # pool and use an identity log2phy. Weight tensors are int32
+            # (liar tensors with NZ storage) matching the decode path.
+            w1 = [mgr._prefill_w13[prefill_slot]]
+            w1_scale = [mgr._prefill_w13_scale[prefill_slot]]
+            w2 = [mgr._prefill_w2[prefill_slot]]
+            w2_scale = [mgr._prefill_w2_scale[prefill_slot]]
+            if mgr._prefill_w13_scale_bias and mgr._prefill_w2_scale_bias:
+                w1_scale_bias = [mgr._prefill_w13_scale_bias[prefill_slot]]
+                w2_scale_bias = [mgr._prefill_w2_scale_bias[prefill_slot]]
+            else:
+                w1_scale_bias = None
+                w2_scale_bias = None
+            # Override local expert count so kernel groupList matches pool
+            _saved_nle = layer.moe_config.num_local_experts
+            _saved_lne = layer.local_num_experts
+            ntotal = mgr.num_total_experts
+            layer.moe_config.num_local_experts = ntotal
+            layer.local_num_experts = ntotal
+            # Token dispatcher caches num_experts_local — patch it too.
+            _saved_td_nel = moe_comm_method.token_dispatcher.num_experts_local
+            moe_comm_method.token_dispatcher.num_experts_local = ntotal
+            # Use prefill-specific identity log2phy (don't pollute decode path)
+            log2phy = mgr._prefill_log2phy
+        elif self.dynamic_eplb:
             w1 = [i.view(torch.int32) for i in layer.w13_weight_list]
             w1_scale = layer.w13_weight_scale_list
             w2 = [i.view(torch.int32) for i in layer.w2_weight_list]
@@ -566,8 +616,7 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             w1_scale_bias = [layer.w13_scale_bias.detach()] if hasattr(layer, "w13_scale_bias") else None
             w2_scale_bias = [layer.w2_scale_bias.detach()] if hasattr(layer, "w2_scale_bias") else None
 
-        moe_comm_method = _EXTRA_CTX.moe_comm_method
-        return moe_comm_method.fused_experts(
+        final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
                 topk_weights=topk_weights,
@@ -591,6 +640,18 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                 swiglu_limit=layer.swiglu_limit,
             )
         )
+        # Trigger next-layer expert prefetch AFTER GMM kernel submission
+        # (decode path only) so compute_event captures real GMM work.
+        if (getattr(layer, 'enable_expert_offload', False)
+                and not use_prefill_pool
+                and num_tokens <= mgr.offload_threshold):
+            mgr.trigger_next_layer_prefetch(layer, x)
+        # Restore decode-path expert count after prefill override.
+        if use_prefill_pool:
+            layer.moe_config.num_local_experts = _saved_nle
+            layer.local_num_experts = _saved_lne
+            moe_comm_method.token_dispatcher.num_experts_local = _saved_td_nel
+        return final_hidden_states
 
     def process_scale(self, weight: torch.Tensor, scale, per_group_scale):
         scale = scale.transpose(1, 2).contiguous()
