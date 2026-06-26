@@ -586,7 +586,7 @@ class AscendFusedMoE(FusedMoE):
 
         def _offload_weight_loader(param, loaded_weight, weight_name, shard_id,
                                    expert_id, **kwargs):
-            # --- Handle scale/offset params (quantized models) ---
+            # --- Handle scale/offset/scale_bias params (quantized models) ---
             if "weight_scale" in weight_name:
                 mgr._load_scale_shard(layer_moe_idx, expert_id,
                                       "w13_weight_scale" if shard_id in ("w1", "w3")
@@ -598,6 +598,13 @@ class AscendFusedMoE(FusedMoE):
                 mgr._load_scale_shard(layer_moe_idx, expert_id,
                                       "w13_weight_offset" if shard_id in ("w1", "w3")
                                       else "w2_weight_offset",
+                                      shard_id, loaded_weight)
+                if expert_id >= ndev:
+                    return None
+            elif "scale_bias" in weight_name:
+                mgr._load_scale_shard(layer_moe_idx, expert_id,
+                                      "w13_scale_bias" if shard_id in ("w1", "w3")
+                                      else "w2_scale_bias",
                                       shard_id, loaded_weight)
                 if expert_id >= ndev:
                     return None
