@@ -792,6 +792,7 @@ class ExpertOffloadConfig:
         "cache_stats_log_interval": 1000,
         "moe_offload_debug": False,
         "expert_prefetch_enabled": False,
+        "expert_prefetch_num": 2,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -854,6 +855,12 @@ class ExpertOffloadConfig:
             raise TypeError("moe_offload_debug must be a boolean")
         if not isinstance(self.config["expert_prefetch_enabled"], bool):
             raise TypeError("expert_prefetch_enabled must be a boolean")
+        if not isinstance(self.config["expert_prefetch_num"], int):
+            raise TypeError("expert_prefetch_num must be an integer")
+        if self.config["expert_prefetch_num"] < 1:
+            raise ValueError(
+                f"expert_prefetch_num must >= 1; "
+                f"got {self.config['expert_prefetch_num']} instead")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

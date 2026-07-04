@@ -262,6 +262,13 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             w1_scale = layer.w13_weight_scale
             w2_scale = layer.w2_weight_scale
 
+        # Trigger next-layer expert prefetch AFTER GMM kernel submission
+        # (decode path only) so compute_event captures real GMM work.
+        if (getattr(layer, 'enable_expert_offload', False)
+                and not use_prefill_pool
+                and num_tokens <= mgr.offload_threshold):
+            mgr.trigger_next_layer_prefetch(layer, x)
+            
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
@@ -288,12 +295,7 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                 swiglu_limit=layer.swiglu_limit,
             )
         )
-        # Trigger next-layer expert prefetch AFTER GMM kernel submission
-        # (decode path only) so compute_event captures real GMM work.
-        if (getattr(layer, 'enable_expert_offload', False)
-                and not use_prefill_pool
-                and num_tokens <= mgr.offload_threshold):
-            mgr.trigger_next_layer_prefetch(layer, x)
+        
         # Restore decode-path expert count after prefill override.
         if use_prefill_pool:
             layer.moe_config.num_local_experts = _saved_nle

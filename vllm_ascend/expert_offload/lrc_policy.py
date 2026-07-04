@@ -4,12 +4,18 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Iterable
 
+import numpy as np
+
 
 @dataclass
 class LRCLayerState:
     recent_queue: deque[tuple[int, ...]] = field(default_factory=deque)
     freq: list[int] = field(default_factory=list)
-    ema: list[float] = field(default_factory=list)
+    # Only `ema` is vectorized (full-array C-level decay), so it is a numpy
+    # array. freq / router_score / last_used stay Python lists: their hot-path
+    # access is scalar, and `ndarray[i] += 1` is ~24x slower than `list[i] += 1`.
+    ema: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.float32))
     router_score: list[float] = field(default_factory=list)
     last_used: list[int] = field(default_factory=list)
     step: int = 0
@@ -54,6 +60,7 @@ class LRCExpertCachePolicy:
         self.topk = topk
         self.recent_window = recent_window
         self.ema_beta = ema_beta
+        self._one_minus_beta = 1.0 - ema_beta
         self.recent_weight = recent_weight
         self.ema_weight = ema_weight
         self.router_weight = router_weight
@@ -77,7 +84,7 @@ class LRCExpertCachePolicy:
         return LRCLayerState(
             recent_queue=deque(),
             freq=[0 for _ in range(self.num_experts)],
-            ema=[0.0 for _ in range(self.num_experts)],
+            ema=np.zeros(self.num_experts, dtype=np.float32),
             router_score=[0.0 for _ in range(self.num_experts)],
             last_used=[-1 for _ in range(self.num_experts)],
         )
@@ -94,14 +101,16 @@ class LRCExpertCachePolicy:
         unique: set[int] = set()
 
         for row_index, row in enumerate(topk_ids):
-            experts = tuple(self._valid_expert(eid) for eid in row)
+            experts = tuple(row)
             unique.update(experts)
             state.step += 1
 
-            hit_set = set(experts)
-            for eid in range(self.num_experts):
-                hit = 1.0 if eid in hit_set else 0.0
-                state.ema[eid] = self.ema_beta * state.ema[eid] + (1.0 - self.ema_beta) * hit
+            # Vectorized EMA: decay the whole array once at C level, then add
+            # (1-beta) to the few hit experts. This is equivalent to the prior
+            # per-expert loop because numpy indexed += does not accumulate
+            # duplicate indices, matching the original set()-based hit semantics.
+            state.ema *= self.ema_beta
+            state.ema[np.array(experts, dtype=np.intp)] += self._one_minus_beta
 
             state.recent_queue.append(experts)
             for eid in experts:
@@ -109,7 +118,7 @@ class LRCExpertCachePolicy:
                 state.last_used[eid] = state.step
 
             if router_scores is not None:
-                score_row = list(score_rows[row_index])
+                score_row = score_rows[row_index]
                 for eid, score in zip(experts, score_row, strict=False):
                     state.router_score[eid] = float(score)
 
@@ -129,10 +138,8 @@ class LRCExpertCachePolicy:
     ) -> int | None:
         """Return resident expert id with the lowest predicted hotness."""
         loading = loading or set()
-        candidates = [
-            eid for eid in slot_owner.values()
-            if eid not in protected and eid not in loading
-        ]
+        skip = protected | loading
+        candidates = [eid for eid in slot_owner.values() if eid not in skip]
         if not candidates:
             candidates = [eid for eid in slot_owner.values() if eid not in protected]
         if not candidates:
@@ -156,9 +163,3 @@ class LRCExpertCachePolicy:
     def _victim_key(self, layer_idx: int, expert_id: int) -> tuple[float, int, int]:
         state = self.layer_states[layer_idx]
         return (self.hotness(layer_idx, expert_id), state.last_used[expert_id], expert_id)
-
-    def _valid_expert(self, expert_id: int) -> int:
-        expert_id = int(expert_id)
-        if expert_id < 0 or expert_id >= self.num_experts:
-            raise ValueError(f"expert id out of range: {expert_id}")
-        return expert_id

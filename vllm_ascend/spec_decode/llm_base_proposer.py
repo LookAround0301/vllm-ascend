@@ -172,7 +172,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             self.tp_group_context = nullcontext()
 
-        self.use_cuda_graph = self.runner._use_aclgraph() and not self.speculative_config.enforce_eager
+        # DSA(use_compress,如 DeepSeek-V4)下 MTP draft 的 FULL 图捕获
+        # metadata 不完整:先缺 *_ratio_to_sas_metadata(dsa_v1 build() 三连 assert),
+        # 补上后又缺 positions_cpu(build_decode_metadata 崩)……是条从未对 DSA 验证过的
+        # 路径。与 v32 一律 force-eager(speculative.py:531 的 FIXME)同理,这里让 draft
+        # 走 eager;主模型仍可用 FULL_DECODE_ONLY 图(MTP head 很小,eager 代价低)。
+        # dummy_run 内部 `if not self.use_cuda_graph: aclgraph_runtime_mode = NONE` 会把
+        # FULL 捕获分支一起短路掉。
+        self.use_cuda_graph = (
+            self.runner._use_aclgraph()
+            and not self.speculative_config.enforce_eager
+            and not self.use_compress
+        )
 
         # TODO: Remove it when the bug of fx-graph is solved
         self.maybe_eager_context: AbstractContextManager[Any] = nullcontext()
@@ -550,9 +561,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.pcp_size * self.dcp_size > 1 and draft_step > 0:
                     assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
                     common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:num_reqs]
+                # DSA(SAS)注意力的 build() 强制要求这三个 *_ratio_to_sas_metadata
+                # 字典非 None(见 dsa_v1.py:508-515),MTP draft FULL 图捕获路径此前
+                # 漏传,导致 AssertionError。镜像同文件 794-801 的写法补上。
+                extra_attn_metadata_args: dict = {}
+                if self.use_compress:
+                    extra_attn_metadata_args = dict(
+                        prefill_ratio_to_sas_metadata=dict(),
+                        decode_ratio_to_sas_metadata=dict(),
+                        common_ratio_to_sas_metadata=dict(),
+                        block_size=self.draft_attn_groups[0].kv_cache_spec.block_size,
+                    )
                 attn_metadata_eagle = builder.build_for_graph_capture(
                     common_attn_metadata,
                     AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill,
+                    **extra_attn_metadata_args,
                 )
                 per_layer_attn_metadata = dict()
                 for layer_name in self.attn_layer_names:

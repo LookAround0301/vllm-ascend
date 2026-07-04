@@ -4804,8 +4804,21 @@ class NPUModelRunner(GPUModelRunner):
 
     def profile_cudagraph_memory(self) -> int:
         parent_module_name = _get_gpu_model_runner_module_name(self)
-        with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
-            result = GPUModelRunner.profile_cudagraph_memory(self)
+        # This runs a throwaway eager forward (npugraph_ex fx_run_eagerly) on
+        # dummy inputs to estimate graph memory. Expert weights aren't
+        # reactively loaded yet → GMM yields NaN hidden_states → prefetch
+        # prediction degenerates to [0..topk] and would fire wasteful H2D
+        # copies + pollute the expert cache. Skip prefetch side-effects for
+        # the whole estimate, same as profile_run. The real graph used at
+        # decode is captured/replayed elsewhere with _skip_prefill=False.
+        if hasattr(self, 'offload_manager'):
+            self.offload_manager._skip_prefill = True
+        try:
+            with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+                result = GPUModelRunner.profile_cudagraph_memory(self)
+        finally:
+            if hasattr(self, 'offload_manager'):
+                self.offload_manager._skip_prefill = False
 
         reset_graph_params()
 
