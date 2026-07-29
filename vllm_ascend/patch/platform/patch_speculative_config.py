@@ -4,6 +4,7 @@ from vllm.config.speculative import SpeculativeConfig
 from vllm.utils.import_utils import LazyLoader
 
 _orig_post_init = SpeculativeConfig.__post_init__
+_LEGACY_QWEN3_DSPARK_BLOCK_SIZE = 7
 
 if TYPE_CHECKING:
     import vllm.model_executor.layers.quantization as me_quant
@@ -16,6 +17,23 @@ else:
 
 def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
     initial_architecture = hf_config.architectures[0]
+    if initial_architecture == "DSparkDraftModel" and hf_config.model_type == "qwen3":
+        # Legacy Qwen3/GQA DSpark checkpoints keep the inference-only fields
+        # under dflash_config and use the training-time architecture name.
+        # Normalize those values before vLLM inspects the model registry.
+        dflash_config = getattr(hf_config, "dflash_config", None) or {}
+
+        def get_dflash_value(name: str) -> Any:
+            if isinstance(dflash_config, dict):
+                return dflash_config.get(name)
+            return getattr(dflash_config, name, None)
+
+        updates: dict[str, Any] = {"architectures": ["Qwen3DSparkModel"]}
+        for name in ("mask_token_id", "target_layer_ids"):
+            if (value := get_dflash_value(name)) is not None:
+                updates[name] = value
+        hf_config.update(updates)
+
     if hf_config.model_type in ("deepseek_v3", "deepseek_v32", "deepseek_v4", "glm_moe_dsa"):
         target_model_type = hf_config.model_type
         hf_config.model_type = "deepseek_mtp"
@@ -147,6 +165,23 @@ def _dspark_post_init(self):
         # gqa backend dspark
         if getattr(draft_hf_config, "ptd_token_id", None) is None:  # type: ignore
             draft_hf_config.ptd_token_id = getattr(draft_hf_config, "mask_token_id", None)  # type: ignore
+        architectures = getattr(draft_hf_config, "architectures", ()) or ()
+        if getattr(draft_hf_config, "model_type", None) == "qwen3" and "Qwen3DSparkModel" in architectures:
+            block_size = getattr(draft_hf_config, "block_size", None)
+            if block_size is None:
+                raise ValueError("Qwen3/GQA DSpark requires block_size in the draft config.")
+            if block_size != _LEGACY_QWEN3_DSPARK_BLOCK_SIZE:
+                raise ValueError(
+                    "Kimi K3 legacy Qwen3/GQA DSpark requires the trained "
+                    f"block_size={_LEGACY_QWEN3_DSPARK_BLOCK_SIZE}; got "
+                    f"{block_size}."
+                )
+            if self.num_speculative_tokens != block_size:
+                raise ValueError(
+                    "Qwen3/GQA DSpark requires num_speculative_tokens to match "
+                    f"the trained block_size ({block_size}); got "
+                    f"{self.num_speculative_tokens}."
+                )
 
 
 SpeculativeConfig.hf_config_override = hf_config_override

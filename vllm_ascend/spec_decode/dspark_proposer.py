@@ -30,13 +30,29 @@ class AscendDSparkProposer(AscendDflashProposer):
         device: torch.device,
         runner=None,
     ):
-        super().__init__(vllm_config, device, runner=runner)
         assert vllm_config.speculative_config is not None
+        additional_config = getattr(vllm_config, "additional_config", None) or {}
+        if additional_config.get("enable_reduce_sample", False):
+            raise ValueError(
+                "DSpark on the v1 model runner does not support "
+                "enable_reduce_sample: the reduced sampling path bypasses the "
+                "DSpark Markov-head correction. Set "
+                "additional_config.enable_reduce_sample=false."
+            )
+        finegrained_tp_config = additional_config.get("finegrained_tp_config", {}) or {}
+        if finegrained_tp_config.get("lmhead_tensor_parallel_size", 0):
+            raise ValueError(
+                "DSpark on the v1 model runner does not support fine-grained "
+                "LM-head tensor parallelism; keep "
+                "additional_config.finegrained_tp_config."
+                "lmhead_tensor_parallel_size=0."
+            )
         if vllm_config.speculative_config.draft_sample_method == "probabilistic":
             raise ValueError(
                 "DSpark probabilistic draft sampling is not supported on the v1 "
                 "model runner; use greedy (the default) instead."
             )
+        super().__init__(vllm_config, device, runner=runner)
         self.sample_from_anchor = not getattr(self.draft_model_config.hf_config, "dspark_bonus_anchor", False)
         if self.sample_from_anchor:
             self.num_query_per_req = self.num_speculative_tokens
@@ -91,6 +107,10 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._per_group_block_tables: dict[int, torch.Tensor] = {}
         # per-gid slot_mapping from runner (just read)
         self._per_group_slot_mappings: dict[int, torch.Tensor] = {}
+        # Per-gid logical block size used by the expanded block table and
+        # attention kernel. This may be smaller than kv_cache_spec.block_size,
+        # which remains the KV manager's physical page size.
+        self._per_group_kernel_block_sizes: dict[int, int] = {}
 
         # per-gid block_table (use in proposer)
         self._per_group_block_table_buffers: dict[int, torch.Tensor] = {}
@@ -101,6 +121,40 @@ class AscendDSparkProposer(AscendDflashProposer):
 
         # per-layer context slot mappings as a flat list
         self._context_slot_mapping_buffers: list[torch.Tensor | None] | None = None
+
+    def _resolve_kernel_block_size(
+        self,
+        gid: int,
+        kv_cache_spec,
+        kernel_block_sizes,
+    ) -> int:
+        """Return the logical block size used by the expanded block table."""
+        runner = getattr(self, "runner", None)
+        input_batch = getattr(runner, "input_batch", None)
+        block_tables = getattr(input_batch, "block_table", None)
+        if block_tables is not None:
+            try:
+                return int(block_tables[gid].block_size)
+            except (AttributeError, IndexError, KeyError, TypeError):
+                pass
+
+        candidate = None
+        if kernel_block_sizes is not None:
+            if isinstance(kernel_block_sizes, (list, tuple)):
+                if gid < len(kernel_block_sizes):
+                    candidate = kernel_block_sizes[gid]
+                elif len(kernel_block_sizes) == 1:
+                    # Compatibility with the old Ascend caller, which passed
+                    # only the first group's supported kernel sizes.
+                    candidate = kernel_block_sizes[0]
+            else:
+                candidate = kernel_block_sizes
+
+        if isinstance(candidate, (list, tuple)):
+            candidate = candidate[0] if candidate else None
+        if candidate is not None:
+            return int(candidate)
+        return int(kv_cache_spec.block_size)
 
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None) -> None:
         # Find draft layers (attention layers added by draft model)
@@ -118,6 +172,7 @@ class AscendDSparkProposer(AscendDflashProposer):
 
         self._draft_attn_layer_names = set(self.model.get_draft_kv_cache_layer_names())
         self.attn_layer_names = list(sorted(self._draft_attn_layer_names))
+        self._per_group_kernel_block_sizes = {}
 
         # there are many kv groups other than one
         for kv_cache_gid, kv_cache_group_spec in enumerate(kv_cache_config.kv_cache_groups):
@@ -135,13 +190,23 @@ class AscendDSparkProposer(AscendDflashProposer):
                 key = (attn_backend.full_cls_name(), layer_kv_cache_spec)
 
                 if key not in attention_groups:
+                    kernel_block_size = self._resolve_kernel_block_size(
+                        kv_cache_gid,
+                        layer_kv_cache_spec,
+                        kernel_block_sizes,
+                    )
                     attn_group = AttentionGroup(
                         attn_backend,
                         [layer_name],
                         layer_kv_cache_spec,
                         kv_cache_gid,
                     )
-                    attn_group.create_metadata_builders(self.vllm_config, self.device)
+                    attn_group.create_metadata_builders(
+                        self.vllm_config,
+                        self.device,
+                        kernel_block_size=kernel_block_size,
+                    )
+                    self._per_group_kernel_block_sizes[kv_cache_gid] = kernel_block_size
                     attention_groups[key] = attn_group
                 else:
                     attention_groups[key].layer_names.append(layer_name)
@@ -161,7 +226,7 @@ class AscendDSparkProposer(AscendDflashProposer):
             )
 
         self.kv_cache_gid = self.draft_attn_groups[0].kv_cache_group_id
-        self.kernel_block_size = int(self.draft_attn_groups[0].kv_cache_spec.block_size)
+        self.kernel_block_size = self._per_group_kernel_block_sizes[self.kv_cache_gid]
 
         name_to_gid = {
             ln: gid
@@ -236,7 +301,7 @@ class AscendDSparkProposer(AscendDflashProposer):
             gid_block_table = self._per_group_block_table_buffers.get(gid)
             if gid_block_table is None:
                 continue
-            kv_block_size = int(attn_group.kv_cache_spec.block_size)
+            kernel_block_size = self._per_group_kernel_block_sizes[gid]
             copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid[1,](
                 # Inputs
                 next_token_ids_ptr=next_token_ids,
@@ -258,7 +323,7 @@ class AscendDSparkProposer(AscendDflashProposer):
                 num_rejected_tokens_ptr=num_rejected_tokens_gpu,
                 # Scalars
                 parallel_drafting_token_id=self.parallel_drafting_token_id,
-                block_size=kv_block_size,
+                block_size=kernel_block_size,
                 num_query_per_req=self.num_query_per_req,
                 num_speculative_tokens=self.num_speculative_tokens,
                 total_input_tokens=self._dflash_num_context,
