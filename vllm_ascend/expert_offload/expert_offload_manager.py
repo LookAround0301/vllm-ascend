@@ -478,11 +478,20 @@ class ExpertOffloadManager:
                 self._process_scale_bias_cpu_buffers()
                 self._encode_w4a8_dynamic_weight_scales()
         elif first_w13.dtype == torch.uint8:
-            self._cast_cpu_weights_to_device_format(mxfp4=True)
+            # mxfp4 packed fp4 weights ship as uint8. Distinguish W4A16 (weight-
+            # only, e.g. Kimi-K3) from W4A8_MXFP by the quant method class —
+            # both are uint8 but use DIFFERENT device formats (W4A16: unpack→
+            # cast29(bf16)→int4pack; W4A8_MXFP: cast29(float8)→transpose).
+            qm = getattr(first_layer, 'quant_method', None)
+            if type(qm).__name__ == 'AscendW4A16MXFP4FusedMoEMethod':
+                self._cast_cpu_weights_to_device_format(w4a16_mxfp4=True)
+            else:
+                self._cast_cpu_weights_to_device_format(mxfp4=True)
         # else: non-quantized model, no-op
 
     def _cast_cpu_weights_to_device_format(self, mxfp4: bool = False,
-                                            w4a8_dynamic: bool = False):
+                                            w4a8_dynamic: bool = False,
+                                            w4a16_mxfp4: bool = False):
         """Relayout resident CPU w13/w2 expert buffers into the device format.
 
         NZ (W8A8) and format-29 mxfp4 (W4A8_MXFP) are equal-length relayouts,
@@ -500,7 +509,25 @@ class ExpertOffloadManager:
         for layer_id in range(num_moe_layers):
             w13 = torch.stack(self.w13_weights_cpu[layer_id]).to('npu')
             w2 = torch.stack(self.w2_weights_cpu[layer_id]).to('npu')
-            if mxfp4:
+            if w4a16_mxfp4:
+                # Mirror AscendW4A16MXFP4FusedMoEMethod.process_weights_after_loading
+                # (pr12950): unpack uint8→fp4(float32) → transpose → cast29(bf16) →
+                # int4pack. The CPU buffer then holds the same device-format bytes
+                # the device slot gets via process_weights, so H2D copy_ lands
+                # correctly. (Needs A5 to verify byte-for-byte against device.)
+                from vllm_ascend.quantization.methods.w4a16_mxfp4 import (
+                    unpack_uint8_to_fp4_return_float32)
+                w13 = unpack_uint8_to_fp4_return_float32(w13)
+                w13 = w13.transpose(1, 2)
+                w13 = torch_npu.npu_format_cast(
+                    w13, 29, customize_dtype=torch.bfloat16)
+                w13 = torch_npu.npu_convert_weight_to_int4pack(w13).contiguous()
+                w2 = unpack_uint8_to_fp4_return_float32(w2)
+                w2 = w2.transpose(1, 2)
+                w2 = torch_npu.npu_format_cast(
+                    w2, 29, customize_dtype=torch.bfloat16)
+                w2 = torch_npu.npu_convert_weight_to_int4pack(w2).contiguous()
+            elif mxfp4:
                 w13 = w13.transpose(1, 2).contiguous()
                 w2 = w2.transpose(1, 2).contiguous()
                 w13 = torch_npu.npu_format_cast(
