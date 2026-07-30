@@ -25,7 +25,7 @@ from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.distributed import get_ep_group
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.mxfp_compat import (
     FLOAT8_E8M0FNU_DTYPE,
     ensure_mxfp4_moe_available,
@@ -182,10 +182,24 @@ class AscendW4A16MXFP4FusedMoEMethod(AscendMoEScheme):
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
-            mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
-                               hidden_states=x)
-            if (num_tokens > mgr.offload_threshold and mgr._prefill_initialized
-                    and not mgr._skip_prefill):
+            is_mc = getattr(layer, 'enable_multi_card', False)
+            if is_mc:
+                mgr.update_weights_multi_card(layer, topk_ids, log2phy,
+                                              topk_weights, hidden_states=x,
+                                              mc2_mask=mc2_mask)
+            else:
+                mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
+                                   hidden_states=x)
+            # Prefill regime: drive off the comm TYPE (MC2=decode, else
+            # prefill) — the single source of truth — so decode/prefill never
+            # disagree at the mc2_capacity/offload_threshold gap.
+            if is_mc:
+                prefill_regime = _EXTRA_CTX.moe_comm_type != MoECommType.MC2
+            else:
+                prefill_regime = num_tokens > mgr.offload_threshold
+            if (prefill_regime
+                    and mgr._prefill_initialized
+                    and (is_mc or not mgr._skip_prefill)):
                 use_prefill_pool = True
                 try:
                     layer_idx = mgr.moe_layers.index(layer)
@@ -195,20 +209,47 @@ class AscendW4A16MXFP4FusedMoEMethod(AscendMoEScheme):
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         if use_prefill_pool:
-            # Prefill pool: full-overwrite pool holds all experts; use it with
-            # an identity log2phy. (single tensors, like W4A8_MXFP's path.)
+            # Prefill pool (single tensors — mxfp4 path). Multi-card: this
+            # rank's EP shard (loaded by update_weights_multi_card) via All2All;
+            # single-card: all experts with an identity log2phy.
             w1 = mgr._prefill_w13[prefill_slot]
             w2 = mgr._prefill_w2[prefill_slot]
             w1_scale = mgr._prefill_w13_scale[prefill_slot]
             w2_scale = mgr._prefill_w2_scale[prefill_slot]
             _saved_nle = layer.moe_config.num_local_experts
             _saved_lne = layer.local_num_experts
-            ntotal = mgr.num_total_experts
-            layer.moe_config.num_local_experts = ntotal
-            layer.local_num_experts = ntotal
-            _saved_td_nel = moe_comm_method.token_dispatcher.num_experts_local
-            moe_comm_method.token_dispatcher.num_experts_local = ntotal
-            log2phy = mgr._prefill_log2phy
+            td = moe_comm_method.token_dispatcher
+            _saved_td = {
+                "num_experts_local": getattr(td, "num_experts_local", None),
+                "num_local_experts": getattr(td, "num_local_experts", None),
+                "expert_ids_per_ep_rank": getattr(td, "expert_ids_per_ep_rank", None),
+                "local_expert_indices": getattr(td, "local_expert_indices", None),
+            }
+            if is_mc:
+                # Multi-card prefill = EP shard via All2All: patch the All2All
+                # dispatcher (init'd with decode nel=num_device_experts) to the
+                # shard so its local_expert_indices / all-to-all splits match.
+                shard = mgr.mc_shard_size
+                layer.moe_config.num_local_experts = shard
+                layer.local_num_experts = shard
+                if getattr(td, "num_local_experts", None) is not None:
+                    td.num_local_experts = shard
+                    td.local_expert_indices = [td.ep_rank * shard + i for i in range(shard)]
+                    if td.expert_ids_per_ep_rank is not None:
+                        td.expert_ids_per_ep_rank = torch.tensor(
+                            [i % shard for i in range(mgr.num_total_experts)],
+                            dtype=torch.int32, device=td.expert_ids_per_ep_rank.device)
+                if getattr(td, "num_experts_local", None) is not None:
+                    td.num_experts_local = shard
+                expert_map = mgr._get_shard_expert_map()
+                log2phy = None
+            else:
+                ntotal = mgr.num_total_experts
+                layer.moe_config.num_local_experts = ntotal
+                layer.local_num_experts = ntotal
+                if getattr(td, "num_experts_local", None) is not None:
+                    td.num_experts_local = ntotal
+                log2phy = mgr._prefill_log2phy
         else:
             w1 = getattr(
                 layer,
@@ -220,13 +261,6 @@ class AscendW4A16MXFP4FusedMoEMethod(AscendMoEScheme):
             )
             w1_scale = layer.w13_weight_scale
             w2_scale = layer.w2_weight_scale
-
-        # Trigger next-layer expert prefetch AFTER GMM kernel submission
-        # (decode path only) so compute_event captures real GMM work.
-        if (getattr(layer, 'enable_expert_offload', False)
-                and not use_prefill_pool
-                and num_tokens <= mgr.offload_threshold):
-            mgr.trigger_next_layer_prefetch(layer, x)
 
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
@@ -254,12 +288,23 @@ class AscendW4A16MXFP4FusedMoEMethod(AscendMoEScheme):
                 swiglu_limit=layer.swiglu_limit,
             )
         )
-
+        # Trigger next-layer expert prefetch AFTER GMM kernel submission
+        # (decode path only) so compute_event captures real GMM work.
+        if (getattr(layer, 'enable_expert_offload', False)
+                and not use_prefill_pool
+                and num_tokens <= mgr.offload_threshold):
+            mgr.trigger_next_layer_prefetch(layer, x)
         # Restore decode-path expert count after prefill override.
         if use_prefill_pool:
             layer.moe_config.num_local_experts = _saved_nle
             layer.local_num_experts = _saved_lne
-            moe_comm_method.token_dispatcher.num_experts_local = _saved_td_nel
+            td = moe_comm_method.token_dispatcher
+            if _saved_td["num_experts_local"] is not None and hasattr(td, "num_experts_local"):
+                td.num_experts_local = _saved_td["num_experts_local"]
+            if _saved_td["num_local_experts"] is not None and hasattr(td, "num_local_experts"):
+                td.num_local_experts = _saved_td["num_local_experts"]
+                td.local_expert_indices = _saved_td["local_expert_indices"]
+                td.expert_ids_per_ep_rank = _saved_td["expert_ids_per_ep_rank"]
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):
