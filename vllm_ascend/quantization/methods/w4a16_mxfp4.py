@@ -175,20 +175,66 @@ class AscendW4A16MXFP4FusedMoEMethod(AscendMoEScheme):
 
         topk_weights = topk_weights.to(x.dtype)
 
+        # Expert offload: incrementally page in needed experts, update log2phy.
+        use_prefill_pool = False
+        prefill_slot = -1
+        num_tokens = topk_ids.size(0)
+        if getattr(layer, 'enable_expert_offload', False):
+            from vllm_ascend.expert_offload import ExpertOffloadManager
+            mgr = ExpertOffloadManager.get_instance()
+            mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
+                               hidden_states=x)
+            if (num_tokens > mgr.offload_threshold and mgr._prefill_initialized
+                    and not mgr._skip_prefill):
+                use_prefill_pool = True
+                try:
+                    layer_idx = mgr.moe_layers.index(layer)
+                except ValueError:
+                    layer_idx = 0
+                prefill_slot = layer_idx % len(mgr._prefill_w13)
+
         moe_comm_method = _EXTRA_CTX.moe_comm_method
-        return moe_comm_method.fused_experts(
+        if use_prefill_pool:
+            # Prefill pool: full-overwrite pool holds all experts; use it with
+            # an identity log2phy. (single tensors, like W4A8_MXFP's path.)
+            w1 = mgr._prefill_w13[prefill_slot]
+            w2 = mgr._prefill_w2[prefill_slot]
+            w1_scale = mgr._prefill_w13_scale[prefill_slot]
+            w2_scale = mgr._prefill_w2_scale[prefill_slot]
+            _saved_nle = layer.moe_config.num_local_experts
+            _saved_lne = layer.local_num_experts
+            ntotal = mgr.num_total_experts
+            layer.moe_config.num_local_experts = ntotal
+            layer.local_num_experts = ntotal
+            _saved_td_nel = moe_comm_method.token_dispatcher.num_experts_local
+            moe_comm_method.token_dispatcher.num_experts_local = ntotal
+            log2phy = mgr._prefill_log2phy
+        else:
+            w1 = getattr(
+                layer,
+                "w13_weight_packed" if self.use_weight_packed else "w13_weight",
+            )
+            w2 = getattr(
+                layer,
+                "w2_weight_packed" if self.use_weight_packed else "w2_weight",
+            )
+            w1_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
+
+        # Trigger next-layer expert prefetch AFTER GMM kernel submission
+        # (decode path only) so compute_event captures real GMM work.
+        if (getattr(layer, 'enable_expert_offload', False)
+                and not use_prefill_pool
+                and num_tokens <= mgr.offload_threshold):
+            mgr.trigger_next_layer_prefetch(layer, x)
+
+        final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                w1=getattr(
-                    layer,
-                    "w13_weight_packed" if self.use_weight_packed else "w13_weight",
-                ),
-                w2=getattr(
-                    layer,
-                    "w2_weight_packed" if self.use_weight_packed else "w2_weight",
-                ),
+                w1=w1,
+                w2=w2,
                 quant_type=self.quant_type,
                 dynamic_eplb=self.dynamic_eplb,
                 expert_map=expert_map,
@@ -203,11 +249,18 @@ class AscendW4A16MXFP4FusedMoEMethod(AscendMoEScheme):
                 mxfp_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
                 mxfp_per_token_scale_dtype=None,
                 mxfp_use_bf16=(x.dtype == torch.bfloat16),
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
                 swiglu_limit=layer.swiglu_limit,
             )
         )
+
+        # Restore decode-path expert count after prefill override.
+        if use_prefill_pool:
+            layer.moe_config.num_local_experts = _saved_nle
+            layer.local_num_experts = _saved_lne
+            moe_comm_method.token_dispatcher.num_experts_local = _saved_td_nel
+        return final_hidden_states
 
     def process_weights_after_loading(self, layer):
         w13_weight = getattr(
