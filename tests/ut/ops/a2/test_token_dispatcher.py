@@ -825,3 +825,61 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         self.assertIsNotNone(result.group_list)
         self.assertIsNotNone(result.dynamic_scale)
         self.assertEqual(result.group_list_type, 1)
+
+    def test_w4a8_mxfp_dispatch_uses_bf16_alltoall_fallback(self):
+        hidden_states = torch.randn(8, 16, dtype=torch.bfloat16)
+        topk_weights = torch.rand(8, 2)
+        topk_ids = torch.randint(0, 4, (8, 2)).long()
+        token_dispatch_input = build_token_dispatch_input_fixture(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            quant_type=QuantType.W4A8MXFP,
+            act_quant_type=torch.float8_e4m3fn,
+        )
+        self.dispatcher.expert_ids_per_ep_rank = torch.tensor([0, 1], dtype=torch.int32)
+        self.dispatcher.local_expert_indices = [0, 1]
+
+        alltoall_handle = MagicMock()
+        with (
+            patch(
+                "vllm_ascend.ops.fused_moe.token_dispatcher.async_all_to_all",
+                return_value=(None, torch.randn(16, 16, dtype=torch.bfloat16), alltoall_handle),
+            ) as mock_alltoall,
+            patch(
+                "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_dynamic_quant"
+            ) as mock_dynamic_quant,
+        ):
+            result = self.dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+
+        mock_dynamic_quant.assert_not_called()
+        self.mock_npu_moe_init_routing_v2.assert_not_called()
+        mock_alltoall.assert_called_once()
+        alltoall_handle.wait.assert_called_once()
+        self.assertIsNone(result.dynamic_scale)
+        self.assertIsInstance(result.combine_metadata, MoEAllToAllCombineMetadata)
+
+    def test_mxfp_routing_uses_prequantized_mode(self):
+        dispatcher = TokenDispatcherWithAll2AllV.__new__(TokenDispatcherWithAll2AllV)
+        dispatcher.num_local_experts = 2
+        dispatcher.lora_context = None
+
+        global_input_tokens = torch.zeros((4, 8), dtype=torch.uint8)
+        dynamic_scale_after_all2all = torch.zeros((4, 2), dtype=torch.uint8)
+        local_expert_indices = torch.arange(4, dtype=torch.int32)
+        routing_error = RuntimeError("MoeInitRoutingV3 dtype mismatch")
+
+        with (
+            patch("torch_npu.npu_moe_init_routing_v2", side_effect=routing_error) as mock_routing,
+            pytest.raises(RuntimeError, match="MoeInitRoutingV3 dtype mismatch"),
+        ):
+            dispatcher._dispatch_postprocess(
+                global_input_tokens,
+                dynamic_scale_after_all2all,
+                local_expert_indices,
+                True,
+                torch.float8_e4m3fn,
+                torch.float8_e8m0fnu,
+            )
+
+        assert mock_routing.call_args.kwargs["quant_mode"] == -1
