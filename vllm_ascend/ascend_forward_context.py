@@ -93,6 +93,17 @@ def _cann_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:
     return quant_name in _CANN_MEGAMOE_SUPPORTED_QUANT_NAMES
 
 
+def _should_skip_compiled_for_multi_card_offload(
+    moe_comm_type: MoECommType | None,
+) -> bool:
+    expert_offload_config = get_ascend_config().expert_offload_config
+    return (
+        expert_offload_config.expert_offload
+        and expert_offload_config.enable_multi_card
+        and moe_comm_type == MoECommType.ALLTOALL
+    )
+
+
 @contextmanager
 def set_ascend_forward_context(
     attn_metadata: Any,
@@ -141,6 +152,13 @@ def set_ascend_forward_context(
 
         forward_context.moe_comm_type = moe_comm_type
         forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
+        if _should_skip_compiled_for_multi_card_offload(moe_comm_type):
+            # Multi-card offload uses an MC2 device buffer for decode and an
+            # ALLTOALL expert pool for prefill. These paths have different
+            # weight placement and dispatcher state, so they must not share a
+            # compiled graph. FULL_DECODE_ONLY still compiles and captures the
+            # graphable MC2 decode path while ALLTOALL prefill runs eagerly.
+            forward_context.skip_compiled = True
 
         tp_world_size = get_tensor_model_parallel_world_size()
 
