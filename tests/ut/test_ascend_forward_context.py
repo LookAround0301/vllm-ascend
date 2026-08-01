@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +13,14 @@ def reset_mc2_tokens_capacity(monkeypatch):
     monkeypatch.setattr(
         afc,
         "get_ascend_config",
-        lambda: SimpleNamespace(enable_prefill_mc2=False, enable_fused_mc2=0),
+        lambda: SimpleNamespace(
+            enable_prefill_mc2=False,
+            enable_fused_mc2=0,
+            expert_offload_config=SimpleNamespace(
+                expert_offload=False,
+                enable_multi_card=False,
+            ),
+        ),
     )
 
 
@@ -78,8 +86,96 @@ def _patch_select_moe_comm_method_deps(
     monkeypatch.setattr(
         afc,
         "get_ascend_config",
-        lambda: SimpleNamespace(enable_fused_mc2=enable_fused_mc2, enable_prefill_mc2=enable_prefill_mc2),
+        lambda: SimpleNamespace(
+            enable_fused_mc2=enable_fused_mc2,
+            enable_prefill_mc2=enable_prefill_mc2,
+            expert_offload_config=SimpleNamespace(
+                expert_offload=False,
+                enable_multi_card=False,
+            ),
+        ),
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "expert_offload",
+        "enable_multi_card",
+        "moe_comm_type",
+        "expected",
+    ),
+    [
+        (True, True, MoECommType.ALLTOALL, True),
+        (True, True, MoECommType.MC2, False),
+        (True, False, MoECommType.ALLTOALL, False),
+        (False, True, MoECommType.ALLTOALL, False),
+    ],
+)
+def test_should_skip_compiled_for_multi_card_offload(
+    monkeypatch,
+    expert_offload,
+    enable_multi_card,
+    moe_comm_type,
+    expected,
+):
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(
+            expert_offload_config=SimpleNamespace(
+                expert_offload=expert_offload,
+                enable_multi_card=enable_multi_card,
+            )
+        ),
+    )
+
+    assert afc._should_skip_compiled_for_multi_card_offload(moe_comm_type) is expected
+
+
+def test_set_forward_context_skips_compiled_alltoall_for_multi_card_offload(
+    monkeypatch,
+):
+    forward_context = SimpleNamespace(skip_compiled=False, dp_metadata=None)
+
+    @contextmanager
+    def fake_set_forward_context(**kwargs):
+        forward_context.skip_compiled = kwargs["skip_compiled"]
+        yield
+
+    monkeypatch.setattr(afc, "set_forward_context", fake_set_forward_context)
+    monkeypatch.setattr(afc, "get_forward_context", lambda: forward_context)
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(
+            expert_offload_config=SimpleNamespace(
+                expert_offload=True,
+                enable_multi_card=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        afc,
+        "select_moe_comm_method",
+        lambda *_: MoECommType.ALLTOALL,
+    )
+    monkeypatch.setattr(afc, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(afc, "is_moe_model", lambda _: False)
+    monkeypatch.setattr(afc, "enable_sp", lambda *_: False)
+    monkeypatch.setattr(afc, "has_layer_idx", lambda _: False)
+    monkeypatch.setattr(afc, "get_dp_group", lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(afc, "get_mc2_mask", lambda: None)
+
+    from vllm_ascend.ops.fused_moe import moe_comm_method
+
+    monkeypatch.setattr(moe_comm_method, "get_moe_comm_method", lambda _: None)
+
+    with afc.set_ascend_forward_context(
+        attn_metadata=None,
+        vllm_config=SimpleNamespace(),
+        num_tokens=8192,
+    ):
+        assert forward_context.skip_compiled is True
 
 
 def test_set_mc2_tokens_capacity_without_cudagraph_aligns_per_tp_rank():

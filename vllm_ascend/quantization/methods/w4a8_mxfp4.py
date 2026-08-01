@@ -26,6 +26,7 @@ from vllm.distributed import get_ep_group
 from vllm.forward_context import get_forward_context
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.device.mxfp_compat import (
     FLOAT8_E8M0FNU_DTYPE,
     ensure_mxfp4_linear_available,
@@ -35,6 +36,24 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
+
+
+def apply_mxfp4_weight_scale_layout(scale: torch.Tensor,
+                                    view_uint8: bool = False) -> torch.Tensor:
+    """MXFP4 weight-scale layout transform: ``reshape(...,n,k//2,2).transpose(-3,-2)``.
+
+    Works on a full tensor ``[g, n, k]`` or a single-expert slice ``[n, k]``
+    (the leading ``g`` dim collapses). ``view_uint8`` mirrors the DeepSeek-V4
+    DS subclass path where the loaded e8m0 scale is viewed as uint8 before the
+    transpose. Shared by the device-side ``process_weights_after_loading`` and
+    by the expert-offload manager so the CPU buffer holds the post-process byte
+    layout (avoids layout drift between the two paths).
+    """
+    *leading, n, k = scale.shape
+    out = scale.reshape(*leading, n, k // 2, 2)
+    if view_uint8:
+        out = out.view(torch.uint8)
+    return out.transpose(-3, -2)
 
 
 @register_scheme("W4A8_MXFP", "linear")
@@ -216,39 +235,140 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         if x.dtype not in [torch.float8_e4m3fn]:
             topk_weights = topk_weights.to(x.dtype)
 
-        moe_comm_method = get_forward_context().moe_comm_method
-        return moe_comm_method.fused_experts(
-            fused_experts_input=build_fused_experts_input(
-                hidden_states=x,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                w1=getattr(
+        # Expert offload: incrementally page in needed experts and update
+        # log2phy. Multi-card decode uses dynamic MC2 placement, while
+        # multi-card prefill loads this rank's EP shard into the prefill pool.
+        use_prefill_pool = False
+        prefill_slot = -1
+        num_tokens = topk_ids.size(0)
+        enable_expert_offload = getattr(layer, "enable_expert_offload", False)
+        forward_context = get_forward_context()
+        if enable_expert_offload:
+            from vllm_ascend.expert_offload import ExpertOffloadManager
+
+            mgr = ExpertOffloadManager.get_instance()
+            enable_multi_card = getattr(layer, "enable_multi_card", False)
+            if enable_multi_card:
+                mgr.update_weights_multi_card(
                     layer,
-                    "w13_weight_packed" if self.use_weight_packed else "w13_weight",
-                ),
-                w2=getattr(
-                    layer,
-                    "w2_weight_packed" if self.use_weight_packed else "w2_weight",
-                ),
-                quant_type=self.quant_type,
-                dynamic_eplb=self.dynamic_eplb,
-                expert_map=expert_map,
-                global_redundant_expert_num=global_redundant_expert_num,
-                mc2_mask=mc2_mask,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                log2phy=log2phy,
-                pertoken_scale=pertoken_scale,
-                activation=activation,
-                mxfp_act_quant_type=torch.float8_e4m3fn,
-                mxfp_weight_quant_type=torch_npu.float4_e2m1fn_x2,
-                mxfp_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
-                mxfp_per_token_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
-                mxfp_use_bf16=(x.dtype in [torch.bfloat16, torch.float8_e4m3fn]),
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                swiglu_limit=layer.swiglu_limit,
+                    topk_ids,
+                    log2phy,
+                    topk_weights,
+                    hidden_states=x,
+                    mc2_mask=mc2_mask,
+                )
+                prefill_regime = forward_context.moe_comm_type != MoECommType.MC2
+            else:
+                mgr.update_weights(layer, topk_ids, log2phy, topk_weights, hidden_states=x)
+                prefill_regime = num_tokens > mgr.offload_threshold
+
+            if (
+                prefill_regime
+                and mgr._prefill_initialized
+                and (enable_multi_card or not mgr._skip_prefill)
+            ):
+                use_prefill_pool = True
+                try:
+                    layer_idx = mgr.moe_layers.index(layer)
+                except ValueError:
+                    layer_idx = 0
+                prefill_slot = layer_idx % len(mgr._prefill_w13)
+
+        moe_comm_method = forward_context.moe_comm_method
+        if use_prefill_pool:
+            # W4A8_MXFP's MoE path expects single tensors, so unlike W4A8 the
+            # pool weights and scales must not be wrapped in lists.
+            w1 = mgr._prefill_w13[prefill_slot]
+            w2 = mgr._prefill_w2[prefill_slot]
+            w1_scale = mgr._prefill_w13_scale[prefill_slot]
+            w2_scale = mgr._prefill_w2_scale[prefill_slot]
+            _saved_nle = layer.moe_config.num_local_experts
+            _saved_lne = layer.local_num_experts
+            token_dispatcher = moe_comm_method.token_dispatcher
+            _saved_dispatcher_state = {
+                "num_experts_local": getattr(token_dispatcher, "num_experts_local", None),
+                "num_local_experts": getattr(token_dispatcher, "num_local_experts", None),
+                "expert_ids_per_ep_rank": getattr(token_dispatcher, "expert_ids_per_ep_rank", None),
+                "local_expert_indices": getattr(token_dispatcher, "local_expert_indices", None),
+            }
+            if enable_multi_card:
+                shard_size = mgr.mc_shard_size
+                layer.moe_config.num_local_experts = shard_size
+                layer.local_num_experts = shard_size
+                if getattr(token_dispatcher, "num_local_experts", None) is not None:
+                    token_dispatcher.num_local_experts = shard_size
+                    token_dispatcher.local_expert_indices = [
+                        token_dispatcher.ep_rank * shard_size + index for index in range(shard_size)
+                    ]
+                    if token_dispatcher.expert_ids_per_ep_rank is not None:
+                        token_dispatcher.expert_ids_per_ep_rank = torch.tensor(
+                            [index % shard_size for index in range(mgr.num_total_experts)],
+                            dtype=torch.int32,
+                            device=token_dispatcher.expert_ids_per_ep_rank.device,
+                        )
+                if getattr(token_dispatcher, "num_experts_local", None) is not None:
+                    token_dispatcher.num_experts_local = shard_size
+                expert_map = mgr._get_shard_expert_map()
+                log2phy = None
+            else:
+                num_total_experts = mgr.num_total_experts
+                layer.moe_config.num_local_experts = num_total_experts
+                layer.local_num_experts = num_total_experts
+                if getattr(token_dispatcher, "num_experts_local", None) is not None:
+                    token_dispatcher.num_experts_local = num_total_experts
+                log2phy = mgr._prefill_log2phy
+        else:
+            w1 = getattr(layer, "w13_weight_packed" if self.use_weight_packed else "w13_weight")
+            w2 = getattr(layer, "w2_weight_packed" if self.use_weight_packed else "w2_weight")
+            w1_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
+
+        try:
+            final_hidden_states = moe_comm_method.fused_experts(
+                fused_experts_input=build_fused_experts_input(
+                    hidden_states=x,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    w1=w1,
+                    w2=w2,
+                    quant_type=self.quant_type,
+                    dynamic_eplb=self.dynamic_eplb,
+                    expert_map=expert_map,
+                    global_redundant_expert_num=global_redundant_expert_num,
+                    mc2_mask=mc2_mask,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    log2phy=log2phy,
+                    pertoken_scale=pertoken_scale,
+                    activation=activation,
+                    mxfp_act_quant_type=torch.float8_e4m3fn,
+                    mxfp_weight_quant_type=torch_npu.float4_e2m1fn_x2,
+                    mxfp_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                    mxfp_per_token_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                    mxfp_use_bf16=(x.dtype in [torch.bfloat16, torch.float8_e4m3fn]),
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                    swiglu_limit=layer.swiglu_limit,
+                )
             )
-        )
+        finally:
+            # The dispatcher is shared across layers. Restore decode state even
+            # when the prefill kernel raises, otherwise later requests inherit
+            # the temporary EP-shard configuration.
+            if use_prefill_pool:
+                layer.moe_config.num_local_experts = _saved_nle
+                layer.local_num_experts = _saved_lne
+                if _saved_dispatcher_state["num_experts_local"] is not None:
+                    token_dispatcher.num_experts_local = _saved_dispatcher_state["num_experts_local"]
+                if _saved_dispatcher_state["num_local_experts"] is not None:
+                    token_dispatcher.num_local_experts = _saved_dispatcher_state["num_local_experts"]
+                    token_dispatcher.local_expert_indices = _saved_dispatcher_state["local_expert_indices"]
+                    token_dispatcher.expert_ids_per_ep_rank = _saved_dispatcher_state["expert_ids_per_ep_rank"]
+
+        # Trigger next-layer expert prefetch only after the GMM kernel has been
+        # submitted, so the recorded compute event covers the current layer.
+        if enable_expert_offload and not use_prefill_pool and num_tokens <= mgr.offload_threshold:
+            mgr.trigger_next_layer_prefetch(layer, x)
+        return final_hidden_states
 
     def process_weights_after_loading(self, layer):
         w13_weight = getattr(
@@ -259,15 +379,24 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             layer,
             "w2_weight_packed" if self.use_weight_packed else "w2_weight",
         )
-        w13_weight.data = torch_npu.npu_format_cast(
-            w13_weight.data, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
-        )
-        w2_weight.data = torch_npu.npu_format_cast(
-            w2_weight.data, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
-        )
-        w13_weight.data = w13_weight.data.transpose(1, 2)
-        w2_weight.data = w2_weight.data.transpose(1, 2)
-        g, n, k = layer.w13_weight_scale.shape
-        layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g, n, k // 2, 2).transpose(-3, -2)
-        g, n, k = layer.w2_weight_scale.shape
-        layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g, n, k // 2, 2).transpose(-3, -2)
+        if getattr(layer, "enable_expert_offload", False):
+            # Offload: NZ format cast is applied to the CPU buffer by the offload
+            # manager (_finalize_offload); device slots are filled via H2D from
+            # that buffer. Only transpose + scale layout here.
+            w13_weight.data = w13_weight.data.transpose(1, 2)
+            w2_weight.data = w2_weight.data.transpose(1, 2)
+            layer.w13_weight_scale.data = apply_mxfp4_weight_scale_layout(layer.w13_weight_scale.data)
+            layer.w2_weight_scale.data = apply_mxfp4_weight_scale_layout(layer.w2_weight_scale.data)
+        else:
+            w13_weight.data = torch_npu.npu_format_cast(
+                w13_weight.data, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
+            )
+            w2_weight.data = torch_npu.npu_format_cast(
+                w2_weight.data, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
+            )
+            w13_weight.data = w13_weight.data.transpose(1, 2)
+            w2_weight.data = w2_weight.data.transpose(1, 2)
+            g, n, k = layer.w13_weight_scale.shape
+            layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g, n, k // 2, 2).transpose(-3, -2)
+            g, n, k = layer.w2_weight_scale.shape
+            layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g, n, k // 2, 2).transpose(-3, -2)

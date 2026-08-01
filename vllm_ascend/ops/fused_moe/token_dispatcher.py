@@ -56,6 +56,7 @@ from vllm_ascend.utils import (
 
 EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
 EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
+MOE_ROUTING_QUANT_MODE_NONE = -1
 
 
 def _get_expert_token_nums_type(token_dispatch_input: MoETokenDispatchInput) -> int:
@@ -393,7 +394,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             else:
                 quant_mode = 3 if is_mxfp else 1
         else:
-            quant_mode = -1
+            quant_mode = MOE_ROUTING_QUANT_MODE_NONE
 
         num_tokens = hidden_states.shape[:-1].numel()
         apply_router_weight_on_input = token_dispatch_input.routing.apply_router_weight_on_input
@@ -490,7 +491,13 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         token_dispatch_input: MoETokenDispatchInput,
     ):
         use_mxfp_quant = token_dispatch_input.quant.is_mxfp
-        with_quant = token_dispatch_input.quant.dispatch_with_quant
+        # MoeInitRoutingV3 does not provide a pass-through kernel for the
+        # pre-quantized E4M3FN activation + E8M0 scale combination used by
+        # W4A8MXFP on A5. Keep All2All communication in BF16 for this method
+        # and let quant_apply_mlp perform the existing MXFP quantization after
+        # the tokens have been routed to their local experts.
+        requires_bf16_rerouting = token_dispatch_input.quant.quant_type == QuantType.W4A8MXFP
+        with_quant = token_dispatch_input.quant.dispatch_with_quant and not requires_bf16_rerouting
         dst_type = token_dispatch_input.quant.get_dst_type
         scale_type = token_dispatch_input.quant.get_scale_type
         hidden_states = token_dispatch_input.hidden_states
@@ -686,15 +693,17 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
                     global_input_tokens_local_experts_indices.shape[0], 1
                 )
                 dynamic_scale_for_routing = dynamic_scale_after_all2all.view(torch.float8_e8m0fnu)
+                active_num = experts_indices_2d_copy.shape[0]
                 global_input_tokens, reversed_global_input_permutation_mapping, _, routed_scale = (
                     torch_npu.npu_moe_init_routing_v2(
                         global_input_tokens,
                         experts_indices_2d_copy,
                         scale=dynamic_scale_for_routing,
-                        active_num=experts_indices_2d_copy.shape[0],
+                        active_num=active_num,
                         expert_num=self.num_local_experts,
                         expert_tokens_num_type=1,
                         expert_tokens_num_flag=True,
+                        quant_mode=MOE_ROUTING_QUANT_MODE_NONE,
                         active_expert_range=[0, self.num_local_experts],
                         x_dtype=dst_type,
                     )
