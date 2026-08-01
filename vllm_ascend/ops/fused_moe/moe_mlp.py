@@ -152,7 +152,7 @@ def _w4a8_situ_apply_mlp(
             hidden_states=hidden_states,
             dynamic_scale=None,
             act_quant_type=act_quant_type,
-            use_mxfp_quant=False,
+            use_mxfp_quant=use_mxfp_quant,
         )
         dispose_tensor(unquantized_hidden_states)
         externally_quantized_hidden_states = None

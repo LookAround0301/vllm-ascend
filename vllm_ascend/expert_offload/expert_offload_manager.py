@@ -20,6 +20,20 @@ def get_subscribed_compute_streams() -> set:
     return _SUBSCRIBED_COMPUTE_STREAMS
 
 
+def _expert_weight(layer, name: str):
+    """Resolve an expert weight tensor, packed-aware.
+
+    ascend w4a8_mxfp4 with ``use_weight_packed=True`` (e.g. Kimi-K3 routed via
+    compressed-tensors) stores weights as ``w13_weight_packed`` / ``w2_weight_packed``;
+    otherwise plain ``w13_weight`` / ``w2_weight``. Scales (``*_scale``) are never
+    packed. Return whichever attribute exists.
+    """
+    packed = getattr(layer, name + "_packed", None)
+    if packed is not None:
+        return packed
+    return getattr(layer, name)
+
+
 class ExpertOffloadManager:
     """Singleton manager for expert weight offloading.
 
@@ -35,7 +49,11 @@ class ExpertOffloadManager:
     _LOAD_POOL_WORKERS = 32
     # Bound on in-flight futures before a partial drain (releases owned clones
     # early so transient memory stays small). >> workers, so no starvation.
-    _LOAD_POOL_DRAIN_EVERY = 2048
+    # 128 (= 4x workers): for big MoE (Kimi-K3 1.5T) the old 2048 piled ~0.8T
+    # of owned clones on top of the 1.5T pinned buffer → host peak ~2.3T (near
+    # the 2.9T limit). 128 bounds in-flight clones to ~50G with no throughput
+    # loss (pool still runs 32-wide; only the drain point is denser).
+    _LOAD_POOL_DRAIN_EVERY = 128
 
     @classmethod
     def get_instance(cls) -> "ExpertOffloadManager":
@@ -47,7 +65,18 @@ class ExpertOffloadManager:
 
         self.offload_config = get_ascend_config().expert_offload_config
         self.num_device_experts = self.offload_config.num_device_experts
-        self.topk = vllm_config.model_config.hf_config.num_experts_per_tok
+        # topk: 标准 MoE 用 num_experts_per_tok;Kimi-K3 用 num_experts_per_token(在 text_config)
+        _hf = vllm_config.model_config.hf_config
+        _tc = getattr(_hf, "text_config", None)
+        self.topk = (
+            getattr(_hf, "num_experts_per_tok", None)
+            or getattr(_hf, "num_experts_per_token", None)
+            or getattr(_tc, "num_experts_per_tok", None)
+            or getattr(_tc, "num_experts_per_token", None)
+        )
+        assert self.topk, ("offload: cannot find num_experts_per_tok/num_experts_per_token "
+                           "on hf_config/text_config")
+        self.topk = int(self.topk)
         self.offload_threshold = self.num_device_experts // self.topk
 
         # Multi-card EP offload (stages 1-2). ep_rank/ep_size are resolved
@@ -228,9 +257,11 @@ class ExpertOffloadManager:
         assert ntotal == self.num_total_experts, \
             f"MoE layers must have same expert count: {ntotal} vs {self.num_total_experts}"
 
-        params_dtype = layer.w13_weight.dtype
-        w13_shape = (layer.w13_weight.shape[2], layer.w13_weight.shape[1])
-        w2_shape = (layer.w2_weight.shape[2], layer.w2_weight.shape[1])
+        _w13 = _expert_weight(layer, "w13_weight")
+        _w2 = _expert_weight(layer, "w2_weight")
+        params_dtype = _w13.dtype
+        w13_shape = (_w13.shape[2], _w13.shape[1])
+        w2_shape = (_w2.shape[2], _w2.shape[1])
 
         use_shard = self.offload_config.shard_per_rank
         if use_shard:
@@ -238,7 +269,8 @@ class ExpertOffloadManager:
             # experts (ntotal // ep_size), as per-expert pinned tensors (like
             # the non-shared path, but shard-sized). No mmap, no cross-process
             # sharing, no staging — H2D reads each expert's own pinned storage.
-            # Scales/offsets stay full-size (negligible memory). Placement must
+            # Scales/offsets are sharded the same way (see
+            # _init_layer_scale_buffers). Placement must
             # be constrained to EP ownership (expert e → rank e // shard) so a
             # rank only loads experts it actually holds.
             shard = ntotal // max(1, self.ep_size)
@@ -317,6 +349,12 @@ class ExpertOffloadManager:
     def _init_layer_scale_buffers(self, layer, layer_moe_idx: int,
                                    ntotal: int):
         """Allocate CPU scale/offset buffers for a single MoE layer."""
+        # shard-per-rank: like the weight buffers, each rank holds only its EP
+        # shard (ntotal // ep_size) of scale/offset/scale_bias, indexed LOCALLY.
+        # global<->local via _shard_local (mirrors the weight path); non-shard
+        # (single-card) keeps the full ntotal, global==local.
+        use_shard = self.offload_config.shard_per_rank
+        nalloc = (ntotal // max(1, self.ep_size)) if use_shard else ntotal
         attr_specs = [
             ("scale_cpu_buffers", "w13_weight_scale"),
             ("scale_cpu_buffers", "w2_weight_scale"),
@@ -346,7 +384,7 @@ class ExpertOffloadManager:
             buffers = buffer_dict[attr_name]
             while len(buffers) <= layer_moe_idx:
                 buffers.append([])
-            for _ in range(ntotal):
+            for _ in range(nalloc):
                 buffers[layer_moe_idx].append(
                     torch.empty(per_expert_shape, dtype=dtype,
                                 device="cpu", pin_memory=True))
@@ -464,7 +502,7 @@ class ExpertOffloadManager:
         is_w4a8 = (hasattr(first_layer, 'w13_weight_scale') and
                    first_layer.w13_weight_scale.dtype == torch.int64)
         if first_w13.dtype == torch.int8:
-            first_dev = first_layer.w13_weight
+            first_dev = _expert_weight(first_layer, "w13_weight")
             if first_dev.dtype == torch.int32:
                 # compressed_tensors W4A8: weight packed to int32
                 self._cast_cpu_weights_to_device_format(w4a8_dynamic=True)
@@ -479,6 +517,16 @@ class ExpertOffloadManager:
                 self._encode_w4a8_dynamic_weight_scales()
         elif first_w13.dtype == torch.uint8:
             self._cast_cpu_weights_to_device_format(mxfp4=True)
+            # W4A8_MXFP: also stamp the on-device expert weight slots with
+            # format-29 (NZ) so the format METADATA matches the NZ bytes that
+            # _cast_cpu_weights_to_device_format produced in the CPU buffer and
+            # that decode/prefill H2D writes into the slots at runtime. Without
+            # this the slot stays base-format; the fused-swiglu GMM reads it via
+            # raw storage (V4 works), but the SiTU raw npu_grouped_matmul path
+            # (Kimi-K3) checks the format and rejects fp4_e2m1 on base format
+            # (AclNN EZ1001 / error 161002). Bytes set here are overwritten by
+            # H2D; only the format persists.
+            self._cast_device_slots_to_mxfp4_nz()
         # else: non-quantized model, no-op
 
     def _cast_cpu_weights_to_device_format(self, mxfp4: bool = False,
@@ -550,6 +598,33 @@ class ExpertOffloadManager:
                 self._expert_dst_storage(layer_id, geid, 'w2').copy_(
                     w2_storage[local_i * per_w2 : (local_i + 1) * per_w2]
                 )
+
+    def _cast_device_slots_to_mxfp4_nz(self):
+        """Stamp on-device W4A8_MXFP expert weight slots with format-29 (NZ).
+
+        The device slot is already transposed by process_weights (offload
+        branch). Mirror the non-offload cast-then-transpose — and the CPU
+        relayout in _cast_cpu_weights_to_device_format — by transposing back
+        to the original shape, casting 29, then transposing forward again, so
+        the slot's format-29 layout is transpose(cast(original)). That is the
+        form npu_grouped_matmul's NZ kernel accepts for fp4_e2m1: it infers
+        transposeWeight from the layout (EZ1001 if base format, EZ0026 if the
+        cast landed on the transposed shape). Slot bytes are refreshed by
+        decode/prefill H2D at runtime (CPU buffer holds the matching NZ bytes);
+        this call fixes the format + layout metadata.
+        """
+        for layer in self.moe_layers:
+            for name in ("w13_weight", "w2_weight"):
+                w = _expert_weight(layer, name)
+                if w is None:
+                    continue
+                d = w.data.transpose(1, 2).contiguous()
+                d = torch_npu.npu_format_cast(
+                    d.view(torch.uint8), 29,
+                    customize_dtype=torch.float8_e4m3fn,
+                    input_dtype=torch_npu.float4_e2m1fn_x2,
+                )
+                w.data = d.transpose(1, 2)
 
     def _process_scale_bias_cpu_buffers(self):
         """Apply update_bias transformation to scale_bias CPU buffers.
@@ -650,9 +725,22 @@ class ExpertOffloadManager:
         if not self._load_futures:
             return
         # f.result() re-raises any worker exception (e.g. shape mismatch).
+        n = len(self._load_futures)
         for f in self._load_futures:
             f.result()
         self._load_futures.clear()
+        # progress: log every drain so the (large) offload weight load isn't silent
+        self._drained_shards = getattr(self, "_drained_shards", 0) + n
+        t0 = getattr(self, "_load_phase_start", None)
+        if t0:
+            elapsed = time.perf_counter() - t0
+            logger.info(
+                "[OFFLOAD] weight load progress: %d shards copied "
+                "(%.0f shards/s, %.0fs elapsed)",
+                self._drained_shards,
+                self._drained_shards / max(elapsed, 1e-6),
+                elapsed,
+            )
 
     def drain_load_pool(self) -> None:
         """Wait for all deferred weight copies to finish.
@@ -842,7 +930,12 @@ class ExpertOffloadManager:
             target_dict = self.scale_cpu_buffers
         else:
             target_dict = self.offset_cpu_buffers
-        target = target_dict[attr_name][layer_moe_idx][expert_id]
+        # shard-per-rank: skip scales for non-owned experts and index the
+        # shard-sized buffer locally (mirrors load_w13/load_w2).
+        local_eid = self._shard_local(expert_id)
+        if local_eid is None:
+            return  # shard-per-rank: scale not owned by this rank
+        target = target_dict[attr_name][layer_moe_idx][local_eid]
         if attr_name.startswith("w13_"):
             key = (layer_moe_idx, expert_id, attr_name)
             pending_shard = self._scale_shard_temp.pop(key, None)
@@ -874,7 +967,7 @@ class ExpertOffloadManager:
         w13_weight_scale_fp32 from the freshly-loaded w13_weight_scale.
         """
         for i, layer in enumerate(self.moe_layers):
-            ndev = min(self.num_device_experts, layer.w13_weight.shape[0])
+            ndev = min(self.num_device_experts, _expert_weight(layer, "w13_weight").shape[0])
             if hasattr(layer, 'w13_weight_scale_fp32'):
                 for j in range(ndev):
                     layer.w13_weight_scale_fp32[j].copy_(
@@ -894,8 +987,9 @@ class ExpertOffloadManager:
             return
         ndl = self.num_device_layers
         pool_layer = self.moe_layers[0]
-        dev = pool_layer.w13_weight.device
-        dt = pool_layer.w13_weight.dtype
+        _pool_w13 = _expert_weight(pool_layer, "w13_weight")
+        dev = _pool_w13.device
+        dt = _pool_w13.dtype
         # Size the pool to the per-rank EP shard, NOT the global expert count.
         # The All2All prefill GMM (aclnnGroupedMatmulWeightNz) requires
         # groupList == weight.dim0; groupList = shard, so the pool must hold
@@ -942,9 +1036,9 @@ class ExpertOffloadManager:
             ("_prefill_w2_scale_bias", "w2_scale_bias", None),
         ]
         self._prefill_w13.append(torch.empty(
-            (ntotal,) + tuple(pool_layer.w13_weight.shape[1:]), dtype=dt, device=dev))
+            (ntotal,) + tuple(_expert_weight(pool_layer, "w13_weight").shape[1:]), dtype=dt, device=dev))
         self._prefill_w2.append(torch.empty(
-            (ntotal,) + tuple(pool_layer.w2_weight.shape[1:]), dtype=dt, device=dev))
+            (ntotal,) + tuple(_expert_weight(pool_layer, "w2_weight").shape[1:]), dtype=dt, device=dev))
         for tgt, src, dtype_override in quant_specs:
             if not hasattr(pool_layer, src):
                 continue
@@ -1198,21 +1292,21 @@ class ExpertOffloadManager:
                 if pool_slot < len(prefill_list) and scale_name in self.scale_cpu_buffers \
                         and layer_idx < len(self.scale_cpu_buffers[scale_name]):
                     for local_i in range(min(shard, len(self.scale_cpu_buffers[scale_name][layer_idx]))):
-                        src = self.scale_cpu_buffers[scale_name][layer_idx][base + local_i]
+                        src = self.scale_cpu_buffers[scale_name][layer_idx][local_i]
                         prefill_list[pool_slot][local_i].copy_(src.reshape(prefill_list[pool_slot][local_i].shape))
             for off_name, prefill_list in [("w13_weight_offset", self._prefill_w13_offset),
                                            ("w2_weight_offset", self._prefill_w2_offset)]:
                 if pool_slot < len(prefill_list) and off_name in self.offset_cpu_buffers \
                         and layer_idx < len(self.offset_cpu_buffers[off_name]):
                     for local_i in range(min(shard, len(self.offset_cpu_buffers[off_name][layer_idx]))):
-                        src = self.offset_cpu_buffers[off_name][layer_idx][base + local_i]
+                        src = self.offset_cpu_buffers[off_name][layer_idx][local_i]
                         prefill_list[pool_slot][local_i].copy_(src.reshape(prefill_list[pool_slot][local_i].shape))
             for sb_name, prefill_list in [("w13_scale_bias", self._prefill_w13_scale_bias),
                                           ("w2_scale_bias", self._prefill_w2_scale_bias)]:
                 if pool_slot < len(prefill_list) and sb_name in self.scale_bias_cpu_buffers \
                         and layer_idx < len(self.scale_bias_cpu_buffers[sb_name]):
                     for local_i in range(min(shard, len(self.scale_bias_cpu_buffers[sb_name][layer_idx]))):
-                        src = self.scale_bias_cpu_buffers[sb_name][layer_idx][base + local_i]
+                        src = self.scale_bias_cpu_buffers[sb_name][layer_idx][local_i]
                         prefill_list[pool_slot][local_i].copy_(src.reshape(prefill_list[pool_slot][local_i].shape))
             # Sync the load stream so the pool data is valid before the GMM reads
             # it (the apply path continues on the default stream after we return;
@@ -1464,12 +1558,16 @@ class ExpertOffloadManager:
                             self.offset_cpu_buffers,
                             self.scale_bias_cpu_buffers):
             for attr_name, buffers in buffer_dict.items():
-                if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
+                # eid is GLOBAL (same eid the weight H2D above used); remap to
+                # the shard-sized buffer's local slot (identity when single-card).
+                local_eid = self._shard_local(eid)
+                if (local_eid is None or layer_idx >= len(buffers)
+                        or local_eid >= len(buffers[layer_idx])):
                     continue
                 dev_tensor = getattr(layer, attr_name, None)
                 if dev_tensor is None:
                     continue
-                src = buffers[layer_idx][eid]
+                src = buffers[layer_idx][local_eid]
                 dev_tensor.data[slot].copy_(
                     src.reshape(dev_tensor.data[slot].shape), non_blocking=True)
 
@@ -1647,10 +1745,10 @@ class ExpertOffloadManager:
     def _load_expert_weights_into_slot(self, layer, layer_idx, eid, slot):
         """H2D-copy one expert's w13/w2 + quant scale/offset/scale_bias from the
         pinned CPU buffer into the device slot, on the caller's load_stream."""
-        layer.w13_weight.data.untyped_storage()[
+        _expert_weight(layer, "w13_weight").data.untyped_storage()[
             slot * self.w13_expert_size_bytes:(slot + 1) * self.w13_expert_size_bytes
         ].copy_(self._expert_src_storage(layer_idx, eid, 'w13'), non_blocking=True)
-        layer.w2_weight.data.untyped_storage()[
+        _expert_weight(layer, "w2_weight").data.untyped_storage()[
             slot * self.w2_expert_size_bytes:(slot + 1) * self.w2_expert_size_bytes
         ].copy_(self._expert_src_storage(layer_idx, eid, 'w2'), non_blocking=True)
         self._copy_quant_attrs_into_slot(layer, layer_idx, eid, slot)
@@ -1728,7 +1826,7 @@ class ExpertOffloadManager:
                                 flag,layer_idx, len(need_to_load), len(reusable_slots),
                                 sorted(need_to_load)[:20])
 
-            dev = layer.w13_weight.device
+            dev = _expert_weight(layer, "w13_weight").device
             n_copies = 0
             for eid in need_to_load:
                 if self.cache_policy is not None:

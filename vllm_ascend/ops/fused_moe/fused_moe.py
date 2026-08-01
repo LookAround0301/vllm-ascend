@@ -18,7 +18,7 @@
 from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass, field
-from functools import wraps
+from functools import lru_cache, wraps
 from types import SimpleNamespace
 
 import torch
@@ -54,6 +54,22 @@ from vllm_ascend.utils import (
     shared_expert_dp_enabled,
     shared_experts_calculation_stream,
 )
+
+
+@lru_cache(maxsize=None)
+def _c_ascend_op_has_kwarg(op_name: str, kwarg: str) -> bool:
+    """True if torch.ops._C_ascend.<op_name> accepts ``kwarg``.
+
+    Some _C_ascend ops (npu_swiglu_group_quant / npu_dequant_swiglu_quant)
+    gained glu_alpha/glu_beta only after a custom op recompile. The stock op
+    rejects those kwargs, so gate them on schema support: the same call site
+    then works on the stock op (V4, no glu) and the recompiled op (Kimi-K3).
+    """
+    try:
+        op = getattr(torch.ops._C_ascend, op_name, None)
+        return op is not None and kwarg in str(op._schema)
+    except Exception:
+        return False
 
 
 def get_compressed_expert_map(expert_map: torch.Tensor) -> str:
@@ -1071,6 +1087,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         quant_mode="dynamic",
                     )
                 else:
+                    _glu_kw = {}
+                    if _c_ascend_op_has_kwarg("npu_dequant_swiglu_quant", "glu_alpha"):
+                        _glu_kw = dict(glu_alpha=fused_moe_evts.swiglu_alpha,
+                                       glu_bias=fused_moe_evts.swiglu_beta)
                     quantized_x, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(
                         x=hidden_states,
                         weight_scale=self._shared_experts.gate_up_proj.weight_scale_fp32,
@@ -1083,9 +1103,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         quant_mode=1,
                         swiglu_mode=1,
                         clamp_limit=fused_moe_evts.swiglu_limit,
-                        # glu_alpha/glu_bias: 容器 _C_ascend 旧版 schema 不支持,rebase 到 v0.26.0rc 后回退
-                        # glu_alpha=fused_moe_evts.swiglu_alpha,
-                        # glu_bias=fused_moe_evts.swiglu_beta,
+                        **_glu_kw,
                     )
                 # Execute the down projection concurrently with the combine
                 # communication.
@@ -1121,6 +1139,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         dst_type=situ_dst_type,
                     )
                 else:
+                    _glu_kw = {}
+                    if _c_ascend_op_has_kwarg("npu_swiglu_group_quant", "glu_alpha"):
+                        _glu_kw = dict(glu_alpha=fused_moe_evts.swiglu_alpha,
+                                       glu_bias=fused_moe_evts.swiglu_beta)
                     quantized_x, swiglu_out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
                         hidden_states,
                         topk_weight=None,
@@ -1128,9 +1150,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         dst_type=torch.float8_e4m3fn,
                         quant_mode=2,
                         clamp_value=fused_moe_evts.swiglu_limit,
-                        # glu_alpha/glu_bias: 容器 _C_ascend 旧版 schema 不支持,rebase 到 v0.26.0rc 后回退
-                        # glu_alpha=fused_moe_evts.swiglu_alpha,
-                        # glu_bias=fused_moe_evts.swiglu_beta,
+                        **_glu_kw,
                     )
                 # Execute the down projection concurrently with the combine
                 # communication.

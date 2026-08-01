@@ -1188,6 +1188,9 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
                     continue
                 if is_pp_missing_parameter(name, self):
                     break
+                if name not in params_dict:
+                    # param absent (e.g. reduced-layer stub): skip this weight.
+                    break
                 param = params_dict[name]
                 param.weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1198,6 +1201,11 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
                     name = name.replace(weight_name, param_name)
                     name = _resolve_packed_expert_weight_name(name, params_dict)
                     if is_pp_missing_parameter(name, self):
+                        break
+                    if name not in params_dict:
+                        # param absent from this model (e.g. reduced-layer stub
+                        # for fast iteration): break the expert loop so the
+                        # for-else regular path is also skipped -> next weight.
                         break
                     param = params_dict[name]
                     param.weight_loader(
@@ -1212,7 +1220,8 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None or is_pp_missing_parameter(name, self):
+                    if name is None or name not in params_dict \
+                            or is_pp_missing_parameter(name, self):
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
