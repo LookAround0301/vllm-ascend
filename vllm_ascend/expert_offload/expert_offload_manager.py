@@ -2636,12 +2636,18 @@ class ExpertOffloadManager:
         topk_weights, topk_ids = predicted
         next_layer = self.moe_layers[next_idx]
         num_tokens = topk_ids.size(0)
-        topk_ids_h = self.topk_ids_h[:num_tokens]
+        # Prediction width for this call. Derived per tensor rather than shared,
+        # so the two branches cannot drift apart silently. num_tokens is 1
+        # (predict_next_layer_experts_npu uses hidden_states[:1]), which keeps
+        # the column slice contiguous and the async D2H unchanged.
+        k_ids = topk_ids.size(1)
+        topk_ids_h = self.topk_ids_h[:num_tokens, :k_ids]
         topk_ids_h.copy_(topk_ids.to(torch.int32), non_blocking=_EXTRA_CTX.capturing)
         topk_weights_h = None
         if (self.cache_policy is not None and topk_weights is not None
                 and self.offload_config.cache_router_weight != 0):
-            topk_weights_h = self.topk_weights_h[:num_tokens]
+            k_w = topk_weights.size(1)
+            topk_weights_h = self.topk_weights_h[:num_tokens, :k_w]
             topk_weights_h.copy_(topk_weights.to(dtype=torch.float32),
                                  non_blocking=_EXTRA_CTX.capturing)
         log2phy_h = self._prefetch_log2phy_h
@@ -2696,20 +2702,21 @@ class ExpertOffloadManager:
         policy_step = -1
         if self.cache_policy is not None:
             policy_step = self.cache_policy.layer_step(layer_idx)
-        logger.info(
-            "[EXPERT-OFFLOAD-CACHE] layer=%d cache_step=%d calls=%d policy_step=%d "
-            "hit_rate=%.4f hits=%d misses=%d last_hit=%s last_miss=%s resident=%s",
-            layer_idx,
-            self.cache_calls[layer_idx],
-            self.cache_calls[layer_idx],
-            policy_step,
-            hit_rate,
-            self.cache_hits[layer_idx],
-            self.cache_misses[layer_idx],
-            self.last_hit_experts[layer_idx],
-            self.last_miss_experts[layer_idx],
-            sorted(on_device),
-        )
+        if self._debug:
+            logger.info(
+                "[EXPERT-OFFLOAD-CACHE] layer=%d cache_step=%d calls=%d policy_step=%d "
+                "hit_rate=%.4f hits=%d misses=%d last_hit=%s last_miss=%s resident=%s",
+                layer_idx,
+                self.cache_calls[layer_idx],
+                self.cache_calls[layer_idx],
+                policy_step,
+                hit_rate,
+                self.cache_hits[layer_idx],
+                self.cache_misses[layer_idx],
+                self.last_hit_experts[layer_idx],
+                self.last_miss_experts[layer_idx],
+                sorted(on_device),
+            )
 
 
 
