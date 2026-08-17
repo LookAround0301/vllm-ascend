@@ -3489,6 +3489,14 @@ class NPUModelRunner(GPUModelRunner):
                 if "sink" in name:
                     self._has_sinks = True
                     break
+                
+            # ReMoE Check: get_model() has now run load_weights (which applied the
+            # gate override) AND process_weights_after_loading (which derived
+            # gate.weight_fp32 from it). Assert the two agree here — a no-op unless
+            # moe_gate_override_path is set
+            from vllm_ascend.models.moe_gate_override import verify_moe_gate_override
+            verify_moe_gate_override(self.model)
+                
             if hasattr(self, 'offload_manager'):
                 self._finalize_offload_setup()
             if self.drafter:

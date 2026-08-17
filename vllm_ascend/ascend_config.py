@@ -54,6 +54,15 @@ class AscendConfig:
         expert_offload_config = additional_config.get("expert_offload_config", {})
         self.expert_offload_config = ExpertOffloadConfig(expert_offload_config)
 
+        # ReMoE router-gate override
+        self.moe_gate_override_path = additional_config.get("moe_gate_override_path", None)
+        if self.moe_gate_override_path is not None and not isinstance(self.moe_gate_override_path, str):
+            raise TypeError(
+                "moe_gate_override_path must be a string or null, got "
+                f"{type(self.moe_gate_override_path).__name__}"
+            )
+        logger.info("[GATE-OVERRIDE] config: moe_gate_override_path=%s", self.moe_gate_override_path)
+
         self.scheduler_config = SchedulerConfig(
             additional_config,
             balance_env_value=ascend_envs.VLLM_ASCEND_BALANCE_SCHEDULING,

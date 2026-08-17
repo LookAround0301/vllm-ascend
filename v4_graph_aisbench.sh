@@ -12,13 +12,14 @@
 #
 #  DIFFERENCE FROM v4_aisbench.sh (the SOURCE script)
 #    Every knob belonging to an UNPORTED feature is GONE, not defaulted-off:
-#      EXPERT_PREFETCH_MAX, PREDICTOR, PREDICTOR_CKPT, REMOE_GATE,
+#      EXPERT_PREFETCH_MAX, PREDICTOR, PREDICTOR_CKPT,
 #      SEQ_STATS, STATS_WINDOW, TIMING, PF_WAIT, CSV, CSV_PATH.
 #    TARGET's ExpertOffloadConfig REJECTS unknown keys with
 #      ValueError: Config has no attribute '<key>'
 #    so emitting any of them stops the engine at startup. They come back one at a
-#    time as each feature lands. (moe_gate_override_path is a TOP-LEVEL key, which
-#    .get() would swallow silently — worse than a crash, so it is removed too.)
+#    time as each feature lands. REMOE_GATE (F1) has landed; its key
+#    moe_gate_override_path is TOP-LEVEL, so an unpatched engine swallows it
+#    silently — the post-health check below turns that back into a failure.
 #
 #    Knobs that are NATIVE on TARGET and therefore exposed here rather than removed:
 #      EXPERT_SUBSTITUTION / EXPERT_SUBSTITUTION_THRESHOLD   (F4 landed upstream)
@@ -47,6 +48,9 @@ MODEL="${MODEL:-/home/yangliu/llms/DeepSeek-V4-Flash-w4a8-mtp}"
 SERVED_NAME="${SERVED_NAME:-A3-deepseekv4-flash-w4a8}"
 TOKENIZER="${TOKENIZER:-/home/yangliu/keyi/code/benchmarks/dsv4-tokenizer}"
 AIS_BENCH_DATASETS_CACHE="${AIS_BENCH_DATASETS_CACHE-/home/yangliu/keyi/code/benchmarks}"
+# ── ReMoE router-gate override ─────────────────────────────────
+# Fine-tuned MoE router gates, swapped in at load time
+REMOE_GATE="${REMOE_GATE:-}"
 CARD="${CARD:-6}"                        # one id for single-card; "6,7" for multi-card,
                                          # in which case TP must match the count
 PORT="${PORT:-7001}"
@@ -291,7 +295,7 @@ fi
 [[ -z "${HOT_EXPERTS_FILE}" || "${HOT_EXPERTS_FILE}" == *.json ]] || die "HOT_EXPERTS_FILE must end in .json"
 [[ "${NCARDS}" == "${EP_SIZE}" ]] \
   || die "CARD lists ${NCARDS} device(s) but TP*DP=${EP_SIZE}. They must match."
-
+[[ -z "${REMOE_GATE}" || -e "${REMOE_GATE}" ]]                  || die "REMOE_GATE not found: ${REMOE_GATE}"
 # TOPK drives the offload threshold and the prefetch-shape check, so take it from
 # the model's own config.json when we can read it — the manager does the same
 # (num_experts_per_tok / num_experts_per_token, hf_config or text_config). The env
@@ -397,6 +401,7 @@ offload_json() {
     p+=",\"moe_offload_debug\":$(bool "${MOE_OFFLOAD_DEBUG}")"
     parts+=( "\"expert_offload_config\":{${p}}" )
   fi
+  [[ -n "${REMOE_GATE}" ]] && parts+=( "\"moe_gate_override_path\":\"${REMOE_GATE}\"" )
   parts+=( "\"enable_cpu_binding\":$(bool "${ENABLE_CPU_BINDING}")" )
   parts+=( "\"multistream_overlap_shared_expert\":$(bool "${MULTISTREAM_OVERLAP_SHARED_EXPERT}")" )
   local acc=()
@@ -943,6 +948,7 @@ fi
 echo "  mtp     : ${MTP} num_spec_tokens=${NUM_SPEC_TOKENS} decode_tok_per_req=${DECODE_TOK_PER_REQ} decode_tokens=${DECODE_TOKENS}"
 echo "  offload : ${OFFLOAD} experts=${NUM_DEVICE_EXPERTS} layers=${NUM_DEVICE_LAYERS} lrc=${CACHE_POLICY} prefetch=${PREFETCH} prefetch_num=${EXPERT_PREFETCH_NUM} debug=${MOE_OFFLOAD_DEBUG}"
 echo "  offload+: subst=${EXPERT_SUBSTITUTION}${EXPERT_SUBSTITUTION_THRESHOLD:+/${EXPERT_SUBSTITUTION_THRESHOLD}} hot_preload=${HOT_PRELOAD}${HOT_EXPERTS_FILE:+/${HOT_EXPERTS_FILE}} multi_card=${ENABLE_MULTI_CARD} shard_per_rank=${SHARD_PER_RANK:-default}"
+echo "  gate    : ${REMOE_GATE:-off (base router)}"
 [[ -n "${COMPILE_CFG}" ]] && echo "  compile : ${COMPILE_CFG}"
 [[ -n "${SPEC_CFG}"    ]] && echo "  spec    : ${SPEC_CFG}"
 [[ -n "${ADDL}" ]] && echo "  addl-cfg: ${ADDL}"
@@ -1095,7 +1101,7 @@ echo "  repro   : $(for v in CARD PORT TASKS RUN THINK THINK_EFFORT NUM_PROMPTS 
       PERF_TEMP MAX_NUM_SEQS MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS SEED GPU_MEM_UTIL TP DP QUANTIZATION \
       ENFORCE_EAGER CUDAGRAPH_MODE CUDAGRAPH_CAPTURE_SIZES ENABLE_NPUGRAPH_EX ENABLE_STATIC_KERNEL \
       MTP NUM_SPEC_TOKENS OFFLOAD NUM_DEVICE_EXPERTS NUM_DEVICE_LAYERS TOPK EXPERT_MAP_PATH \
-      CACHE_POLICY PREFETCH EXPERT_PREFETCH_NUM CACHE_STATS_LOG_INTERVAL MOE_OFFLOAD_DEBUG \
+      CACHE_POLICY PREFETCH EXPERT_PREFETCH_NUM CACHE_STATS_LOG_INTERVAL MOE_OFFLOAD_DEBUG REMOE_GATE \
       EXPERT_SUBSTITUTION EXPERT_SUBSTITUTION_THRESHOLD HOT_PRELOAD HOT_EXPERTS_FILE \
       ENABLE_MULTI_CARD SHARD_PER_RANK CACHE_RECENT_WINDOW CACHE_EMA_BETA CACHE_RECENT_WEIGHT \
       CACHE_EMA_WEIGHT CACHE_ROUTER_WEIGHT CACHE_AGE_WEIGHT \
@@ -1145,6 +1151,19 @@ if [[ "${SKIP_SERVE}" != "1" ]]; then
 else
   echo "[serve] SKIP_SERVE=1 — using whatever is on :${PORT}"
   curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 || die "nothing healthy on :${PORT}"
+fi
+
+# ReMoE: moe_gate_override_path is a TOP-LEVEL additional_config key read with
+# .get(), so an engine without the F1 patch — or a typo — is ignored SILENTLY and the
+# run measures the BASE router while everything else says otherwise. The engine logs
+# "[GATE-OVERRIDE] applied" once per rank during weight loading, well before /health.
+# The second line prints the deduplicated gate fingerprint: more than one line means
+# ranks read different files, which under EP is inconsistent dispatch with no error.
+if [[ -n "${REMOE_GATE}" && "${SKIP_SERVE}" != "1" ]]; then
+  grep -q '\[GATE-OVERRIDE\] applied' "${SERVE_LOG}" || guard "REMOE_GATE is set but the
+       engine never logged '[GATE-OVERRIDE] applied' — this run would measure the BASE
+       router. Apply Groups 1-3, or unset REMOE_GATE."
+  grep -o 'sha256_16=.*$' "${SERVE_LOG}" | sort -u | sed 's/^/  gate    : /'
 fi
 
 [[ "${PROBE}" == "1" ]] && for m in ${MODES}; do probe_mode "${m}"; done

@@ -1526,4 +1526,17 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
 
+        # ReMoE router-gate override, at the tail of load_weights and
+        # nowhere else. Everything that derives a copy of the gate runs strictly
+        # later — vLLM's process_weights_after_loading (which creates
+        # gate.weight_fp32, the tensor shared_forward_impl actually routes with, and
+        # may re-lay-out gate.weight as FRACTAL_NZ) and then
+        # ExpertOffloadManager.register_gate_weights during _finalize_offload — so
+        # both pick up the new weights with no extra work.
+        gate_override_path = getattr(get_ascend_config(), "moe_gate_override_path", None)
+        if gate_override_path:
+            from vllm_ascend.models.moe_gate_override import apply_moe_gate_override
+
+            apply_moe_gate_override(self, params_dict, loaded_params, gate_override_path)
+
         return loaded_params
