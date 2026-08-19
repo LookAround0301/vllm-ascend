@@ -147,7 +147,12 @@ class ExpertOffloadManager:
         # [1, topk]; >topk has no extra effect since the router selects at
         # most topk experts per token.
         self.expert_prefetch_num = self.offload_config.expert_prefetch_num
+        # Single-card transfer cap only. _update_weights_multi_card never reads
+        # it: multi-card re-plans the layer's whole global placement and loads
+        # whatever that implies, so it has no per-layer transfer budget.
         self.prefetch_topk = max(1, min(self.topk, self.expert_prefetch_num))
+        # How many tokens to predict from
+        self.prefetch_tokens = max(1, self.offload_config.expert_prefetch_tokens)
 
         # CPU weight buffers (post-transpose format, matching device after
         # process_weights_after_loading):
@@ -2381,11 +2386,36 @@ class ExpertOffloadManager:
             on_device = set(slot_owner.values())
 
             if is_prefetch:
-                # Prefetch: only load the truly-missing top-N predicted experts.
-                ordered_misses = [e for e in topk_ids_h.reshape(-1).tolist() if e not in on_device]
-                need_to_load = set(ordered_misses[:self.prefetch_topk])
+                # Prefetch: load at most prefetch_topk experts for the layer — a
+                # GLOBAL cap across all predicted token rows, not one per token —
+                # chosen as the highest-scoring predictions not already resident.
+                # An expert predicted by several tokens is one transfer and takes
+                # its best score across them.
+                rows_ids = topk_ids_h.tolist()
+                rows_w = topk_weights_h.tolist() if topk_weights_h is not None else None
+                n_rows = len(rows_ids)
+                best_score: dict[int, float] = {}
+                for r, row in enumerate(rows_ids):
+                    for c, eid in enumerate(row):
+                        if eid in on_device:
+                            continue          # resident: nothing to transfer
+                        if rows_w is not None:
+                            score = rows_w[r][c]
+                        else:
+                            # No scores available: interleave rows by rank so
+                            # every row's rank-0 outranks every row's rank-1,
+                            # rather than concatenating rows — the bias this
+                            # block exists to remove. At one row this is plain
+                            # column order.
+                            score = -float(c * n_rows + r)
+                        if score > best_score.get(eid, float("-inf")):
+                            best_score[eid] = score
+                need_to_load = set(
+                    sorted(best_score, key=best_score.get, reverse=True)
+                    [:self.prefetch_topk])
             else:
                 need_to_load = needed - on_device
+                
             already_there = needed & on_device              # for cache_stats / debug
 
             # both hit-rate numerators must be taken HERE — the load loop
@@ -2659,15 +2689,23 @@ class ExpertOffloadManager:
             input_ids = get_forward_context().input_ids
             if input_ids is None:
                 return None
-            # [1] on the tid2eid device -> index_select -> [1, topk] int32.
-            first_id = input_ids[:1].to(tid2eid.device).long()
-            topk_ids = tid2eid.index_select(0, first_id)
+            # n rows, was input_ids[:1]. min() against both the hidden
+            # rows and the context's id count: they agree on the decode path
+            n_tok = min(self.prefetch_tokens, hidden_states.shape[0],
+                        input_ids.shape[0])
+            if n_tok < 1:
+                return None
+            # [n_tok] on the tid2eid device -> index_select -> [n_tok, topk] int32.
+            tok_ids = input_ids[:n_tok].to(tid2eid.device).long()
+            topk_ids = tid2eid.index_select(0, tok_ids)
             # Selection does not depend on affinity for hash layers, so the
             # router weight is meaningless; uniform placeholders keep the
-            # [1, topk] shape the caller expects (cache_router_weight is
-            # optional).
+            # [n_tok, topk] shape the caller expects. NOTE this leaves every hash
+            # candidate score-tied, so the single-card ranking in _update_weights
+            # falls back to insertion order for these layers — harmless, since
+            # tid2eid prediction is exact and any miss is equally worth fetching.
             topk_weights = torch.full(
-                (1, self.topk), 1.0 / self.topk,
+                (n_tok, self.topk), 1.0 / self.topk,
                 dtype=torch.float32, device=topk_ids.device,
             )
             return topk_weights, topk_ids
@@ -2677,11 +2715,19 @@ class ExpertOffloadManager:
         # update_weights(). prefetch_topk (= min(topk, expert_prefetch_num))
         # caps how many experts are prefetched per layer — single-card uses 1
         # (cheap, conservative); raise expert_prefetch_num for more coverage.
-        # On-device prediction: [1, hidden_dim] x [n_experts, hidden_dim]^T
-        router_logits = F.linear(hidden_states[:1].float(), gate_w)
+        # TO BE CHECKED: first token may not be enough for MTP
+        # Changed to n rows, was hidden_states[:1]. The [:1] was an identity slice
+        # when written — without speculative decoding and at MAX_NUM_SEQS=1 the
+        # decode path carries exactly one token — and only became a one-in-N
+        # sample when MTP raised the forward to 1 + num_speculative_tokens rows.
+        # Rows always fit the pinned staging buffers, which are
+        # [offload_threshold, topk], because a prefetch is only triggered when
+        # num_tokens <= offload_threshold.
+        # Shape is fixed per captured graph, so this stays capture-safe.
+        # On-device prediction: [n_tok, hidden_dim] x [n_experts, hidden_dim]
+        n_tok = min(self.prefetch_tokens, hidden_states.shape[0])
+        router_logits = F.linear(hidden_states[:n_tok].float(), gate_w)
         probs = router_logits.softmax(dim=-1)
-        # TO BE CHECKED: width is self.topk, was self.prefetch_topk.
-        # refetch_topk conflated two different things: how many experts we PREDICT, and how many of those we TRANSFER
         topk_weights, topk_ids = probs.topk(self.topk, dim=-1)
         return topk_weights, topk_ids
 
@@ -2709,7 +2755,7 @@ class ExpertOffloadManager:
         staged = self._stage_predicted_topk(layer_idx, hidden_states)
         if staged is None:
             return
-        topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx = staged
+        (topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx, mc2_mask_h) = staged
 
         ready_to_load_event = torch_npu.npu.Event()
         torch_npu.npu.current_stream().record_event(ready_to_load_event) 
@@ -2722,7 +2768,7 @@ class ExpertOffloadManager:
                 subscribed_compute_streams.add(current_compute_stream)
 
             prefetch_fn, prefetch_args = self._build_prefetch_call(
-                topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx)
+                topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx, mc2_mask_h)
             nxt = next_idx
 
             def _prefetch_host_cb(_args):
@@ -2758,40 +2804,59 @@ class ExpertOffloadManager:
         topk_weights, topk_ids = predicted
         next_layer = self.moe_layers[next_idx]
         num_tokens = topk_ids.size(0)
-        # Prediction width for this call. Derived per tensor rather than shared,
-        # so the two branches cannot drift apart silently. num_tokens is 1
-        # (predict_next_layer_experts_npu uses hidden_states[:1]), which keeps
-        # the column slice contiguous and the async D2H unchanged.
+        # Prediction shape for this call. Derived per tensor rather than shared,
+        # so the two branches cannot drift apart silently.
+        # Changed to num_tokens is min(expert_prefetch_tokens, forward rows), no
+        # longer always 1. The slice stays contiguous because k_ids == topk ==
+        # the buffer's full width, and the rows fit because a prefetch only
+        # triggers when num_tokens <= offload_threshold — exactly how these
+        # buffers are sized. Multi-card needs nothing further: it bincounts these
+        # rows into global_counts, so extra rows simply make the placement better
+        # informed, with multiplicity carrying the weight.
         k_ids = topk_ids.size(1)
         topk_ids_h = self.topk_ids_h[:num_tokens, :k_ids]
         topk_ids_h.copy_(topk_ids.to(torch.int32), non_blocking=_EXTRA_CTX.capturing)
         topk_weights_h = None
-        if (self.cache_policy is not None and topk_weights is not None
-                and self.offload_config.cache_router_weight != 0):
+        # staged whenever the predictor produced weights, was gated on
+        # the LRC policy plus a non-zero cache_router_weight. The single-card
+        # load selection below now ranks candidates by router score across token
+        # rows, so the scores are needed whatever the eviction policy is. This
+        # copy was previously staged and never read on the single-card prefetch
+        # path. _build_prefetch_call's multi-card branch builds a 7-tuple that
+        # omits topk_weights_h entirely, so multi-card cannot observe this.
+        topk_weights_h = None
+        if topk_weights is not None:
             k_w = topk_weights.size(1)
             topk_weights_h = self.topk_weights_h[:num_tokens, :k_w]
             topk_weights_h.copy_(topk_weights.to(dtype=torch.float32),
                                  non_blocking=_EXTRA_CTX.capturing)
         log2phy_h = self._prefetch_log2phy_h
         log2phy_h.copy_(next_layer.log2phy, non_blocking=_EXTRA_CTX.capturing)
+        # (multi-card): mirror the active-token mask for the rows we predicted from
+        mc2_mask_h = None
+        if self.enable_multi_card:
+            mc2_mask = getattr(get_forward_context(), "mc2_mask", None)
+            if mc2_mask is not None:
+                mc2_mask_h = self.mc2_mask_h[:num_tokens]
+                # int32, not bool: Ascend has no async bool D2H, and a sync here
+                # would break graph capture. Same path topk_ids_h already uses.
+                mc2_mask_h.copy_(mc2_mask[:num_tokens].to(torch.int32), non_blocking=_EXTRA_CTX.capturing)
+                
         return (topk_ids_h, topk_weights_h, log2phy_h, self._prefetch_log2phy_np,
-                next_layer, next_idx)
+                next_layer, next_idx, mc2_mask_h)
 
     def _build_prefetch_call(self, topk_ids_h, topk_weights_h, log2phy_h,
-                             log2phy_np, next_layer, next_idx):
+                             log2phy_np, next_layer, next_idx, mc2_mask_h=None):
         """Pick the single-card vs multi-card planner+H2D inner and its args."""
         self._is_prefetch = True
         if self.enable_multi_card:
             per_rank_slots = self.offload_config.num_device_experts_for_rank(
                 next_idx, self.ep_size)
-            # mc2_mask_h=None: prefetch predicts the NEXT layer whose
-            # active-token mask isn't known yet, so don't filter. Prefetch
-            # placement is corrected by the next layer's reactive update
-            # (which does filter), and prefetch calls are excluded from
-            # hit-rate stats via is_prefetch=True.
+            # the real mask is passed, was hardcoded None
             return self._update_weights_multi_card, (
                 topk_ids_h, log2phy_h, next_layer, next_idx, per_rank_slots,
-                True, None)
+                True, mc2_mask_h)
+        # SINGLE-CARD. Unchanged
         return self._update_weights, (
             topk_ids_h, log2phy_np, next_layer, next_idx, topk_weights_h,
             self._is_prefetch)

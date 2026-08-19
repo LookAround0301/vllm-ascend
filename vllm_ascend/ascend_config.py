@@ -1008,6 +1008,8 @@ class ExpertOffloadConfig:
         "moe_offload_debug": False,
         "expert_prefetch_enabled": False,
         "expert_prefetch_num": 2,
+        # How many token rows of the forward the next-layer predictor runs on
+        "expert_prefetch_tokens": 1,
         "shard_per_rank": True,
         "enable_multi_card": False,
         "hot_expert_preload": False,
@@ -1172,6 +1174,13 @@ class ExpertOffloadConfig:
             raise ValueError(
                 f"expert_prefetch_num must >= 1; "
                 f"got {self.config['expert_prefetch_num']} instead")
+        # No upper bound here: the ceiling is the forward's token count
+        if not isinstance(self.config["expert_prefetch_tokens"], int):
+            raise TypeError("expert_prefetch_tokens must be an integer")
+        if self.config["expert_prefetch_tokens"] < 1:
+            raise ValueError(
+                f"expert_prefetch_tokens must >= 1; "
+                f"got {self.config['expert_prefetch_tokens']} instead")
         if not isinstance(self.config["enable_multi_card"], bool):
             raise TypeError("enable_multi_card must be a boolean")
         if not isinstance(self.config["expert_substitution_enabled"], bool):
