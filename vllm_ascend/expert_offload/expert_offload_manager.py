@@ -16,6 +16,7 @@ from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
+from vllm_ascend.expert_offload.decode_stats import get_decode_stats
 from vllm_ascend.ops.fused_moe.experts_selector import (
     commit_expert_substitutions,
     plan_expert_substitutions,
@@ -180,6 +181,11 @@ class ExpertOffloadManager:
         self.cache_calls: list[int] = []
         self.last_hit_experts: list[list[int]] = []
         self.last_miss_experts: list[list[int]] = []
+        # decode-statistics collector, resolved in _finalize_offload.
+        self._stats = None
+        # prefetch -> reactive handoff for the prefetch-accuracy fractions.
+        self._prefetch_stats_pending: dict[int, tuple] = {}
+        
         # Master debug switch for expert-offload diagnostics — UPDATE-W cache
         # trace, per-prefill-load logs, prefetch/update slot shortfalls.
         # Flipping it on surfaces them at info level (no need for global
@@ -572,6 +578,24 @@ class ExpertOffloadManager:
                 router_weight=self.offload_config.cache_router_weight,
                 age_weight=self.offload_config.cache_age_weight,
             )
+
+        # register the MoE-layer topology with the decode-statistics collector.
+        # Hash-routed layers are identified by their gate carrying a
+        # tid2eid table — the same test predict_next_layer_experts_npu uses —
+        # so no new config key is needed and the notion cannot drift.
+        self._stats = get_decode_stats()
+        if self._stats is not None:
+            hash_layers = {
+                index for index, moe_layer in enumerate(self.moe_layers)
+                if getattr(getattr(moe_layer, "gate", None), "tid2eid", None)
+                is not None
+            }
+            self._stats.set_topology(num_moe_layers, hash_layers,
+                                     multi_card=self.enable_multi_card)
+            logger.info(
+                "[DECODE-STATS] topology: moe_layers=%d hash_layers=%s "
+                "multi_card=%s", num_moe_layers, sorted(hash_layers),
+                self.enable_multi_card)
         t3 = time.perf_counter()
 
         ntotal = self.num_total_experts
@@ -2301,10 +2325,23 @@ class ExpertOffloadManager:
             (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
              is_prefetch, do_substitution, router_logits_h, scoring_func,
              correction_bias_h) = args
+        # resolve the collector once per call. `collecting` is False during
+        # profile_run, warmups and graph capture, and is re-read on every graph
+        # replay because this is a plain attribute read inside the callback body
+        # (arguments, by contrast, are frozen at capture time).
+        stats = self._stats if (self._stats is not None
+                                and self._stats.collecting) else None
+        gt_ids = None      # pre-substitution routed set, the ground truth
+        subst_count = 0.0
         if do_substitution:
+            # Was cloned only under _debug. The pre-substitution ids are
+            # now also the ground truth G for the prefetch-accuracy fractions
+            # and the denominator of the pre-substitution hit rate, so clone
+            # whenever either consumer is active. Note the cache policy still
+            # observes the SUBSTITUTED ids below
             original_ids = (
                 topk_ids_h[:, :self.topk].clone()
-                if self._debug else None
+                if (self._debug or stats is not None) else None
             )
             substituted_ids = substitute_experts(
                 router_logits_h,
@@ -2316,8 +2353,15 @@ class ExpertOffloadManager:
                 e_score_correction_bias=correction_bias_h,
             )
             if original_ids is not None:
-                self._log_expert_substitution(
-                    layer_idx, original_ids, substituted_ids)
+                # Guard on _debug explicitly. original_ids can now be
+                # non-None with debug off, and this log must stay debug-only.
+                if self._debug:
+                    self._log_expert_substitution(
+                        layer_idx, original_ids, substituted_ids)
+                if stats is not None:
+                    gt_ids = set(original_ids.reshape(-1).tolist())
+                    subst_count = float((original_ids != substituted_ids).sum())
+                    
             topk_ids_h[:, :self.topk].copy_(substituted_ids)
         with torch_npu.npu.stream(self.load_stream):
             # Hotness observation only on the reactive (non-prefetch) H2D path
@@ -2344,6 +2388,20 @@ class ExpertOffloadManager:
                 need_to_load = needed - on_device
             already_there = needed & on_device              # for cache_stats / debug
 
+            # both hit-rate numerators must be taken HERE — the load loop
+            # below mutates on_device. `needed` is the post-substitution routed
+            # set; gt_set is what the router originally selected (identical when
+            # substitution is off, which is what makes the two series equal in
+            # that case, exactly).
+            stat_hit_post = stat_hit_pre = None
+            gt_set = None
+            if stats is not None and not is_prefetch:
+                gt_set = gt_ids if gt_ids is not None else needed
+                stat_hit_post = (len(already_there) / len(needed)
+                                 if needed else 0.0)
+                stat_hit_pre = (len(gt_set & on_device) / len(gt_set)
+                                if gt_set else 0.0)
+
             if self.cache_policy is not None:
                 self._record_cache_stats(layer_idx, already_there, need_to_load, needed, on_device)
             reusable_slots = [s for s, e in slot_owner.items()
@@ -2364,6 +2422,7 @@ class ExpertOffloadManager:
 
             dev = _expert_weight(layer, "w13_weight").device
             n_copies = 0
+            loaded_ids = []      # what was ACTUALLY transferred this pass
             for eid in need_to_load:
                 if self.cache_policy is not None:
                     victim = self.cache_policy.choose_victim(
@@ -2380,6 +2439,9 @@ class ExpertOffloadManager:
                     victim = None
 
                 if slot < 0:
+                    # count the shortfall
+                    if stats is not None:
+                        stats.note_shortfall()
                     if self._debug:
                         logger.info(
                             "[UPDATE-W] l=%d NO SLOTS: %d experts could not be loaded, "
@@ -2400,6 +2462,62 @@ class ExpertOffloadManager:
                 if slot in reusable_slots:
                     reusable_slots.remove(slot)
                 n_copies += 1
+                loaded_ids.append(eid)
+
+            # hand the prefetch pass's set arithmetic across to the
+            # reactive pass, then record. Placed after the load loop
+            if stats is not None:
+                if is_prefetch:
+                    # P = predicted set, |A| = predicted-and-already-resident,
+                    # N = actually transferred. G is not known on this pass.
+                    # Last-writer-wins; the reactive pass for this same layer
+                    # pops it later in this very forward.
+                    with self._prefetch_state_lock:
+                        self._prefetch_stats_pending[layer_idx] = (
+                            set(needed), len(already_there), set(loaded_ids))
+                else:
+                    with self._prefetch_state_lock:
+                        pending = self._prefetch_stats_pending.pop(
+                            layer_idx, None)
+                    pred_acc = pred_prec = pf_in_lrc = pf_useful = None
+                    psize = pf_loads = pf_hit = pf_waste = None
+                    if pending is not None:
+                        predicted, n_already, transferred = pending
+                        psize = float(len(predicted))
+                        pf_loads = float(len(transferred))
+                        overlap = len(predicted & gt_set) if gt_set else 0
+                        # |N&G| computed ONCE and shared with pf_useful
+                        transferred_hits = len(transferred & gt_set) if gt_set else 0
+                        pf_hit = float(transferred_hits)
+                        pf_waste = float(len(transferred) - transferred_hits)
+                        if gt_set:
+                            pred_acc = overlap / len(gt_set)
+                            if predicted:
+                                pred_prec = overlap / len(predicted)
+                        if predicted:
+                            pf_in_lrc = n_already / len(predicted)
+                        if transferred:
+                            # reuses transferred_hits. Still no sample when nothing was transferred.
+                            pf_useful = transferred_hits / len(transferred)
+                    stats.record_layer(
+                        layer_idx,
+                        # |G| is the layer's unique routed-expert count, which
+                        # is what shows how much MTP's extra token positions
+                        # overlap: 3 positions x topk 6 = 18 routing slots collapse to |G| unique experts.
+                        gsize=float(len(gt_set)) if gt_set else 0.0,
+                        psize=psize,
+                        hit_post=stat_hit_post,
+                        hit_pre=stat_hit_pre,
+                        loads=float(n_copies),
+                        pf_loads=pf_loads,
+                        pf_hit=pf_hit,
+                        pf_waste=pf_waste,
+                        subst=subst_count,
+                        pred_acc=pred_acc,
+                        pred_prec=pred_prec,
+                        pf_in_lrc=pf_in_lrc,
+                        pf_useful=pf_useful,
+                    )
 
             self.load_stream.synchronize()
 
@@ -2562,7 +2680,9 @@ class ExpertOffloadManager:
         # On-device prediction: [1, hidden_dim] x [n_experts, hidden_dim]^T
         router_logits = F.linear(hidden_states[:1].float(), gate_w)
         probs = router_logits.softmax(dim=-1)
-        topk_weights, topk_ids = probs.topk(self.prefetch_topk, dim=-1)
+        # TO BE CHECKED: width is self.topk, was self.prefetch_topk.
+        # refetch_topk conflated two different things: how many experts we PREDICT, and how many of those we TRANSFER
+        topk_weights, topk_ids = probs.topk(self.topk, dim=-1)
         return topk_weights, topk_ids
 
     def trigger_next_layer_prefetch(self, layer,
@@ -2628,7 +2748,9 @@ class ExpertOffloadManager:
         log2phy_np, next_layer, next_idx), or None if prefetch isn't possible
         (last layer / missing gate weights / prediction failed)."""
         next_idx = layer_idx + 1
-        if next_idx >= len(self.moe_layers) - 1:
+        # TO BE CHECKED: was `>= len(self.moe_layers) - 1`, which excluded the LAST MoE
+        # layer from being prefetched for.
+        if next_idx >= len(self.moe_layers):
             return None
         predicted = self.predict_next_layer_experts_npu(layer_idx, hidden_states)
         if predicted is None:

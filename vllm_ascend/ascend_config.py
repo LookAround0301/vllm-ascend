@@ -62,6 +62,43 @@ class AscendConfig:
                 f"{type(self.moe_gate_override_path).__name__}"
             )
         logger.info("[GATE-OVERRIDE] config: moe_gate_override_path=%s", self.moe_gate_override_path)
+        
+        # decode-time statistics
+        self.decode_stats_enabled = additional_config.get("decode_stats_enabled", True)
+        self.decode_stats_csv = additional_config.get("decode_stats_csv", False)
+        self.decode_stats_path = additional_config.get("decode_stats_path",
+                additional_config.get("decode_stats_csv_path", None))
+        self.decode_stats_flush_every = additional_config.get("decode_stats_flush_every", 100)
+        # wall-clock flush interval, in seconds
+        self.decode_stats_flush_seconds = additional_config.get("decode_stats_flush_seconds", 30.0)
+        if not isinstance(self.decode_stats_enabled, bool):
+            raise TypeError(
+                "decode_stats_enabled must be a boolean, got "
+                f"{type(self.decode_stats_enabled).__name__}")
+        if not isinstance(self.decode_stats_csv, bool):
+            raise TypeError(
+                "decode_stats_csv must be a boolean, got "
+                f"{type(self.decode_stats_csv).__name__}")
+        if self.decode_stats_path is not None and not isinstance(self.decode_stats_path, str):
+            raise TypeError(
+                "decode_stats_path must be a string or null, got "
+                f"{type(self.decode_stats_path).__name__}")
+        if not isinstance(self.decode_stats_flush_every, int) or self.decode_stats_flush_every < 1:
+            raise ValueError(
+                "decode_stats_flush_every must be an integer >= 1, got "
+                f"{self.decode_stats_flush_every!r}")
+        if (not isinstance(self.decode_stats_flush_seconds, (int, float))
+                or isinstance(self.decode_stats_flush_seconds, bool)
+                or self.decode_stats_flush_seconds <= 0):
+            raise ValueError(
+                "decode_stats_flush_seconds must be a positive number, got "
+                f"{self.decode_stats_flush_seconds!r}")
+        self.decode_stats_flush_seconds = float(self.decode_stats_flush_seconds)
+        logger.info(
+            "[DECODE-STATS] config: enabled=%s csv=%s path=%s flush_every=%s flush_seconds=%s",
+            self.decode_stats_enabled, self.decode_stats_csv,
+            self.decode_stats_path, self.decode_stats_flush_every,
+            self.decode_stats_flush_seconds)
 
         self.scheduler_config = SchedulerConfig(
             additional_config,
