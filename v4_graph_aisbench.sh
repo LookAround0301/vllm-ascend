@@ -25,7 +25,8 @@ MODEL="${MODEL:-/mnt/data/models/DeepSeek-V4-Flash}"
 SERVED_NAME="${SERVED_NAME:-A5-deepseekv4-flash-w4a8}"
 TOKENIZER="${TOKENIZER:-/home/keyi/llms/benchmarks/dsv4-tokenizer}"
 AIS_BENCH_DATASETS_CACHE="${AIS_BENCH_DATASETS_CACHE-/home/keyi/llms/benchmarks}"
-REMOE_GATE="${REMOE_GATE:-}"             # fine-tuned MoE router gates, swapped in at load
+REMOE_GATE="${REMOE_GATE:-}"                # fine-tuned MoE router gates, swapped in at load
+REMOE_GATE_ROT="${REMOE_GATE_ROT:-quarot}"  # the rotation the REMOE_GATE checkpoints were fine-tuned against
 CARD="${CARD:-6}"; PORT="${PORT:-7001}"
 TP="${TP:-1}"; DP="${DP:-1}"
 SEED="${SEED:-1024}"
@@ -33,7 +34,7 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"       # empty = the checkpoint's own
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
-QUANTIZATION="${QUANTIZATION-}"          # non-empty -> --quantization <v>; empty -> flag
+QUANTIZATION="${QUANTIZATION-ascend}"    # non-empty -> --quantization <v>; empty -> flag
                                          # omitted, engine resolves it from the checkpoint.
                                          # That is ALL this variable does.
 API_SERVER_COUNT="${API_SERVER_COUNT:-1}"
@@ -143,6 +144,49 @@ die()   { echo "ERROR: $*" >&2; exit 1; }
 guard() { [[ "${ALLOW_UNSAFE}" == "1" ]] && echo "  warn    : [unsafe] $*" || die "$*"; }
 bool()  { [[ "$1" == "1" ]] && echo true || echo false; }
 
+# the rotation a model build declares, as a canonical id. Echoes exactly one of:
+#   absent      no quant_model_description.json -> the build ships no quantisation metadata
+#               at all. The fp8/ue8m0 DeepSeek release is like this.
+#   none        the file exists but carries no `optional` block
+#   unreadable  the file exists but is not parseable JSON
+#   <ids>       comma-separated sorted keys of `optional`, e.g. "quarot"
+# Never fails: a bad path or a corrupt file resolves to a value the caller reports, rather
+# than to a stack trace the caller has to interpret. The 8.5 MB / 136973-key file parses in
+# ~94 ms, so this is cheap enough for preflight without a grep fast-path.
+model_rotation() {   # $1 = model dir
+  local desc="$1/quant_model_description.json"
+  [[ -f "${desc}" ]] || { echo absent; return 0; }
+  python3 - "${desc}" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("unreadable"); sys.exit(0)
+o = d.get("optional")
+print(",".join(sorted(map(str, o))) if isinstance(o, dict) and o else "none")
+PY
+}
+
+# one failure path for the rotation gate, so the WHY/SYMPTOM/FIX explanation is written
+# once instead of three times. $1 is the specific finding. guard() rather than die() to match
+# every other safety check here — ALLOW_UNSAFE=1 downgrades it to a warning.
+gate_rot_fail() {   # $1 = what was found
+  guard "$1
+       WHY   : a router gate is only meaningful in the hidden-space basis it was trained in.
+               QuaRot's R1 acts on the residual stream and is absorbed into every input
+               projection INCLUDING mlp.gate (https://arxiv.org/abs/2404.00456), so a rotated
+               build stores W@R1 where an unrotated one stores W. The two are identical in
+               shape, in every row norm and in their singular values, so the engine's shape
+               check, its layer-index checks and its fp32 verifier all pass on the wrong one.
+       SYMPTOM: no crash and no error. The forward pass runs at full speed; attention, the
+               shared expert and the three hash-routed layers are untouched. The model simply
+               stops emitting EOS, so every request runs to max_out_len — at MAX_NUM_SEQS=1
+               that is ~15 min per prompt and AISBench reads as hung.
+       FIX   : serve ${REMOE_GATE} on the build it was fine-tuned from; or set REMOE_GATE_ROT
+               to match this build if that is genuinely correct; or unset REMOE_GATE to
+               measure the base router. ALLOW_UNSAFE=1 to override."
+}
+
 export ASCEND_RT_VISIBLE_DEVICES="${CARD}"
 export no_proxy="127.0.0.1,localhost,${no_proxy:-}"; export NO_PROXY="${no_proxy}"
 [[ -n "${AIS_BENCH_DATASETS_CACHE}" ]] && export AIS_BENCH_DATASETS_CACHE \
@@ -197,6 +241,31 @@ NDE_MIN="${NUM_DEVICE_EXPERTS}"
 [[ "${HOT_PRELOAD}" != "1" || -n "${HOT_EXPERTS_FILE}" ]]         || die "HOT_PRELOAD=1 needs HOT_EXPERTS_FILE (a .json)"
 [[ "${NCARDS}" == "${EP_SIZE}" ]] || die "CARD lists ${NCARDS} device(s) but TP*DP=${EP_SIZE}"
 [[ -z "${REMOE_GATE}" || -e "${REMOE_GATE}" ]]                    || die "REMOE_GATE not found: ${REMOE_GATE}"
+# the two DeepSeek-V4-Flash builds have byte-identical config.json apart from
+# quantization_config vs expert_dtype, and every routing-relevant field (num_hash_layers=3,
+# n_routed_experts=256, hidden_size=4096) is the same in both — so config.json cannot tell
+# them apart. quant_model_description.json can: only the w4a8 build ships one, and only it
+# declares optional.quarot. Checked here, at ~0.1s, rather than after a two-minute load.
+# MODEL_ROT is seeded so the plan echo below can read it whether or not the gate is in use.
+MODEL_ROT="not checked (no REMOE_GATE)"
+if [[ -n "${REMOE_GATE}" ]]; then
+  [[ -d "${MODEL}" ]] || die "MODEL is not a directory: ${MODEL}"
+  [[ -n "${REMOE_GATE_ROT}" ]] || die "REMOE_GATE is set but REMOE_GATE_ROT is empty. Set it to the
+       rotation the gates were fine-tuned against ('quarot' for the w4a8 build), or unset REMOE_GATE."
+  MODEL_ROT="$(model_rotation "${MODEL}")"
+  if [[ "${MODEL_ROT}" == "${REMOE_GATE_ROT}" ]]; then
+    :   # the build declares the rotation these gates belong to
+  elif [[ "${MODEL_ROT}" == absent ]]; then
+    gate_rot_fail "REMOE_GATE is set, but ${MODEL} has no quant_model_description.json — this build
+       declares no rotation at all, and REMOE_GATE_ROT=${REMOE_GATE_ROT} was required."
+  elif [[ "${MODEL_ROT}" == unreadable ]]; then
+    gate_rot_fail "REMOE_GATE is set, but ${MODEL}/quant_model_description.json could not be parsed
+       as JSON, so this build's rotation cannot be established (required: ${REMOE_GATE_ROT})."
+  else
+    gate_rot_fail "REMOE_GATE is set, but ${MODEL} declares rotation='${MODEL_ROT}' and
+       REMOE_GATE_ROT='${REMOE_GATE_ROT}' was required."
+  fi
+fi
 
 # TOPK from the checkpoint — the engine reads the config, not this variable. MUST resolve
 # before the threshold and capture arithmetic.
@@ -733,6 +802,7 @@ echo "  serve   : ${SERVED_NAME} on :${PORT} (card ${CARD}) tp=${TP} dp=${DP} ep
 echo "  spec    : ${SPEC_METHOD:-off} num_spec_tokens=${NUM_SPEC_TOKENS} decode_tokens=${DECODE_TOKENS} moe_rows=${MOE_ROWS} (x dp=${DP})"
 echo "  offload : ${OFFLOAD} experts=${NUM_DEVICE_EXPERTS} layers=${NUM_DEVICE_LAYERS} lrc=${CACHE_POLICY} prefetch=${PREFETCH}/${EXPERT_PREFETCH_NUM} tokens=${EXPERT_PREFETCH_TOKENS}(eff ${PF_TOK_EFF}) subst=${EXPERT_SUBSTITUTION} multi_card=${ENABLE_MULTI_CARD} debug=${MOE_OFFLOAD_DEBUG}"
 echo "  gate    : ${REMOE_GATE:-off (base router)}"
+[[ -n "${REMOE_GATE}" ]] && echo "            build rotation=${MODEL_ROT} (required=${REMOE_GATE_ROT}) — matched"
 echo "  stats   : ${DECODE_STATS} csv=${CSV} -> ${STATS_DIR}  (quiesce=${STATS_QUIESCE}s engine_grace=${ENGINE_GRACE}s reap_wait=${REAP_WAIT}s)"
 echo "  health  : ${HEALTH_URL}  (wait=${WAIT}s, grace_after_listening=${HEALTH_GRACE}s)"
 echo "  env     : conda=${VA_CONDA_ENV:-unset} cann=${VA_CANN_SOURCED:-unset} omp=${OMP_NUM_THREADS:-unset} log=${VLLM_LOGGING_LEVEL:-unset} v2_runner=${VLLM_USE_V2_MODEL_RUNNER:-unset}"
@@ -810,7 +880,7 @@ echo "  repro   : $(for v in CARD PORT TASKS RUN THINK THINK_EFFORT NUM_PROMPTS 
       PERF_TEMP MAX_NUM_SEQS MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS SEED GPU_MEM_UTIL TP DP QUANTIZATION PREFIX_CACHING \
       ENFORCE_EAGER CUDAGRAPH_MODE CUDAGRAPH_CAPTURE_SIZES ENABLE_NPUGRAPH_EX ENABLE_STATIC_KERNEL \
       MTP NUM_SPEC_TOKENS OFFLOAD NUM_DEVICE_EXPERTS NUM_DEVICE_LAYERS TOPK EXPERT_MAP_PATH \
-      CACHE_POLICY PREFETCH EXPERT_PREFETCH_NUM EXPERT_PREFETCH_TOKENS CACHE_STATS_LOG_INTERVAL MOE_OFFLOAD_DEBUG REMOE_GATE \
+      CACHE_POLICY PREFETCH EXPERT_PREFETCH_NUM EXPERT_PREFETCH_TOKENS CACHE_STATS_LOG_INTERVAL MOE_OFFLOAD_DEBUG REMOE_GATE REMOE_GATE_ROT \
       DECODE_STATS CSV CSV_PATH STATS_FLUSH_EVERY STATS_FLUSH_SECONDS STATS_QUIESCE WAIT HEALTH_GRACE ENGINE_GRACE REAP_WAIT \
       EXPERT_SUBSTITUTION EXPERT_SUBSTITUTION_THRESHOLD HOT_PRELOAD HOT_EXPERTS_FILE \
       ENABLE_MULTI_CARD SHARD_PER_RANK CACHE_RECENT_WINDOW CACHE_EMA_BETA CACHE_RECENT_WEIGHT \
