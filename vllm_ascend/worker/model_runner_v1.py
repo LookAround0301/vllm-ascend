@@ -2048,6 +2048,12 @@ class NPUModelRunner(GPUModelRunner):
         defer_kv_connector_finalize = self.speculative_config is not None and (
             get_pp_group().is_last_rank or self.broadcast_pp_output
         )
+        # tell the statistics collector whether this forward is a decode step.
+        _stats = get_decode_stats()
+        if _stats is not None:
+            _stats.set_step_kind(
+                self.attn_state in (AscendAttentionState.DecodeOnly,
+                                    AscendAttentionState.SpecDecoding))
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2706,6 +2712,30 @@ class NPUModelRunner(GPUModelRunner):
                     f"subst={'on(%.3f)' % config.expert_substitution_threshold if config.expert_substitution_enabled else 'off'} "
                     f"multi_card={config.enable_multi_card} "
                     f"debug={config.moe_offload_debug}")
+                # the decode/prefill split is decided on MoE token ROWS, and
+                # AllGatherCommImpl concatenates every DP rank's rows before the
+                # MoE — so the count compared against offload_threshold is
+                # seqs x (1 + spec) x dp, not the batch size.
+                dp_size = self.parallel_config.data_parallel_size
+                per_req = 1 + (self.num_spec_tokens if self.speculative_config
+                               else 0)
+                moe_tokens = self.max_num_reqs * per_req * dp_size
+                paging = moe_tokens <= manager.offload_threshold
+                lines.append(
+                    f"decode   : moe_rows/step={moe_tokens} "
+                    f"(seqs={self.max_num_reqs} x {per_req} x dp={dp_size}) "
+                    f"threshold={manager.offload_threshold} -> "
+                    f"{'paging' if paging else 'PREFILL-POOL (no statistics)'}")
+                if not paging:
+                    logger.warning_once(
+                        "[DECODE-STATS] moe token rows/step=%d exceeds "
+                        "offload_threshold=%d: every decode step takes the "
+                        "prefill-pool path, so there is no paging, no prefetch "
+                        "and no cache statistics. Raise num_device_experts to "
+                        ">= %d, or lower max_num_seqs / num_speculative_tokens / "
+                        "data_parallel_size.",
+                        moe_tokens, manager.offload_threshold,
+                        moe_tokens * manager.topk)
             except Exception:
                 pass
         else:
@@ -3558,6 +3588,9 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
+            _stats = get_decode_stats()
+            if _stats is not None:
+                _stats.set_step_kind(False)
             with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,

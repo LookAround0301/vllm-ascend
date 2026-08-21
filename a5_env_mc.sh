@@ -9,7 +9,7 @@
 # STACK — identical to A3; requirements.txt is shared, so nothing moves here:
 #   vLLM          upstream vllm-project/vllm @ v0.26.0
 #   vllm-ascend   LookAround0301/vllm-ascend @ moe_offload_v0260rc_k3_0801
-#   CANN / NNAL   9.0.1          torch 2.10.0
+#   CANN / NNAL   9.1.0          torch 2.10.0
 #   torch-npu     2.10.0.post2   torchvision 0.25.0 / torchaudio 2.10.0
 #   triton-ascend 3.2.1          transformers 5.14.1 (hard pin via requirements.txt)
 #   Python        3.12
@@ -50,7 +50,7 @@ conda activate "${VA_CONDA_ENV}" || echo "WARN: could not activate ${VA_CONDA_EN
 # Set BEFORE sourcing CANN, deliberately: set_env.sh PREPENDS its paths, so this
 # ordering leaves CANN's libs ahead of conda's. Reversing it lets conda's
 # libstdc++ shadow CANN's. Do not move this line below section 2.
-export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
+# export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
 
 # ---- 2. CANN / NNAL --------------------------------------------------------
 # VA_ASCEND_ROOT is the INSTALL ROOT (the dir containing ascend-toolkit/ and
@@ -64,7 +64,7 @@ export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
 # after one source ASCEND_HOME_PATH is already <root>/ascend-toolkit/latest, so
 # :- never fires, the old install sticks, and the script then hunts for
 # <root>/ascend-toolkit/latest/ascend-toolkit/set_env.sh and calls it missing.
-export VA_ASCEND_ROOT="/home/keyi/Ascend901"
+export VA_ASCEND_ROOT="/home/keyi/Ascend910"
 
 # set_env.sh CANNOT be un-sourced — it prepends to PATH / LD_LIBRARY_PATH /
 # PYTHONPATH. Mixing two CANN roots in one shell yields a half-and-half
@@ -359,7 +359,7 @@ export VLLM_WORKER_MULTIPROC_METHOD="spawn"
 
 # ---- 15. Summary -----------------------------------------------------------
 echo "[env-a5] ${VA_CONDA_ENV} | ${HOST_ARCH} | SOC=${SOC_VERSION}"
-echo "[env-a5] CANN=${_CANN_V:-UNKNOWN} (want 9.0.1) root=${VA_ASCEND_ROOT}"
+echo "[env-a5] CANN=${_CANN_V:-UNKNOWN} (want 9.0.1 on A3 & 9.1.0 on A5) root=${VA_ASCEND_ROOT}"
 echo "[env-a5] vllm=${VLLM_TAG} vllm-ascend=${VLLM_ASCEND_BRANCH} torch=${TORCH_VERSION} torch-npu=${TORCH_NPU_VERSION}"
 echo "[env-a5] tools: cmake=${_CMAKE_V:-none} gcc=$(gcc -dumpversion 2>/dev/null || echo none) triton-c++=${_CXX} (${_CXX_V:-?})"
 echo "[env-a5] pip: primary=$(pip config get global.index-url 2>/dev/null || echo 'pypi.org') extra=${PIP_EXTRA_INDEX_URL} torch_idx='${TORCH_IDX_ARG:-none}'"
@@ -369,5 +369,5 @@ echo "[env-a5] perf: NZ=${VLLM_ASCEND_ENABLE_NZ} MLAPO=${VLLM_ASCEND_ENABLE_MLAP
 echo "[env-a5] offload invariants: EPLB=${DYNAMIC_EPLB} MC2=${VLLM_ASCEND_ENABLE_FUSED_MC2} V2_RUNNER=${VLLM_USE_V2_MODEL_RUNNER} BLOCKING=${ASCEND_LAUNCH_BLOCKING} LOG=${VLLM_LOGGING_LEVEL}"
 echo "[env-a5] per-run (test script): ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-unset}"
 command -v npu-smi >/dev/null 2>&1 || echo "[env-a5] WARN: npu-smi not on PATH"
-
+which bisheng
 unset _f _stale _jemalloc _CMAKE_V _CXX _CXX_V _CANN_V

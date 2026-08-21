@@ -57,6 +57,12 @@ _LAYER_KEYS = tuple(
 _CSV_COLUMNS = tuple(
     source for _k, _l, source, _r, in_csv in _METRICS if in_csv)
 
+# watchdog cadence. Not a snapshot interval
+_WATCHDOG_TICK_SECONDS = 1.0
+_QUIET_SECONDS = 3.0
+# liveness line
+_HEARTBEAT_SECONDS = 60.0
+
 
 def _summarize_series(series):
     """(mean, median, min, max, n) over a per-step series, or None if empty."""
@@ -110,6 +116,15 @@ class DecodeStatsCollector:
         # cached run header, so an interim artifact is self-describing too.
         self._header = None
 
+        # watchdog state
+        self._record_calls = 0
+        self._last_record = time.monotonic()
+        self._watchdog = None
+        self._stop = threading.Event()
+        # per-forward decode gate, set by the model runner before every forward.
+        self._step_is_decode = True
+        self._nondecode_steps = 0
+
         self._spec_len = []
         self._spec_rate = []
         self._spec_accepted = 0
@@ -134,9 +149,17 @@ class DecodeStatsCollector:
         # otherwise model loading and graph capture, which are minutes, would make
         # the very first decode step look overdue and flush an empty table.
         self._time_at_last_flush = time.monotonic()
-        logger.info("[DECODE-STATS] armed: collection is now live (flush every %d "
-                    "steps or %.0fs, whichever comes first; output dir %s)",
-                    self._flush_every, self._flush_seconds, self._out_path or "<none>")
+        self._last_record = time.monotonic()
+
+        if self._watchdog is None:
+            self._watchdog = threading.Thread(
+                target=self._watchdog_loop, name="decode-stats-watchdog",
+                daemon=True)
+            self._watchdog.start()
+        logger.info("[DECODE-STATS] armed: collection is now live (snapshot every %d "
+                    "steps or %.0fs, and %.0fs after decoding stops; output dir %s)",
+                    self._flush_every, self._flush_seconds, _QUIET_SECONDS,
+                    self._out_path or "<none>")
 
     def set_header(self, header) -> None:
         """Cache the run-configuration header for interim flushes.
@@ -158,8 +181,25 @@ class DecodeStatsCollector:
             self._multi_card = multi_card
 
     # -------------------------------------------------------------- #
-    #  Recording                                                       #
+    #  Recording                                                     #
     # -------------------------------------------------------------- #
+    
+    def set_step_kind(self, is_decode: bool) -> None:
+        """Declare whether the forward about to run is a pure decode step.
+
+        Called once per forward by the model runner, from `execute_model`
+        (with the real answer) and from `_dummy_run` (always False). Everything
+        else — prefill, chunked prefill, a prefix-cache-hit remainder short
+        enough to slip under `offload_threshold`, and the DP-idle dummy run —
+        must not contribute samples, and none of them were excluded before.
+
+        No lock: a bool store on the forward thread against a bool load on the
+        report thread, and the two are ordered by the forward itself (eager runs
+        the callback inline; replay is preceded by a stream synchronize).
+        """
+        self._step_is_decode = is_decode
+        if not is_decode and self._active and not self._final:
+            self._nondecode_steps += 1
 
     def note_shortfall(self) -> None:
         """One (layer, step) where a needed expert could not be given a slot.
@@ -187,6 +227,9 @@ class DecodeStatsCollector:
         """
         if not self.collecting:
             return
+        # drop the whole forward if it is not a decode step for decode stats capture.
+        if not self._step_is_decode:
+            return
         values = {
             # gsize/psize/pf_loads/pred_prec added. Keys must match the
             # `source` column of _METRICS; nothing else keys off this dict.
@@ -197,20 +240,26 @@ class DecodeStatsCollector:
             "subst": subst, "pred_acc": pred_acc, "pred_prec": pred_prec,
             "pf_in_lrc": pf_in_lrc, "pf_useful": pf_useful,
         }
-        due = False
+        # This method runs inside the paging host callback, which blocks its stream until it returns, 
+        # so the summary formatting and two file writes were a decode stall that grew
+        # with the run. _watchdog_loop owns snapshotting now.
         with self._lock:
-            # announce the first real sample once
-            if not self._announced_first:
-                self._announced_first = True
-                logger.info("[DECODE-STATS] first sample recorded (layer=%d) — "
-                            "collection is working", layer_idx)
+            # re-check under the lock
+            if self._final:
+                return
+            self._record_calls += 1
+            self._last_record = time.monotonic()
             if layer_idx in self._seen:
                 self._close_step_locked()
-                due = self._maybe_due_locked()
             self._seen.add(layer_idx)
             self._step_open = True
             if layer_idx in self._hash_layers:
                 return
+            # announce *after* the hash-layer return.
+            if not self._announced_first:
+                self._announced_first = True
+                logger.info("[DECODE-STATS] first sample recorded (layer=%d) — "
+                            "collection is working", layer_idx)
             for key, value in values.items():
                 if value is None:
                     continue
@@ -219,11 +268,9 @@ class DecodeStatsCollector:
                     self._layer_sum[key].get(layer_idx, 0.0) + value)
                 self._layer_cnt[key][layer_idx] = (
                     self._layer_cnt[key].get(layer_idx, 0) + 1)
-        if due:
-            self._flush(final=False)
 
-    def _maybe_due_locked(self) -> bool:
-        """Is a periodic flush due? Caller holds _lock.
+    def _maybe_due_locked(self, quiet: bool = False) -> bool:
+        """Is a snapshot due? Caller holds _lock.
 
         Marks the flush as taken here rather than in _flush, so two threads
         cannot both decide they are due for the same interval — record_layer runs
@@ -231,13 +278,62 @@ class DecodeStatsCollector:
         """
         if self._out_path is None:
             return False
+        # require at least one new step
+        new_steps = self._decode_steps - self._steps_at_last_flush
+        if new_steps <= 0:
+            return False
         now = time.monotonic()
-        if (self._decode_steps - self._steps_at_last_flush < self._flush_every
-                and now - self._time_at_last_flush < self._flush_seconds):
+        # `quiet` is the third trigger — decoding has stopped, which is
+        # the end of the workload and the moment the artifact must be complete
+        if (new_steps < self._flush_every
+                and now - self._time_at_last_flush < self._flush_seconds
+                and not quiet):
             return False
         self._steps_at_last_flush = self._decode_steps
         self._time_at_last_flush = now
         return True
+    
+    def _watchdog_loop(self) -> None:
+        """Snapshot on a timer, off the paging callback's critical path.
+
+        Closes three failure modes that all presented as "no summary and no
+        CSV after the run":
+        * both periodic triggers used to be evaluated inside ``record_layer``,
+          which only runs while decoding — so once the workload finished nothing
+          could snapshot again and the tail lived in memory until ``summarize()``,
+          the call vLLM's process manager SIGKILLs;
+        * ``record_layer`` runs inside ``_launch_host_func``, so its file writes
+          stalled the compute stream;
+        * a collector that never received a sample looked exactly like one that
+          was never created. The heartbeat is emitted either way.
+        """
+        heartbeat_at = time.monotonic()
+        while not self._stop.wait(_WATCHDOG_TICK_SECONDS):
+            if self._final:
+                return
+            due = False
+            beat = None
+            with self._lock:
+                if self._final:
+                    return
+                now = time.monotonic()
+                quiet = (now - self._last_record) >= _QUIET_SECONDS
+                if quiet and self._step_open:
+                    self._close_step_locked()
+                due = self._maybe_due_locked(quiet=quiet)
+                if now - heartbeat_at >= _HEARTBEAT_SECONDS:
+                    heartbeat_at = now
+                    beat = (self._decode_steps, self._record_calls,
+                            self._flushes, len(self._spec_len))
+            # both outside the lock: logging and file I/O must not serialise
+            # against record_layer on the report thread.
+            if beat is not None:
+                logger.info("[DECODE-STATS] heartbeat: steps=%d records=%d "
+                            "snapshots=%d spec_samples=%d out=%s",
+                            beat[0], beat[1], beat[2], beat[3],
+                            self._out_path or "<none>")
+            if due and not self._final:
+                self._flush(final=False)
 
     def record_spec_step_totals(self, accepted: int, proposed: int, n_drafts: int) -> None:
         """Record one decode step's speculative-decoding totals.
@@ -279,8 +375,7 @@ class DecodeStatsCollector:
     def summarize(self, header=None) -> None:
         """Emit the final statistics. Idempotent and latched.
 
-        Called from the model runner's shutdown(), from the atexit backstop, and
-        from a signal handler — whichever arrives first wins.
+        Called from the model runner's shutdown() and from the atexit backstop.
         """
         self._flush(final=True, header=header)
 
@@ -296,11 +391,32 @@ class DecodeStatsCollector:
         """
         with self._lock:
             if self._final:
+                # was a warning. Demoted, because this can only ever
+                # drop a RECOMPUTATION, never data: record_layer refuses to
+                # record once _final is set (see its in-lock re-check), and
+                # every flush rebuilds the whole summary from the running
+                # accumulators. The only way to get here now is a watchdog tick
+                # that decided it was due and then lost the lock to
+                # summarize() — expected at shutdown, and already written.
+                logger.debug("[DECODE-STATS] snapshot skipped: already "
+                             "finalized (steps=%d)", self._decode_steps)
                 return
             if final:
                 self._close_step_locked()
                 self._final = True
-            # CHANGE: fall back to the cached header, so interim artifacts carry
+                # retire the watchdog with the collector, so it cannot
+                # race the shutdown path or hold a reference after the summary.
+                self._stop.set()
+                # latch the trigger baseline. _close_step_locked() above
+                # just incremented _decode_steps, and _steps_at_last_flush is
+                # still pointing at the last PERIODIC snapshot — so without this
+                # the next watchdog tick computes new_steps > 0, declares itself
+                # due, and flushes into a finalized collector. That is the
+                # "snapshot dropped: already finalized" line every clean
+                # shutdown was producing.
+                self._steps_at_last_flush = self._decode_steps
+                self._time_at_last_flush = time.monotonic()
+            # fall back to the cached header, so interim artifacts carry
             # the run configuration too and not just the metric table.
             if header is None:
                 header = self._header
@@ -361,6 +477,15 @@ class DecodeStatsCollector:
             f"measured : decode steps={self._decode_steps}  "
             f"moe layers={moe_layers} (hash excluded={len(self._hash_layers)})  "
             f"slot shortfalls={self._shortfalls}")
+        # collector state, always. An empty table used to give no way to
+        # tell "never armed" from "armed but never fed" from "finalized early".
+        lines.append(
+            f"collector: active={self._active} final={self._final} "
+            f"snapshots={self._flushes} record_calls={self._record_calls} "
+            # forwards dropped as non-decode. decode_steps + non_decode
+            # should equal the engine's total forward count
+            f"non_decode={self._nondecode_steps} "
+            f"out={self._out_path or '<none>'}")
         if self._multi_card:
             lines.append(
                 "note     : multi-card offload path collects no per-layer "
@@ -468,6 +593,10 @@ def get_decode_stats():
         return None  # config not built yet; retry on the next call
     _COLLECTOR_RESOLVED = True
     if not getattr(config, "decode_stats_enabled", False):
+        # A None collector was indistinguishable from one that
+        # existed and never recorded anything, which is half of every "no statistics" investigation.
+        logger.info("[DECODE-STATS] disabled by config "
+                    "(additional_config.decode_stats_enabled=false)")
         return None
     _COLLECTOR = DecodeStatsCollector(
         csv_enabled=config.decode_stats_csv,

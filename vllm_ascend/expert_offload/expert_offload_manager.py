@@ -1640,20 +1640,21 @@ class ExpertOffloadManager:
             layer,
             layer_idx,
             topk_weights_h,
-            self._is_prefetch,
+            False,
             do_substitution,
             router_logits_h,
             scoring_func,
             correction_bias_h,
         )
+        # launch the guarded wrapper — see _note_cb_failure.
         if _EXTRA_CTX.capturing:
             torch_npu.npu._launch_host_func(
                 current_compute_stream,
-                self._update_weights,
+                self._update_weights_guarded,
                 args,
             )
         else:
-            self._update_weights(args)
+            self._update_weights_guarded(args)
 
         if do_substitution:
             topk_ids[:, :self.topk].copy_(topk_ids_h[:, :self.topk],
@@ -1803,11 +1804,13 @@ class ExpertOffloadManager:
             mc2_mask_h, do_substitution, router_logits_h, scoring_func,
             correction_bias_h, topk_weights_h,
         )
+        # guarded wrapper, same reason as the single-card site
         if _EXTRA_CTX.capturing:
             torch_npu.npu._launch_host_func(
-                current_compute_stream, self._update_weights_multi_card, args)
+                current_compute_stream,
+                self._update_weights_multi_card_guarded, args)
         else:
-            self._update_weights_multi_card(args)
+            self._update_weights_multi_card_guarded(args)
         if do_substitution:
             topk_ids[:, :self.topk].copy_(
                 topk_ids_h[:, :self.topk], non_blocking=True)
@@ -2317,6 +2320,44 @@ class ExpertOffloadManager:
             replacements[:sample_limit],
             max(0, len(replacements) - sample_limit),
         )
+        
+    def _note_cb_failure(self, where: str) -> None:
+        """Turn a report-thread exception into a log line.
+
+        Under ACL-graph replay these callbacks run on the report thread,
+        where an exception reaches neither the forward thread nor the log — the
+        run just silently stops paging and stops recording statistics. The
+        counter is lazily initialised so this needs no __init__ edit.
+        """
+        count = getattr(self, "_cb_failures", 0) + 1
+        self._cb_failures = count
+        if count <= 5:
+            logger.exception(
+                "[EXPERT-OFFLOAD] %s host callback failed (#%d) — this layer's "
+                "paging did not complete", where, count)
+        elif count == 6:
+            logger.error(
+                "[EXPERT-OFFLOAD] %s host callback keeps failing; further "
+                "tracebacks suppressed", where)
+
+    def _update_weights_guarded(self, args):
+        """_update_weights, with the report-thread exception made visible."""
+        try:
+            self._update_weights(args)
+        except Exception:
+            self._note_cb_failure("update_weights")
+
+    def _update_weights_multi_card_guarded(self, args):
+        """_update_weights_multi_card, same guard.
+
+        Note this also catches the deliberate placement-overflow RuntimeError.
+        That was already being swallowed under replay; the guard only makes it
+        loud. It is a hard configuration error, not a recoverable condition.
+        """
+        try:
+            self._update_weights_multi_card(args)
+        except Exception:
+            self._note_cb_failure("update_weights_multi_card")
 
     def _update_weights(self, args):
         if len(args) == 6:
@@ -2432,7 +2473,10 @@ class ExpertOffloadManager:
                 stat_hit_pre = (len(gt_set & on_device) / len(gt_set)
                                 if gt_set else 0.0)
 
-            if self.cache_policy is not None:
+            # Reactive pass only. On the prefetch pass `needed` is the
+            # PREDICTED set, so these legacy counters were mixing predicted with
+            # actual routing and their hit rate moved when prefetch was toggled.
+            if self.cache_policy is not None and not is_prefetch:
                 self._record_cache_stats(layer_idx, already_there, need_to_load, needed, on_device)
             reusable_slots = [s for s, e in slot_owner.items()
                             if e not in needed]          # slots to recycle
@@ -2470,7 +2514,7 @@ class ExpertOffloadManager:
 
                 if slot < 0:
                     # count the shortfall
-                    if stats is not None:
+                    if stats is not None and not is_prefetch:
                         stats.note_shortfall()
                     if self._debug:
                         logger.info(
@@ -2657,15 +2701,17 @@ class ExpertOffloadManager:
         - Hash-routed layers (first num_hash_layers): experts come from the
           tid2eid table indexed by token id (deterministic, 100% accurate).
         - Learned layers (the rest): softmax + topk on the gate logits of the
-          first token.
+          first `expert_prefetch_tokens` token rows.
 
         Args:
             layer_idx: Current layer index.
             hidden_states: [num_tokens, hidden_dim] NPU tensor.
 
         Returns:
-            (topk_weights, topk_ids) for the first token only, both
-            [1, topk] NPU tensors, or None if prediction is not possible.
+            (topk_weights, topk_ids), both [n_tok, topk] NPU tensors where
+            n_tok = min(expert_prefetch_tokens, forward rows), or None if
+            prediction is not possible. CHANGE: was "[1, topk], first token
+            only" — that stopped being true when expert_prefetch_tokens landed.
         """
         next_idx = layer_idx + 1
         if next_idx >= len(self.moe_layers):
@@ -2710,12 +2756,12 @@ class ExpertOffloadManager:
             )
             return topk_weights, topk_ids
 
-        # Predict from the first token only — one representative token's
+        # Previous behavior: Predict from the first token only — one representative token's
         # experts is enough for prefetch; others are handled reactively by
         # update_weights(). prefetch_topk (= min(topk, expert_prefetch_num))
         # caps how many experts are prefetched per layer — single-card uses 1
         # (cheap, conservative); raise expert_prefetch_num for more coverage.
-        # TO BE CHECKED: first token may not be enough for MTP
+        # New behavior TO BE CHECKED: first token may not be enough for MTP
         # Changed to n rows, was hidden_states[:1]. The [:1] was an identity slice
         # when written — without speculative decoding and at MAX_NUM_SEQS=1 the
         # decode path carries exactly one token — and only became a one-in-N
@@ -2732,7 +2778,7 @@ class ExpertOffloadManager:
         return topk_weights, topk_ids
 
     def trigger_next_layer_prefetch(self, layer,
-                        hidden_states: torch.Tensor | None = None) -> int:
+                        hidden_states: torch.Tensor | None = None) -> None:
         """Trigger next-layer expert prefetch after the GMM kernel submits.
 
         Graph-compatible (mirrors the reactive update_weights path — NO stream
@@ -2772,8 +2818,18 @@ class ExpertOffloadManager:
             nxt = next_idx
 
             def _prefetch_host_cb(_args):
-                prefetch_fn(_args)
-                
+                # snapshot the staged mapping first, and restore it if
+                # the callback dies. log2phy_h is mutated in place, and the H2D
+                # write-back below is a recorded node that replays regardless —
+                # so a partial failure would publish residency for experts whose
+                # H2D never happened (log2phy applied then clamped -> slot 0,
+                # silent misroute). Restoring makes the write-back a no-op.
+                saved = log2phy_h.clone()
+                try:
+                    prefetch_fn(_args)
+                except Exception:
+                    log2phy_h.copy_(saved)
+                    self._note_cb_failure("prefetch")
 
             if _EXTRA_CTX.capturing:
                 torch_npu.npu._launch_host_func(
@@ -2816,7 +2872,6 @@ class ExpertOffloadManager:
         k_ids = topk_ids.size(1)
         topk_ids_h = self.topk_ids_h[:num_tokens, :k_ids]
         topk_ids_h.copy_(topk_ids.to(torch.int32), non_blocking=_EXTRA_CTX.capturing)
-        topk_weights_h = None
         # staged whenever the predictor produced weights, was gated on
         # the LRC policy plus a non-zero cache_router_weight. The single-card
         # load selection below now ranks candidates by router score across token
@@ -2858,8 +2913,7 @@ class ExpertOffloadManager:
                 True, mc2_mask_h)
         # SINGLE-CARD. Unchanged
         return self._update_weights, (
-            topk_ids_h, log2phy_np, next_layer, next_idx, topk_weights_h,
-            self._is_prefetch)
+            topk_ids_h, log2phy_np, next_layer, next_idx, topk_weights_h, True)
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #
@@ -2877,8 +2931,6 @@ class ExpertOffloadManager:
         self.cache_requests[layer_idx] += len(needed)
         self.cache_hits[layer_idx] += len(hit_experts)
         self.cache_misses[layer_idx] += len(miss_experts)
-        self.last_hit_experts[layer_idx] = sorted(hit_experts)
-        self.last_miss_experts[layer_idx] = sorted(miss_experts)
 
         interval = self.offload_config.cache_stats_log_interval
         if interval == 0 or self.cache_calls[layer_idx] % interval != 0:
@@ -2890,6 +2942,9 @@ class ExpertOffloadManager:
         if self.cache_policy is not None:
             policy_step = self.cache_policy.layer_step(layer_idx)
         if self._debug:
+            # the two sorted() calls moved here from the top of the function.
+            self.last_hit_experts[layer_idx] = sorted(hit_experts)
+            self.last_miss_experts[layer_idx] = sorted(miss_experts)
             logger.info(
                 "[EXPERT-OFFLOAD-CACHE] layer=%d cache_step=%d calls=%d policy_step=%d "
                 "hit_rate=%.4f hits=%d misses=%d last_hit=%s last_miss=%s resident=%s",

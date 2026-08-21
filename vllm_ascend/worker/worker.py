@@ -375,6 +375,15 @@ class NPUWorker(WorkerBase):
         self._is_checkpoint_format = True
 
     def shutdown(self) -> None:
+        # model_runner.shutdown() moved to the top. It emits the
+        # decode-statistics summary, and vLLM's process manager SIGKILLs this
+        # process in the same second it sends SIGTERM — so only the first thing
+        # here is guaranteed to run.
+        if model_runner := getattr(self, "model_runner", None):
+            shutdown_fn = getattr(model_runner, "shutdown", None)
+            if callable(shutdown_fn):
+                shutdown_fn()
+
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
 
@@ -383,11 +392,6 @@ class NPUWorker(WorkerBase):
 
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
-
-        if model_runner := getattr(self, "model_runner", None):
-            shutdown_fn = getattr(model_runner, "shutdown", None)
-            if callable(shutdown_fn):
-                shutdown_fn()
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks

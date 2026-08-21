@@ -37,7 +37,7 @@ conda activate "${VA_CONDA_ENV}" || echo "WARN: could not activate ${VA_CONDA_EN
 # Set BEFORE sourcing CANN, deliberately: set_env.sh PREPENDS its paths, so this
 # ordering leaves CANN's libs ahead of conda's. Reversing it lets conda's
 # libstdc++ shadow CANN's. Do not move this line below section 2.
-export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
+# export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
 
 # ---- 2. CANN / NNAL --------------------------------------------------------
 # VA_ASCEND_ROOT is the INSTALL ROOT (the dir containing ascend-toolkit/ and
