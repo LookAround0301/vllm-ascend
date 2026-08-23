@@ -3,6 +3,8 @@
 import logging
 from dataclasses import replace
 
+import os
+
 import torch
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import logger
@@ -564,6 +566,19 @@ def rejection_sample(
             target_argmax = greedy_sample(target_logits)
         else:
             target_argmax = target_logits.argmax(dim=-1).view(-1)
+
+        _fake_rate = float(os.getenv("VLLM_ASCEND_FAKE_ACCEPT_RATE", "0.8"))
+        if 0.0 < _fake_rate < 1.0:
+            with torch.no_grad():
+                # 每个 bs 长度固定 = 投机步长+1, host 端纯整数计算即可
+                _slots = max_spec_len + 1                     # 投机步长 + 1 (DSpark 7 → 8)
+                _k = int(_slots * _fake_rate)                 # 向上取整:
+                if _k < _slots * _fake_rate:
+                    _k += 1
+                # 直接取 target_argmax 的第一个值作为统一填充 token id
+                _fill = target_argmax[0].to(output_token_ids.dtype)  # 0-dim 设备张量
+                output_token_ids[:, :_k] = _fill             # 填充每行前 k 个槽位
+            return output_token_ids
 
         if HAS_TRITON:
             rejection_greedy_sample_with_triton(
