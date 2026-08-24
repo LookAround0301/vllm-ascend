@@ -26,6 +26,11 @@ local_ip="90.90.93.34"
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages/mooncake:$LD_LIBRARY_PATH
 export PYTHONPATH=/home/g00619970/moeoffload_multi/vllm:/home/g00619970/moeoffload_multi/vllm-ascend:$PYTHONPATH
 
+# MemFabric acc_offload 扩展库：offload.initialize() 运行时会从该路径 dlopen
+# libmf_hybm_accoffload.so，缺失会导致 "offload launch load library failed"
+# → RuntimeError: MemFabric LOCAL initialization failed (ret=-1)
+# source /usr/local/memfabric_hybrid/set_env.sh
+
 rm -rf ~/ascend/log/debug/plog/*
 export HCCL_IF_IP=$local_ip
 export GLOO_SOCKET_IFNAME=$nic_name
@@ -91,10 +96,15 @@ vllm serve /home/g00955623/weights/DeepSeek-V4-Flash \
     # --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
     # --speculative-config '{"num_speculative_tokens": 1,"method": "mtp","enforce_eager": true}' \
 
+    # --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,3]}' \
+    # --speculative-config '{"num_speculative_tokens": 2,"method": "mtp","enforce_eager": true}' \
+
     # --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true,"num_device_experts": [84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84], "num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1, "hot_expert_preload": true, "hot_experts_file": "expert_rank_gsm8k.json", "moe_offload_debug": true}}' \
 
     # --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true,"num_device_experts": [78, 78, 78, 120, 78, 78, 120, 78, 78, 78, 120, 78, 78, 78, 78, 78, 78, 78, 78, 120, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 120, 78, 78, 78, 120, 78, 78, 120, 256], "num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1, "hot_expert_preload": true, "hot_experts_file": "expert_rank_gsm8k.json", "substitute_policy_enabled": true, "substitute_alpha": 0.1, "substitute_scoring_func": "sqrtsoftplus", "substitute_skip_layers": [0, 1, 2], "substitute_max_reuse": 0, "moe_offload_debug": true}}' \
 
     # --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true, "enable_multi_card": true, "num_device_experts": 48, "num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1, "hot_expert_preload": true, "hot_experts_file": "expert_rank_gsm8k.json","moe_offload_debug": true}}' \
 
-    # "expert_substitution_enabled": true,"expert_substitution_threshold": 0.25,
+    # "expert_substitution_enabled": true,"expert_substitution_threshold": 0.02,
+
+    # --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true, "enable_multi_card": true,"h2d_backend": "memfabric", "memfabric_pool_size_gib": 25,"memfabric_log_level": 1,"num_device_experts": 48,"num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1,"hot_expert_preload": false, "hot_experts_file": "expert_rank_gsm8k.json","expert_substitution_enabled": false,"expert_substitution_threshold": 0.25,"moe_offload_debug": true}}' \

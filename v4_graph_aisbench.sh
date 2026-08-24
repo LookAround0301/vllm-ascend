@@ -28,13 +28,13 @@ AIS_BENCH_DATASETS_CACHE="${AIS_BENCH_DATASETS_CACHE-/home/keyi/llms/benchmarks}
 REMOE_GATE="${REMOE_GATE:-}"                # fine-tuned MoE router gates, swapped in at load
 REMOE_GATE_ROT="${REMOE_GATE_ROT:-quarot}"  # the rotation the REMOE_GATE checkpoints were fine-tuned against
 CARD="${CARD:-6}"; PORT="${PORT:-7001}"
-TP="${TP:-1}"; DP="${DP:-1}"
+TP="${TP:-1}"; DP="${DP:-1}"; PP="${PP:-1}"   # EP spans TP*DP; the card list must be TP*DP*PP
 SEED="${SEED:-1024}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"       # empty = the checkpoint's own
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
-QUANTIZATION="${QUANTIZATION-ascend}"    # non-empty -> --quantization <v>; empty -> flag
+QUANTIZATION="${QUANTIZATION-}"          # non-empty -> --quantization <v>; empty -> flag
                                          # omitted, engine resolves it from the checkpoint.
                                          # That is ALL this variable does.
 API_SERVER_COUNT="${API_SERVER_COUNT:-1}"
@@ -76,6 +76,15 @@ EXPERT_SUBSTITUTION_THRESHOLD="${EXPERT_SUBSTITUTION_THRESHOLD:-}"
 HOT_PRELOAD="${HOT_PRELOAD:-0}"; HOT_EXPERTS_FILE="${HOT_EXPERTS_FILE:-}"
 ENABLE_MULTI_CARD="${ENABLE_MULTI_CARD:-0}"      # must move together with EP world size
 SHARD_PER_RANK="${SHARD_PER_RANK:-}"     # empty = engine default (true)
+# Expert-weight H2D backend. "torch" is pinned CPU + copy_(), the engine default and what
+# every number so far was measured with. "memfabric" swaps the host allocator and the copy
+# for MemFabric Hybrid 1.2 — LOCAL DRAM on one card, SHARED DRAM across the EP group —
+# leaving routing, eviction and placement untouched. SHARED publishes every rank's shard
+# pointers, which RAISES the MC2 admission bound from one rank's slots to the whole pool
+# (see the mc line below). Needs the MemFabric runtime sourced before this script runs.
+H2D_BACKEND="${H2D_BACKEND:-torch}"              # torch | memfabric
+MEMFABRIC_POOL_GIB="${MEMFABRIC_POOL_GIB:-0}"    # PER RANK, not the total. >0 for memfabric
+MEMFABRIC_LOG_LEVEL="${MEMFABRIC_LOG_LEVEL:-}"   # empty = engine default (3)
 CACHE_RECENT_WINDOW="${CACHE_RECENT_WINDOW:-}"   # empty = engine defaults for all six
 CACHE_EMA_BETA="${CACHE_EMA_BETA:-}"
 CACHE_RECENT_WEIGHT="${CACHE_RECENT_WEIGHT:-}"
@@ -218,6 +227,7 @@ GRAPH_ON=0
 [[ "${ENFORCE_EAGER}" != "1" && "${CUDAGRAPH_MODE}" != "NONE" ]] && GRAPH_ON=1
 NCARDS="$(awk -F',' '{print NF}' <<<"${CARD}")"
 EP_SIZE=$(( TP * DP ))
+WORLD_SIZE=$(( TP * DP * PP ))   # cards; EP does not span pipeline stages
 # env_a5_0260.sh sets the single-card OMP value and leaves the multi-card re-export here.
 (( EP_SIZE > 1 )) && [[ -n "${VA_OMP_MULTI:-}" ]] && export OMP_NUM_THREADS="${VA_OMP_MULTI}"
 
@@ -239,7 +249,22 @@ NDE_MIN="${NUM_DEVICE_EXPERTS}"
 [[ -z "${CUDAGRAPH_CAPTURE_SIZES}" || "${CUDAGRAPH_CAPTURE_SIZES}" =~ ^(auto|auto-safe|[0-9]+(,[0-9]+)*)$ ]] \
   || die "CUDAGRAPH_CAPTURE_SIZES must be empty, auto, auto-safe, or a comma-separated list"
 [[ "${HOT_PRELOAD}" != "1" || -n "${HOT_EXPERTS_FILE}" ]]         || die "HOT_PRELOAD=1 needs HOT_EXPERTS_FILE (a .json)"
-[[ "${NCARDS}" == "${EP_SIZE}" ]] || die "CARD lists ${NCARDS} device(s) but TP*DP=${EP_SIZE}"
+[[ "${PP}" =~ ^[1-9][0-9]*$ ]]                                    || die "PP must be a positive integer"
+[[ "${NCARDS}" == "${WORLD_SIZE}" ]] || die "CARD lists ${NCARDS} device(s) but TP*DP*PP=${WORLD_SIZE}"
+# These four mirror ExpertOffloadConfig._validate_config exactly. The nested key set is
+# CLOSED, so the engine would raise on them anyway — but two minutes into a model load.
+[[ "${H2D_BACKEND}" =~ ^(torch|memfabric)$ ]]                     || die "H2D_BACKEND must be torch or memfabric"
+[[ "${MEMFABRIC_POOL_GIB}" =~ ^[0-9]+$ ]]                         || die "MEMFABRIC_POOL_GIB must be a non-negative integer"
+[[ -z "${MEMFABRIC_LOG_LEVEL}" || "${MEMFABRIC_LOG_LEVEL}" =~ ^[0-9]+$ ]] || die "MEMFABRIC_LOG_LEVEL must be empty or an integer"
+if [[ "${H2D_BACKEND}" == memfabric ]]; then
+  [[ "${OFFLOAD}" == "1" ]] || die "H2D_BACKEND=memfabric with OFFLOAD=0: the backend only moves expert weights."
+  (( MEMFABRIC_POOL_GIB > 0 )) || die "H2D_BACKEND=memfabric needs MEMFABRIC_POOL_GIB > 0. It is the PER-RANK
+       DRAM contribution, so the aggregate SHARED pool is EP_SIZE x that value — size it to hold this
+       rank's expert shard and its quantisation metadata."
+  [[ "${ENABLE_MULTI_CARD}" != "1" || "${SHARD_PER_RANK}" != false ]] \
+    || die "multi-card MemFabric requires SHARD_PER_RANK=true: SHARED mode keeps the host weights sharded
+       and shares the POINTERS. Replicated host weights have nothing to publish."
+fi
 [[ -z "${REMOE_GATE}" || -e "${REMOE_GATE}" ]]                    || die "REMOE_GATE not found: ${REMOE_GATE}"
 # the two DeepSeek-V4-Flash builds have byte-identical config.json apart from
 # quantization_config vs expert_dtype, and every routing-relevant field (num_hash_layers=3,
@@ -713,6 +738,12 @@ if [[ "${OFFLOAD}" == "1" ]]; then
   [[ "${HOT_PRELOAD}" == "1" ]] && p+=",\"hot_expert_preload\":true,\"hot_experts_file\":\"${HOT_EXPERTS_FILE}\""
   [[ "${ENABLE_MULTI_CARD}" == "1" ]] && p+=",\"enable_multi_card\":true"
   [[ -n "${SHARD_PER_RANK}"           ]] && p+=",\"shard_per_rank\":${SHARD_PER_RANK}"
+  # Emitted only when non-default, like every other knob here: a torch-backend run sends
+  # exactly the JSON it sent before these keys existed, so old and new runs stay comparable.
+  if [[ "${H2D_BACKEND}" != torch ]]; then
+    p+=",\"h2d_backend\":\"${H2D_BACKEND}\",\"memfabric_pool_size_gib\":${MEMFABRIC_POOL_GIB}"
+    [[ -n "${MEMFABRIC_LOG_LEVEL}" ]] && p+=",\"memfabric_log_level\":${MEMFABRIC_LOG_LEVEL}"
+  fi
   [[ -n "${CACHE_RECENT_WINDOW}"      ]] && p+=",\"cache_recent_window\":${CACHE_RECENT_WINDOW}"
   [[ -n "${CACHE_EMA_BETA}"           ]] && p+=",\"cache_ema_beta\":${CACHE_EMA_BETA}"
   [[ -n "${CACHE_RECENT_WEIGHT}"      ]] && p+=",\"cache_recent_weight\":${CACHE_RECENT_WEIGHT}"
@@ -774,6 +805,7 @@ SERVE=( vllm serve "${MODEL}" --host 0.0.0.0 --port "${PORT}"
                                  || SERVE+=( --no-enable-prefix-caching )
 [[ -n "${QUANTIZATION}"      ]] && SERVE+=( --quantization "${QUANTIZATION}" )
 [[ -n "${MAX_MODEL_LEN}"     ]] && SERVE+=( --max-model-len "${MAX_MODEL_LEN}" )
+[[ "${PP}" != "1"            ]] && SERVE+=( --pipeline-parallel-size "${PP}" )
 [[ "${ENFORCE_EAGER}" == "1" ]] && SERVE+=( --enforce-eager )
 [[ -n "${COMPILE_CFG}"       ]] && SERVE+=( --compilation-config "${COMPILE_CFG}" )
 [[ -n "${SPEC_CFG}"          ]] && SERVE+=( --speculative-config "${SPEC_CFG}" )
@@ -795,12 +827,13 @@ fi
 
 echo "────────────────────────────────────────────────────────────"
 echo "  started : $(date '+%F %T')  host $(hostname)  pid $$"
-echo "  serve   : ${SERVED_NAME} on :${PORT} (card ${CARD}) tp=${TP} dp=${DP} ep=${EP_SIZE} max_num_seqs=${MAX_NUM_SEQS}"
+echo "  serve   : ${SERVED_NAME} on :${PORT} (card ${CARD}) tp=${TP} dp=${DP} pp=${PP} ep=${EP_SIZE} max_num_seqs=${MAX_NUM_SEQS}"
 [[ "${GRAPH_ON}" == "1" ]] \
   && echo "  graph   : ON ${CUDAGRAPH_MODE} sizes=[${CAPTURE_SIZES:-vllm-default}] ${AUTO_NOTE}" \
   || echo "  graph   : OFF (eager) — prefetch cannot overlap; TPOT is a debug number, accuracy is not"
 echo "  spec    : ${SPEC_METHOD:-off} num_spec_tokens=${NUM_SPEC_TOKENS} decode_tokens=${DECODE_TOKENS} moe_rows=${MOE_ROWS} (x dp=${DP})"
 echo "  offload : ${OFFLOAD} experts=${NUM_DEVICE_EXPERTS} layers=${NUM_DEVICE_LAYERS} lrc=${CACHE_POLICY} prefetch=${PREFETCH}/${EXPERT_PREFETCH_NUM} tokens=${EXPERT_PREFETCH_TOKENS}(eff ${PF_TOK_EFF}) subst=${EXPERT_SUBSTITUTION} multi_card=${ENABLE_MULTI_CARD} debug=${MOE_OFFLOAD_DEBUG}"
+echo "  h2d     : ${H2D_BACKEND}$([[ "${H2D_BACKEND}" == memfabric ]] && echo " pool=${MEMFABRIC_POOL_GIB}GiB/rank (aggregate $(( MEMFABRIC_POOL_GIB * EP_SIZE ))GiB) mode=$([[ "${ENABLE_MULTI_CARD}" == "1" ]] && echo shared || echo local)")"
 echo "  gate    : ${REMOE_GATE:-off (base router)}"
 [[ -n "${REMOE_GATE}" ]] && echo "            build rotation=${MODEL_ROT} (required=${REMOE_GATE_ROT}) — matched"
 echo "  stats   : ${DECODE_STATS} csv=${CSV} -> ${STATS_DIR}  (quiesce=${STATS_QUIESCE}s engine_grace=${ENGINE_GRACE}s reap_wait=${REAP_WAIT}s)"
@@ -848,14 +881,21 @@ if [[ "${OFFLOAD}" == "1" ]]; then
     for _e in $(tr -d '[] ' <<<"${NUM_DEVICE_EXPERTS}" | tr ',' ' '); do
       (( _e % EP_SIZE == 0 )) || die "num_device_experts entry ${_e} is not divisible by EP size ${EP_SIZE}"
     done
-    _slots="${NDE_MIN}"; [[ "${SHARD_PER_RANK}" != false ]] && _slots=$(( NDE_MIN / EP_SIZE ))
+    _slots="${NDE_MIN}"; _scope=global
+    [[ "${SHARD_PER_RANK}" != false ]] && { _slots=$(( NDE_MIN / EP_SIZE )); _scope=owner; }
+    # MemFabric SHARED publishes every rank's shard POINTERS after weight conversion, so a
+    # target-model expert can be placed on any rank and admission is bounded by the whole
+    # pool again — select_moe_comm_method takes _supports_global_placement. Draft (MTP /
+    # DSpark) layers register AFTER that publication and stay owner-constrained, so a
+    # draft forward still sees the per-rank bound.
+    [[ "${H2D_BACKEND}" == memfabric ]] && { _slots="${NDE_MIN}"; _scope="global (memfabric shared)"; }
     # In multi-card the decode/prefill split is the COMM TYPE: MC2 is admitted only when
-    # num_tokens*topk <= per-rank slots. Miss it and every step goes ALLTOALL -> shard
+    # num_tokens*topk <= admission slots. Miss it and every step goes ALLTOALL -> shard
     # prefill pool -> no paging, no stats, no prefetch, and the run looks normal.
     (( DECODE_TOKENS * TOPK > _slots )) && guard "multi-card decode never reaches MC2:
-       decode_tokens*topk=$(( DECODE_TOKENS * TOPK )) > per-rank slots=${_slots}."
-    echo "  mc      : per-rank slots=${_slots}; records NO per-layer cache statistics (accounting"
-    echo "            lives in the single-card host callback). EXPERT_PREFETCH_NUM does not reach it."
+       decode_tokens*topk=$(( DECODE_TOKENS * TOPK )) > admission slots=${_slots} (${_scope})."
+    echo "  mc      : admission slots=${_slots} (${_scope}); records NO per-layer cache statistics"
+    echo "            (accounting lives in the single-card host callback). EXPERT_PREFETCH_NUM does not reach it."
   fi
   [[ "${EXPERT_SUBSTITUTION}" == "1" ]] && \
     echo "  note    : substitution ON — it CHANGES ROUTING. Accuracy is not comparable to a run with it off."
@@ -877,13 +917,14 @@ for t in ${TASK_LIST}; do
 done
 echo "  out     : ${OUT_DIR}"
 echo "  repro   : $(for v in CARD PORT TASKS RUN THINK THINK_EFFORT NUM_PROMPTS PERF_PROMPTS AVG_N TEMP TOPP \
-      PERF_TEMP MAX_NUM_SEQS MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS SEED GPU_MEM_UTIL TP DP QUANTIZATION PREFIX_CACHING \
+      PERF_TEMP MAX_NUM_SEQS MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS SEED GPU_MEM_UTIL TP DP PP QUANTIZATION PREFIX_CACHING \
       ENFORCE_EAGER CUDAGRAPH_MODE CUDAGRAPH_CAPTURE_SIZES ENABLE_NPUGRAPH_EX ENABLE_STATIC_KERNEL \
       MTP NUM_SPEC_TOKENS OFFLOAD NUM_DEVICE_EXPERTS NUM_DEVICE_LAYERS TOPK EXPERT_MAP_PATH \
       CACHE_POLICY PREFETCH EXPERT_PREFETCH_NUM EXPERT_PREFETCH_TOKENS CACHE_STATS_LOG_INTERVAL MOE_OFFLOAD_DEBUG REMOE_GATE REMOE_GATE_ROT \
       DECODE_STATS CSV CSV_PATH STATS_FLUSH_EVERY STATS_FLUSH_SECONDS STATS_QUIESCE WAIT HEALTH_GRACE ENGINE_GRACE REAP_WAIT \
       EXPERT_SUBSTITUTION EXPERT_SUBSTITUTION_THRESHOLD HOT_PRELOAD HOT_EXPERTS_FILE \
-      ENABLE_MULTI_CARD SHARD_PER_RANK CACHE_RECENT_WINDOW CACHE_EMA_BETA CACHE_RECENT_WEIGHT \
+      ENABLE_MULTI_CARD SHARD_PER_RANK H2D_BACKEND MEMFABRIC_POOL_GIB MEMFABRIC_LOG_LEVEL \
+      CACHE_RECENT_WINDOW CACHE_EMA_BETA CACHE_RECENT_WEIGHT \
       CACHE_EMA_WEIGHT CACHE_ROUTER_WEIGHT CACHE_AGE_WEIGHT MULTISTREAM_OVERLAP_SHARED_EXPERT \
       ENABLE_CPU_BINDING API_SERVER_COUNT PROBE MODEL SERVED_NAME TOKENIZER AIS_BENCH_DATASETS_CACHE
    do printf '%s=%q ' "${v}" "${!v-}"; done)$0"
@@ -906,6 +947,17 @@ if not list(entry_points(group='vllm.platform_plugins')): sys.exit(1)
 for m in ('vllm_ascend','torch_npu'): __import__(m)
 " 2>/dev/null || die "vllm-ascend / torch_npu will not import, or no vllm.platform_plugins entry
        point is registered. Did you 'source env_a5_0260.sh' in this shell?"
+
+# MemFabric is imported lazily, at FIRST LAYER ALLOCATION — i.e. minutes into the load —
+# and offload.initialize() then dlopens libmf_hybm_accoffload.so from the runtime's own
+# path. Without set_env.sh that surfaces as "offload launch load library failed" ->
+# RuntimeError: MemFabric LOCAL initialization failed (ret=-1). Settle it here instead.
+[[ "${H2D_BACKEND}" != memfabric ]] || python3 -c "
+import memfabric_hybrid
+from memfabric_hybrid import offload" 2>/dev/null \
+  || die "H2D_BACKEND=memfabric but memfabric_hybrid will not import in this shell.
+       Install MemFabric Hybrid 1.2 and source its runtime env — typically
+       'source /usr/local/memfabric_hybrid/set_env.sh' — BEFORE this script."
 
 command -v ais_bench >/dev/null 2>&1 || die "ais_bench not on PATH"
 [[ -n "${PKG_CFG}" && -d "${PKG_CFG}" ]] || die "cannot locate the ais_bench configs dir"
@@ -1014,6 +1066,15 @@ if [[ "${SKIP_SERVE}" != "1" ]]; then
   [[ -n "${REMOE_GATE}" ]] && { grep -q '\[GATE-OVERRIDE\] applied' "${SERVE_LOG}" \
     || guard "REMOE_GATE is set but the engine never logged '[GATE-OVERRIDE] applied' — this run
        would measure the BASE router."; }
+  # The manager states its backend once, at construction. A memfabric run that fell back
+  # — or a config whose nested keys never reached ExpertOffloadConfig — reads torch here.
+  if [[ "${OFFLOAD}" == "1" ]]; then
+    grep -o '\[EXPERT-OFFLOAD-H2D\].*$' "${SERVE_LOG}" | sort -u | sed 's/^/  h2d     : /'
+    [[ "${H2D_BACKEND}" == memfabric ]] \
+      && ! grep -q '\[EXPERT-OFFLOAD-H2D\] backend=memfabric' "${SERVE_LOG}" \
+      && guard "H2D_BACKEND=memfabric but the engine did not log 'backend=memfabric' — this run
+       is measuring the torch copy path under a memfabric label."
+  fi
   if grep -q '\[DECODE-STATS\] config:' "${SERVE_LOG}"; then
     grep -o '\[DECODE-STATS\] \(config\|topology\|armed\|decode\):.*$' "${SERVE_LOG}" | sort -u | sed 's/^/  stats   : /'
     grep -q '\[DECODE-STATS\] armed' "${SERVE_LOG}" || \
@@ -1176,6 +1237,16 @@ exit "${rc}"
 #
 #  MULTI-CARD RECORDS NO PER-LAYER STATISTICS. The accounting lives in the single-card host
 #  callback. The summary prints with those rows empty; the spec-decode rows are unaffected.
+#
+#  MEMFABRIC SHARED MOVES THE MC2 ADMISSION BOUND. With h2d_backend=torch and
+#  shard_per_rank=true a rank can only load experts from its own host shard, so MC2 is
+#  admitted on ONE RANK'S slots (num_device_experts / ep_size). SHARED all-gathers every
+#  rank's shard pointers once after weight conversion, so placement is global again and the
+#  bound becomes the WHOLE pool — the same NUM_DEVICE_EXPERTS now admits ep_size x the
+#  batch. Draft (MTP / DSpark) layers register after that publication and keep the per-rank
+#  bound. This is the one behavioural difference between the two backends; everything else
+#  — routing, eviction, placement, NPU weight layout — is byte-identical, which is what
+#  makes a torch-vs-memfabric A/B a pure transfer-path measurement.
 #
 #  DRAFT MoE LAYERS DO NOT OFFLOAD — the exclusion is a layer-NAME test ("mtp" as a path
 #  component). The post-health moe_layers check proves it held for the drafter in front of

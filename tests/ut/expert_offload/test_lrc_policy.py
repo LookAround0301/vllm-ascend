@@ -217,6 +217,34 @@ def test_choose_victim_loading_excludes_and_falls_back():
         0, slot_owner, protected={5, 6}, loading={1, 2, 3, 4}) == 3
 
 
+def test_choose_victims_ranks_residents_once_and_respects_protection():
+    policy = LRCExpertCachePolicy(
+        num_layers=1,
+        num_experts=8,
+        cache_size=4,
+        topk=2,
+        recent_weight=0.0,
+        ema_weight=0.0,
+        router_weight=1.0,
+        age_weight=0.0,
+    )
+    state = policy.layer_states[0]
+    state.router_score[1] = 0.4
+    state.router_score[2] = 0.1
+    state.router_score[3] = 0.3
+    state.router_score[4] = 0.2
+    slot_owner = {0: 1, 1: 2, 2: 3, 3: 4}
+
+    assert policy.choose_victims(
+        0, slot_owner, protected={2}, count=2) == [4, 3]
+    assert policy.choose_victims(
+        0, slot_owner, protected={2}, count=8) == [4, 3, 1]
+    assert policy.choose_victims(
+        0, slot_owner, protected={2}, count=0) == []
+    with pytest.raises(ValueError, match="victim count must be >= 0"):
+        policy.choose_victims(0, slot_owner, protected=set(), count=-1)
+
+
 def test_seed_layer_hotness_protects_offline_preloaded_experts():
     policy = LRCExpertCachePolicy(
         num_layers=1,

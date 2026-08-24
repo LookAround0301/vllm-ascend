@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -12,6 +13,7 @@ from vllm_ascend.expert_offload.expert_offload_manager import (
     _expert_weight,
     _stable_int_checksum,
 )
+from vllm_ascend.expert_offload.h2d_transfer import H2DCopyTask
 
 
 def _manager_for_prediction(next_layer, gate_weight, *, topk=2,
@@ -21,6 +23,21 @@ def _manager_for_prediction(next_layer, gate_weight, *, topk=2,
     manager._gate_weights_npu = [None, gate_weight]
     manager.topk = topk
     manager.prefetch_topk = prefetch_topk
+    return manager
+
+
+def _manager_for_mc_debug():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager._debug = True
+    manager._ep_size = 16
+    manager._ep_rank = 8
+    manager._ep_info_resolved = True
+    manager._mc_debug_lock = threading.Lock()
+    manager._mc_debug_schedule_seq = 0
+    manager._mc_debug_callback_seq = 0
+    manager._mc_debug_collective_seq = 0
+    manager._mc_debug_active_callbacks = 0
+    manager._mc_debug_layer_calls = {}
     return manager
 
 
@@ -136,6 +153,99 @@ def test_multi_card_lrc_log_exposes_cross_rank_checksums():
     assert args[-1][0]["expert"] == 1
     assert args[-1][0]["count"] == 2
     assert args[-1][0]["freq"] == 5
+
+
+def test_mc_debug_callback_log_exposes_sequence_and_reentry():
+    manager = _manager_for_mc_debug()
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
+    ) as log_info:
+        first = manager._begin_mc_debug_callback(39, False, True)
+        second = manager._begin_mc_debug_callback(40, False, True)
+        manager._end_mc_debug_callback(second, "ok")
+        manager._end_mc_debug_callback(first, "ok")
+
+    assert first["callback_seq"] == 1
+    assert first["layer_call"] == 1
+    assert second["callback_seq"] == 2
+    assert manager._mc_debug_active_callbacks == 0
+    events = [entry.args[1] for entry in log_info.call_args_list]
+    assert events == ["CB_ENTER", "CB_ENTER", "CB_EXIT", "CB_EXIT"]
+    assert "active_callbacks=2" in log_info.call_args_list[1].args[-1]
+
+
+def test_mc_debug_gloo_log_pairs_collective_sequences():
+    manager = _manager_for_mc_debug()
+    context = manager._begin_mc_debug_callback(39, False, True)
+    cpu_group = SimpleNamespace(group_name="ep_offload")
+    local_values = torch.tensor([1, 2], dtype=torch.int64)
+
+    with patch(
+        "vllm_ascend.expert_offload.multi_card_planner."
+        "gather_global_counts_cpu",
+        side_effect=lambda values, group: values + 1,
+    ), patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
+    ) as log_info:
+        counts = manager._gather_cpu_with_mc_debug(
+            local_values, cpu_group, "count", context)
+        scores = manager._gather_cpu_with_mc_debug(
+            local_values.float(), cpu_group, "router_score", context)
+
+    assert torch.equal(counts, torch.tensor([2, 3]))
+    assert torch.equal(scores, torch.tensor([2.0, 3.0]))
+    events = [entry.args[1] for entry in log_info.call_args_list]
+    assert events == ["GLOO_ENTER", "GLOO_EXIT",
+                      "GLOO_ENTER", "GLOO_EXIT"]
+    assert "kind=count" in log_info.call_args_list[0].args[-1]
+    assert "collective_seq=1" in log_info.call_args_list[0].args[-1]
+    assert "kind=router_score" in log_info.call_args_list[2].args[-1]
+    assert "collective_seq=2" in log_info.call_args_list[2].args[-1]
+
+
+def test_mc_debug_callback_logs_python_error_and_exit():
+    manager = _manager_for_mc_debug()
+    manager._update_weights_multi_card_impl = MagicMock(
+        side_effect=RuntimeError("debug failure"))
+    args = (
+        None, None, None, 39, 16, False, None, False, None, "softmax",
+        None, None, True,
+    )
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
+    ) as log_info:
+        try:
+            manager._update_weights_multi_card(args)
+        except RuntimeError as exc:
+            assert str(exc) == "debug failure"
+        else:
+            raise AssertionError("expected RuntimeError")
+
+    events = [entry.args[1] for entry in log_info.call_args_list]
+    assert events == ["CB_ENTER", "CB_ERROR", "CB_EXIT"]
+    assert "status=error:RuntimeError" in log_info.call_args_list[-1].args[-1]
+    assert manager._mc_debug_active_callbacks == 0
+
+
+def test_mc_debug_disabled_uses_uninstrumented_fast_path():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager._debug = False
+    manager._update_weights_multi_card_impl = MagicMock(return_value="done")
+    args = (
+        None, None, None, 39, 16, False, None, False, None, "softmax",
+        None, None,
+    )
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
+    ) as log_info:
+        result = manager._update_weights_multi_card(args)
+
+    assert result == "done"
+    manager._update_weights_multi_card_impl.assert_called_once_with(args)
+    log_info.assert_not_called()
 
 
 def test_multi_card_decode_plan_log_is_emitted_only_by_rank_zero():
@@ -306,11 +416,11 @@ def test_deepseek_hash_router_prefetch_uses_tid2eid():
     assert torch.equal(weights, torch.full((1, 2), 0.5))
 
 
-def test_kimi_k3_learned_router_prefetch_uses_gate_logits():
+def test_kimi_k3_learned_router_prefetch_keeps_full_topk_candidates():
     next_layer = SimpleNamespace(gate=SimpleNamespace())
     gate_weight = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
     manager = _manager_for_prediction(
-        next_layer, gate_weight, topk=2, prefetch_topk=2)
+        next_layer, gate_weight, topk=2, prefetch_topk=1)
 
     weights, expert_ids = manager.predict_next_layer_experts_npu(
         0, torch.tensor([[1.0, 2.0]]))
@@ -512,6 +622,10 @@ def test_prefetch_dispatch_uses_single_or_per_layer_multi_card_capacity():
     assert multi_args[4] == 6
     assert multi_args[-2:] == (True, None)
 
+    manager._debug = True
+    _, debug_multi_args = manager._build_prefetch_call(*inputs)
+    assert debug_multi_args[-3:] == (True, None, False)
+
 
 def test_shared_expert_copy_is_non_blocking_and_refreshes_quant_scale():
     class RecordingStorage:
@@ -539,7 +653,9 @@ def test_shared_expert_copy_is_non_blocking_and_refreshes_quant_scale():
     manager.w2_expert_size_bytes = 2
     manager._expert_src_storage = MagicMock(
         side_effect=["w13-source", "w2-source"])
-    manager._copy_quant_attrs_into_slot = MagicMock()
+    manager.scale_cpu_buffers = {}
+    manager.offset_cpu_buffers = {}
+    manager.scale_bias_cpu_buffers = {}
     layer = SimpleNamespace(
         w13_weight=Weight(),
         w2_weight=Weight(),
@@ -553,9 +669,250 @@ def test_shared_expert_copy_is_non_blocking_and_refreshes_quant_scale():
         (slice(4, 8), "w13-source", True)]
     assert layer.w2_weight.storage.copies == [
         (slice(2, 4), "w2-source", True)]
-    manager._copy_quant_attrs_into_slot.assert_called_once_with(
-        layer, 0, 7, 1)
     assert layer.w13_weight_scale_fp32[1] == 2.5
+
+
+def test_memfabric_shared_resolves_remote_expert_pointer():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "h2d_backend": "memfabric",
+        "memfabric_pool_size_gib": 1,
+        "enable_multi_card": True,
+        "shard_per_rank": True,
+    })
+    manager._shard_base = 0
+    manager._shard_size = 2
+    manager.w13_weights_cpu = [[torch.zeros(1), torch.zeros(1)]]
+    manager._shared_h2d_sources_ready = True
+    manager._shared_h2d_sources = {(0, 3, "w13"): 123456}
+
+    source = manager._expert_src_storage(0, 3, "w13")
+
+    assert source.data_ptr() == 123456
+
+
+def test_memfabric_shared_publishes_complete_peer_pointer_table():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "h2d_backend": "memfabric",
+        "memfabric_pool_size_gib": 1,
+        "enable_multi_card": True,
+        "shard_per_rank": True,
+    })
+    manager.h2d_transport = SimpleNamespace(supports_remote_sources=True)
+    manager._ep_size = 2
+    manager._ep_rank = 0
+    manager._ep_info_resolved = True
+    manager._shard_base = 0
+    manager.num_total_experts = 2
+    manager.w13_weights_cpu = [[torch.zeros(1)]]
+    manager.w2_weights_cpu = [[torch.zeros(1)]]
+    manager.scale_cpu_buffers = {}
+    manager.offset_cpu_buffers = {}
+    manager.scale_bias_cpu_buffers = {}
+    manager._shared_h2d_sources = {}
+    manager._shared_h2d_sources_ready = False
+
+    def gather(output, local, group):
+        output[0] = local
+        output[1] = {
+            (0, 1, "w13"): 301,
+            (0, 1, "w2"): 302,
+        }
+
+    ep_group = SimpleNamespace(cpu_group=object())
+    with (
+        patch("torch.distributed.all_gather_object", side_effect=gather),
+        patch("vllm.distributed.parallel_state.get_ep_group",
+              return_value=ep_group),
+    ):
+        manager._publish_shared_h2d_sources()
+
+    assert manager._shared_h2d_sources_ready is True
+    assert manager._shared_h2d_sources[(0, 1, "w13")] == 301
+    assert len(manager._shared_h2d_sources) == 4
+
+
+def test_expert_load_combines_multiple_experts_into_one_transport_batch():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.h2d_transport = MagicMock()
+    first_task = H2DCopyTask(object(), object(), 4, name="first")
+    second_task = H2DCopyTask(object(), object(), 8, name="second")
+    manager._build_expert_h2d_tasks = MagicMock(
+        side_effect=[[first_task], [second_task]])
+    manager._refresh_expert_fp32_scale = MagicMock()
+    layer = object()
+
+    manager._load_expert_weights_into_slots(
+        layer, 3, [(1, 7), (2, 9)])
+
+    manager.h2d_transport.copy_batch.assert_called_once_with(
+        [first_task, second_task])
+    assert manager._build_expert_h2d_tasks.call_args_list == [
+        call(layer, 3, 7, 1),
+        call(layer, 3, 9, 2),
+    ]
+    assert manager._refresh_expert_fp32_scale.call_args_list == [
+        call(layer, 1),
+        call(layer, 2),
+    ]
+
+
+def test_expert_host_allocation_and_synchronization_use_transport():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.h2d_transport = MagicMock()
+    manager.load_stream = object()
+    expected = object()
+    manager.h2d_transport.allocate_host_tensor.return_value = expected
+
+    result = manager._allocate_expert_host_tensor((2, 4), torch.float32)
+    manager._synchronize_h2d()
+
+    assert result is expected
+    manager.h2d_transport.allocate_host_tensor.assert_called_once_with(
+        (2, 4), torch.float32)
+    manager.h2d_transport.synchronize.assert_called_once_with(
+        manager.load_stream)
+
+
+def test_prefill_weight_and_quant_attributes_are_one_h2d_task_batch():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({"shard_per_rank": False})
+    manager.w13_expert_size_bytes = 4
+    manager.w2_expert_size_bytes = 2
+    w13_source = torch.ones(4, dtype=torch.uint8).untyped_storage()
+    w2_source = torch.ones(2, dtype=torch.uint8).untyped_storage()
+    manager._expert_src_storage = MagicMock(
+        side_effect=[w13_source, w2_source])
+    manager._prefill_w13 = [torch.zeros((2, 4), dtype=torch.uint8)]
+    manager._prefill_w2 = [torch.zeros((2, 2), dtype=torch.uint8)]
+    manager._prefill_w13_scale = [torch.zeros((2, 2))]
+    manager._prefill_w2_scale = []
+    manager._prefill_w13_offset = []
+    manager._prefill_w2_offset = []
+    manager._prefill_w13_scale_bias = []
+    manager._prefill_w2_scale_bias = []
+    scale = torch.tensor([1.0, 2.0])
+    manager.scale_cpu_buffers = {"w13_weight_scale": [[scale]]}
+    manager.offset_cpu_buffers = {}
+    manager.scale_bias_cpu_buffers = {}
+
+    tasks = manager._build_prefill_h2d_tasks(0, 0, 0, 1)
+
+    assert len(tasks) == 3
+    assert [task.nbytes for task in tasks] == [4, 2, 8]
+    assert tasks[2].source.data_ptr() == scale.data_ptr()
+    assert tasks[2].destination.data_ptr() == \
+        manager._prefill_w13_scale[0][1].data_ptr()
+
+
+def test_quant_attributes_are_represented_as_h2d_tasks():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({"shard_per_rank": False})
+    source = torch.tensor([1.25, 2.5], dtype=torch.float32)
+    manager.scale_cpu_buffers = {"w13_weight_scale": [[source]]}
+    manager.offset_cpu_buffers = {}
+    manager.scale_bias_cpu_buffers = {}
+    destination = torch.zeros((1, 2), dtype=torch.float32)
+    layer = SimpleNamespace(w13_weight_scale=destination)
+
+    tasks = manager._build_quant_attr_h2d_tasks(layer, 0, 0, 0)
+
+    assert len(tasks) == 1
+    assert tasks[0].source.data_ptr() == source.data_ptr()
+    assert tasks[0].destination.data_ptr() == destination[0].data_ptr()
+    assert tasks[0].nbytes == source.numel() * source.element_size()
+    assert tasks[0].non_blocking is True
+
+
+def test_single_card_update_submits_misses_as_one_batch():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig()
+    manager.topk = 1
+    manager._debug = False
+    manager.cache_policy = None
+    manager.load_stream = MagicMock()
+    manager._load_expert_weights_into_slots = MagicMock()
+    topk_ids_h = torch.tensor([[1]], dtype=torch.int32)
+    log2phy_h = torch.tensor([0, -1], dtype=torch.int32)
+    layer = SimpleNamespace()
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
+        return_value=nullcontext(),
+    ):
+        manager._update_weights((
+            topk_ids_h,
+            log2phy_h.numpy(),
+            layer,
+            0,
+            None,
+            False,
+        ))
+
+    manager._load_expert_weights_into_slots.assert_called_once_with(
+        layer, 0, [(0, 1)])
+    assert log2phy_h.tolist() == [-1, 0]
+    manager.load_stream.synchronize.assert_called_once_with()
+
+
+def test_single_card_update_ranks_all_lrc_victims_once():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig()
+    manager.topk = 2
+    manager._debug = False
+    manager.cache_policy = MagicMock()
+    manager.cache_policy.observe.return_value = {4, 5}
+    manager.cache_policy.choose_victims.return_value = [0, 1]
+    manager.load_stream = MagicMock()
+    manager._record_cache_stats = MagicMock()
+    manager._load_expert_weights_into_slots = MagicMock()
+    manager._synchronize_h2d = MagicMock()
+    topk_ids_h = torch.tensor([[4, 5]], dtype=torch.int32)
+    log2phy_h = torch.tensor([0, 1, -1, -1, -1, -1], dtype=torch.int32)
+    layer = SimpleNamespace()
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
+        return_value=nullcontext(),
+    ):
+        manager._update_weights((
+            topk_ids_h,
+            log2phy_h.numpy(),
+            layer,
+            0,
+            None,
+            False,
+        ))
+
+    manager.cache_policy.choose_victims.assert_called_once_with(
+        0, {0: 0, 1: 1}, protected={4, 5}, count=2)
+    loads = manager._load_expert_weights_into_slots.call_args.args[2]
+    assert {slot for slot, _ in loads} == {0, 1}
+    assert {eid for _, eid in loads} == {4, 5}
+    assert log2phy_h[:4].tolist() == [-1, -1, -1, -1]
+    assert set(log2phy_h[4:].tolist()) == {0, 1}
+    manager._synchronize_h2d.assert_called_once_with()
+
+
+def test_multi_card_misses_submit_one_batch_before_resident_commit():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.load_stream = MagicMock()
+    manager._load_expert_weights_into_slots = MagicMock()
+    layer = object()
+    misses = [(0, 4), (1, 7)]
+    resident_map = {}
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
+        return_value=nullcontext(),
+    ):
+        manager._h2d_load_mc_misses(layer, 3, misses, resident_map)
+
+    manager._load_expert_weights_into_slots.assert_called_once_with(
+        layer, 3, misses)
+    assert resident_map == {0: 4, 1: 7}
+    manager.load_stream.synchronize.assert_called_once_with()
 
 
 def test_single_card_hot_preload_uses_format_aware_shared_copy(tmp_path):

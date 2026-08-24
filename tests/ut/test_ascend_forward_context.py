@@ -33,18 +33,23 @@ def _make_vllm_config(
     tensor_parallel_size: int = 1,
     num_experts: int = 128,
     quant_type: str | None = None,
-    top_k_experts: int = 1,
+    top_k_experts: int | None = 1,
     num_experts_per_tok: int | None = None,
+    num_experts_per_token: int | None = None,
     cudagraph_capture_sizes: list[int] | None = None,
     max_cudagraph_capture_size: int = 0,
     max_num_batched_tokens: int = 0,
     hidden_size: int = 2048,
 ):
-    hf_text_config_attrs: dict[str, object] = {"top_k_experts": top_k_experts}
+    hf_text_config_attrs: dict[str, object] = {}
+    if top_k_experts is not None:
+        hf_text_config_attrs["top_k_experts"] = top_k_experts
     if quant_type is not None:
         hf_text_config_attrs["quantize"] = quant_type
     if num_experts_per_tok is not None:
         hf_text_config_attrs["num_experts_per_tok"] = num_experts_per_tok
+    if num_experts_per_token is not None:
+        hf_text_config_attrs["num_experts_per_token"] = num_experts_per_token
     hf_text_config_attrs["hidden_size"] = hidden_size
 
     model_config = SimpleNamespace(
@@ -306,7 +311,7 @@ def test_multi_card_offload_capacity_supports_deepseek_and_kimi_k3(
         (False, 5, MoECommType.ALLTOALL),
     ],
 )
-def test_multi_card_offload_admission_uses_owner_capacity_when_sharded(
+def test_multi_card_torch_offload_admission_uses_owner_capacity_when_sharded(
     monkeypatch,
     shard_per_rank,
     num_tokens,
@@ -323,6 +328,7 @@ def test_multi_card_offload_admission_uses_owner_capacity_when_sharded(
         enable_multi_card=True,
         moe_offload_debug=True,
         shard_per_rank=shard_per_rank,
+        h2d_backend="torch",
         num_device_experts_list=[8],
         num_device_experts_for_rank=lambda _layer, ep_size: 8 // ep_size,
     )
@@ -344,11 +350,70 @@ def test_multi_card_offload_admission_uses_owner_capacity_when_sharded(
         if call.args[0].startswith("[MC_ADMISSION]"))
     assert admission.args[1] == (
         "sharded" if shard_per_rank else "replicated")
-    assert admission.args[2:9] == (
-        num_tokens, 2, 2, 8, 4 if shard_per_rank else 8,
+    assert admission.args[2:5] == (
+        "torch", "owner" if shard_per_rank else "global", num_tokens)
+    assert admission.args[5:11] == (
+        2, 2, 8, 4 if shard_per_rank else 8,
         num_tokens * 2, 128)
-    assert admission.args[10] == expected.name
-    assert admission.args[11] == (
+    assert admission.args[12] == expected.name
+    assert admission.args[13] == (
+        "fits" if expected == MoECommType.MC2 else "expert_slots")
+
+
+@pytest.mark.parametrize(
+    ("h2d_backend", "is_draft_model", "expected", "admission_slots",
+     "placement_scope"),
+    [
+        ("torch", False, MoECommType.ALLTOALL, 6, "owner"),
+        ("memfabric", False, MoECommType.MC2, 48, "global"),
+        ("memfabric", True, MoECommType.ALLTOALL, 6, "owner"),
+    ],
+)
+def test_multi_card_memfabric_admission_uses_global_target_capacity(
+    monkeypatch,
+    h2d_backend,
+    is_draft_model,
+    expected,
+    admission_slots,
+    placement_scope,
+):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A3,
+        capacity=128,
+        ep_world_size=8,
+    )
+    offload_config = SimpleNamespace(
+        expert_offload=True,
+        enable_multi_card=True,
+        moe_offload_debug=True,
+        shard_per_rank=True,
+        h2d_backend=h2d_backend,
+        num_device_experts_list=[48],
+        num_device_experts_for_rank=lambda _layer, ep_size: 48 // ep_size,
+    )
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(expert_offload_config=offload_config),
+    )
+    vllm_config = _make_vllm_config()
+    vllm_config.model_config.hf_config = SimpleNamespace(
+        num_experts_per_tok=6)
+
+    with patch.object(afc.logger, "info") as log_info:
+        selected = afc.select_moe_comm_method(
+            3, vllm_config, is_draft_model=is_draft_model)
+
+    assert selected == expected
+    admission = next(
+        call for call in log_info.call_args_list
+        if call.args[0].startswith("[MC_ADMISSION]"))
+    assert admission.args[1:11] == (
+        "sharded", h2d_backend, placement_scope,
+        3, 6, 8, 48, admission_slots, 18, 128)
+    assert admission.args[12] == expected.name
+    assert admission.args[13] == (
         "fits" if expected == MoECommType.MC2 else "expert_slots")
 
 
@@ -556,22 +621,47 @@ def test_select_moe_comm_method_a3_mc2_invalid_hidden_size(
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "world_size", "top_k_experts", "expected"),
+    ("num_tokens", "world_size", "ep_world_size", "top_k_experts", "expected"),
     [
-        (128, 4, 2, MoECommType.MC2),
-        (129, 2, 4, MoECommType.ALLGATHER),
-        (129, 8, 4, MoECommType.ALLTOALL),
+        (128, 4, 4, 2, MoECommType.MC2),
+        (129, 2, 2, 4, MoECommType.ALLGATHER),
+        (129, 8, 8, 4, MoECommType.ALLTOALL),
+        (129, 32, 8, 16, MoECommType.ALLGATHER),
     ],
 )
-def test_select_moe_comm_method_a5(monkeypatch, num_tokens, world_size, top_k_experts, expected):
+def test_select_moe_comm_method_a5(
+    monkeypatch,
+    num_tokens,
+    world_size,
+    ep_world_size,
+    top_k_experts,
+    expected,
+):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
         device_type=afc.AscendDeviceType.A5,
         capacity=128,
+        ep_world_size=ep_world_size,
     )
     vllm_config = _make_vllm_config(world_size=world_size, top_k_experts=top_k_experts)
 
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
+
+
+def test_select_moe_comm_method_a5_uses_kimi_k3_top_k(monkeypatch):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A5,
+        capacity=128,
+        ep_world_size=8,
+    )
+    vllm_config = _make_vllm_config(
+        world_size=32,
+        top_k_experts=None,
+        num_experts_per_token=16,
+    )
+
+    assert afc.select_moe_comm_method(129, vllm_config) == MoECommType.ALLGATHER
 
 
 def test_select_moe_comm_method_310p_uses_allgather(monkeypatch):

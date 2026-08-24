@@ -199,6 +199,30 @@ class LRCExpertCachePolicy:
 
         return min(candidates, key=lambda eid: self._victim_key(layer_idx, eid))
 
+    def choose_victims(
+        self,
+        layer_idx: int,
+        slot_owner: dict[int, int],
+        protected: set[int],
+        count: int,
+    ) -> list[int]:
+        """Return up to ``count`` resident experts ordered coldest first.
+
+        Unlike repeated :meth:`choose_victim` calls, this ranks the resident
+        candidates once.  The stable sort preserves ``slot_owner`` iteration
+        order when experts have equal hotness, matching ``min`` tie-breaking.
+        """
+        if count < 0:
+            raise ValueError("victim count must be >= 0")
+        if count == 0:
+            return []
+
+        candidates = [
+            eid for eid in slot_owner.values() if eid not in protected
+        ]
+        candidates.sort(key=lambda eid: self._victim_key(layer_idx, eid))
+        return candidates[:count]
+
     def hotness(self, layer_idx: int, expert_id: int) -> float:
         state = self.layer_states[layer_idx]
         age = 0 if state.last_used[expert_id] < 0 else state.step - state.last_used[expert_id]

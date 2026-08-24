@@ -388,6 +388,12 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         # reinit valid_sampled_token_count_cpu with torch.int64 dtype
+        # Declared unconditionally so the call site / method can guard with
+        # ``is None`` without AttributeError on the non-async path (the real
+        # stream/event/buffer are created only when async spec decode is on).
+        self.num_rejected_tokens_cpu: torch.Tensor | None = None
+        self.num_rejected_tokens_event: torch.npu.Event | None = None
+        self.num_rejected_tokens_copy_stream = None
         if self.use_async_scheduling and self.num_spec_tokens:
             self.valid_sampled_token_count_cpu = torch.empty(
                 self.max_num_reqs,
@@ -395,10 +401,23 @@ class NPUModelRunner(GPUModelRunner):
                 device="cpu",
                 pin_memory=self.pin_memory,
             )
+            # Side-stream host mirror of num_rejected_tokens_gpu (int32 to match
+            # the device tensor produced by prepare_inputs_padded). The draft
+            # FIA forward entry synchronizes this copy before subtracting the
+            # per-request reject count from seq_lens_list, overlapping the D2H
+            # with metadata build and the early draft forward.
+            self.num_rejected_tokens_cpu = torch.empty(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+            self.num_rejected_tokens_event = torch.npu.Event()
+            self.num_rejected_tokens_copy_stream = torch.npu.Stream()
             
         # pending record for deferred speculative-decoding statistics
         self._spec_stats_pending: tuple[list[int], int] | None = None
-
+        
         try:
             self.dcp_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
@@ -1441,6 +1460,29 @@ class NPUModelRunner(GPUModelRunner):
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count # type: ignore[no-redef]
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
+    def _copy_num_rejected_tokens(self, num_rejected_tokens_gpu: torch.Tensor) -> None:
+        """Async D2H the per-request reject counts onto a side stream.
+
+        Mirrors ``_copy_valid_sampled_token_count``: copy the device tensor into
+        a pinned host buffer on a side stream that waits on the default stream,
+        then record an event. The draft FIA forward entry synchronizes that
+        event before reading the host buffer, so the copy overlaps with draft
+        metadata build and the early draft forward instead of synchronizing in
+        the proposer.
+        """
+        event = self.num_rejected_tokens_event
+        copy_stream = self.num_rejected_tokens_copy_stream
+        counts_cpu = self.num_rejected_tokens_cpu
+        if event is None:
+            return
+        assert copy_stream is not None and counts_cpu is not None
+        default_stream = torch.npu.current_stream()
+        with torch.npu.stream(copy_stream):
+            copy_stream.wait_stream(default_stream)
+            n = num_rejected_tokens_gpu.shape[0]
+            counts_cpu[:n].copy_(num_rejected_tokens_gpu[:n], non_blocking=True)
+            event.record()
+
     def propose_draft_token_ids(
         self,
         valid_sampled_token_ids: torch.Tensor | list[list[int]],
@@ -1616,6 +1658,8 @@ class NPUModelRunner(GPUModelRunner):
                             common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
                         )
                     )
+                if num_rejected_tokens_gpu is not None and self.num_rejected_tokens_event is not None:
+                    self._copy_num_rejected_tokens(num_rejected_tokens_gpu)
                 target_token_ids = self.input_ids.gpu[token_indices]
                 target_positions = self._get_positions(token_indices)
                 if self.use_aux_hidden_state_outputs:
@@ -1639,6 +1683,11 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output=scheduler_output,
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                num_draft_tokens_cpu=(
+                    spec_decode_metadata.num_draft_tokens
+                    if num_rejected_tokens_gpu is not None
+                    else None
+                ),
             )
             if get_pp_group().world_size > 1 and hasattr(
                 self.drafter, "take_last_draft_probs"
@@ -1835,7 +1884,7 @@ class NPUModelRunner(GPUModelRunner):
                         # returns True. before returning early here we call
                         # dummy run to ensure coordinate_batch_across_dp
                         # is called into to avoid out of sync issues.
-                        self._dummy_run(1)
+                        self._dummy_run(1, skip_gdn_state_update=True)
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
                         return EMPTY_MODEL_RUNNER_OUTPUT
@@ -3030,6 +3079,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens: dict[str, int] | None = None,
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
+        skip_gdn_state_update: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -3173,14 +3223,40 @@ class NPUModelRunner(GPUModelRunner):
             common_ratio_to_sas_metadata: dict,
             ubid: int | None = None,
         ) -> None:
+            assert num_reqs_padded is not None
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
+            is_gdn_noop = skip_gdn_state_update and isinstance(
+                builder,
+                GDNAttentionMetadataBuilder,
+            )
+            if is_gdn_noop:
+                # An idle DP dummy has a real tensor shape for model and
+                # collective execution, but no GDN tokens.  Keep the GDN
+                # query lengths at zero and make the host-side token count
+                # agree so the builder refreshes both captured recurrent
+                # branches without classifying the dummy as spec decode.
+                common_attn_metadata = common_attn_metadata.replace(
+                    query_start_loc=self.gdn_query_start_loc.gpu[
+                        : num_reqs_padded + 1
+                    ],
+                    query_start_loc_cpu=self.gdn_query_start_loc.cpu[
+                        : num_reqs_padded + 1
+                    ],
+                    num_actual_tokens=0,
+                    max_query_len=0,
+                    is_prefilling=(
+                        torch.zeros_like(common_attn_metadata.is_prefilling)
+                        if common_attn_metadata.is_prefilling is not None
+                        else None
+                    ),
+                )
             cascade_attn_prefix_len = (
                 cascade_attn_prefix_lens[kv_cache_gid][attn_gid] if cascade_attn_prefix_lens else 0
             )
 
             extra_attn_metadata_args = {}
-            if use_spec_decode and isinstance(builder, GDNAttentionMetadataBuilder):
+            if use_spec_decode and isinstance(builder, GDNAttentionMetadataBuilder) and not is_gdn_noop:
                 assert ubid is None, "UBatching not supported with GDN yet"
                 extra_attn_metadata_args = dict(
                     num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
@@ -3347,6 +3423,7 @@ class NPUModelRunner(GPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
+        skip_gdn_state_update: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -3485,7 +3562,10 @@ class NPUModelRunner(GPUModelRunner):
                 self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                 self.query_start_loc.copy_to_gpu()
                 if self._has_gdn:
-                    self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
+                    if skip_gdn_state_update:
+                        self.gdn_query_start_loc.np.fill(0)
+                    else:
+                        self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                     self.gdn_query_start_loc.copy_to_gpu()
 
                 if not profile_cpp:
@@ -3517,6 +3597,7 @@ class NPUModelRunner(GPUModelRunner):
                     ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                     for_cudagraph_capture=is_graph_capturing,
                     num_scheduled_tokens_np=num_scheduled_tokens,
+                    skip_gdn_state_update=skip_gdn_state_update,
                 )
                 if not is_graph_capturing:
                     for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):

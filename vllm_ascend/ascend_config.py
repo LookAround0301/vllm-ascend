@@ -1015,7 +1015,12 @@ class ExpertOffloadConfig:
         "hot_expert_preload": False,
         "hot_experts_file": "",
         "expert_substitution_enabled": False,
-        "expert_substitution_threshold": 0.25,
+        "expert_substitution_threshold": 0.02,
+        # Expert weight H2D backend. MemFabric selects LOCAL for single-card
+        # and SHARED DRAM for multi-card expert offload.
+        "h2d_backend": "torch",  # Options: "torch", "memfabric"
+        "memfabric_pool_size_gib": 0,
+        "memfabric_log_level": 3,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -1183,6 +1188,29 @@ class ExpertOffloadConfig:
                 f"got {self.config['expert_prefetch_tokens']} instead")
         if not isinstance(self.config["enable_multi_card"], bool):
             raise TypeError("enable_multi_card must be a boolean")
+        if not isinstance(self.config["enable_multi_card"], bool):
+            raise TypeError("enable_multi_card must be a boolean")
+        if self.config["h2d_backend"] not in ("torch", "memfabric"):
+            raise ValueError(
+                "h2d_backend must be either 'torch' or 'memfabric'")
+        pool_size_gib = self.config["memfabric_pool_size_gib"]
+        if isinstance(pool_size_gib, bool) or not isinstance(
+                pool_size_gib, int):
+            raise TypeError("memfabric_pool_size_gib must be an integer")
+        if pool_size_gib < 0:
+            raise ValueError("memfabric_pool_size_gib must be >= 0")
+        log_level = self.config["memfabric_log_level"]
+        if isinstance(log_level, bool) or not isinstance(log_level, int):
+            raise TypeError("memfabric_log_level must be an integer")
+        if self.config["h2d_backend"] == "memfabric":
+            if pool_size_gib == 0:
+                raise ValueError(
+                    "memfabric_pool_size_gib must be > 0 when "
+                    "h2d_backend='memfabric'")
+            if (self.config["enable_multi_card"]
+                    and not self.config["shard_per_rank"]):
+                raise ValueError(
+                    "multi-card MemFabric requires shard_per_rank=True")
         if not isinstance(self.config["expert_substitution_enabled"], bool):
             raise TypeError("expert_substitution_enabled must be a boolean")
         if not isinstance(self.config["expert_substitution_threshold"],

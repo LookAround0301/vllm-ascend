@@ -3,7 +3,7 @@ def __getattr__(name):
         from .expert_offload_manager import ExpertOffloadManager
 
         return ExpertOffloadManager
-    
+
     # expose the decode-statistics collector on the package, mirroring the
     # lazy-import style above so importing the package still does not pull in
     # torch_npu / the manager.

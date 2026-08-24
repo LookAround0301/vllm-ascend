@@ -514,6 +514,43 @@ class TestAscendConfig(TestBase):
 
 
 class TestExpertOffloadConfig(TestBase):
+    def test_h2d_backend_defaults_to_torch(self):
+        config = ExpertOffloadConfig({})
+
+        self.assertEqual(config.h2d_backend, "torch")
+        self.assertEqual(config.memfabric_pool_size_gib, 0)
+        self.assertEqual(config.memfabric_log_level, 3)
+
+    def test_memfabric_h2d_accepts_local_and_shared_configs(self):
+        local = ExpertOffloadConfig({
+            "h2d_backend": "memfabric",
+            "memfabric_pool_size_gib": 16,
+        })
+        shared = ExpertOffloadConfig({
+            "h2d_backend": "memfabric",
+            "memfabric_pool_size_gib": 16,
+            "enable_multi_card": True,
+            "shard_per_rank": True,
+        })
+
+        self.assertFalse(local.enable_multi_card)
+        self.assertTrue(shared.enable_multi_card)
+
+    def test_memfabric_h2d_config_validation(self):
+        with self.assertRaisesRegex(ValueError, "h2d_backend must be"):
+            ExpertOffloadConfig({"h2d_backend": "unknown"})
+        with self.assertRaisesRegex(TypeError, "pool_size_gib.*integer"):
+            ExpertOffloadConfig({"memfabric_pool_size_gib": 1.5})
+        with self.assertRaisesRegex(ValueError, "pool_size_gib must be > 0"):
+            ExpertOffloadConfig({"h2d_backend": "memfabric"})
+        with self.assertRaisesRegex(ValueError, "shard_per_rank=True"):
+            ExpertOffloadConfig({
+                "h2d_backend": "memfabric",
+                "memfabric_pool_size_gib": 16,
+                "enable_multi_card": True,
+                "shard_per_rank": False,
+            })
+
     def test_expert_substitution_defaults_and_override(self):
         default = ExpertOffloadConfig({})
         enabled = ExpertOffloadConfig({

@@ -17,7 +17,7 @@
 """Native multimodal Kimi K3 model for vLLM-Ascend."""
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from typing import Annotated, Any, Literal, cast
 
@@ -101,6 +101,7 @@ from vllm.multimodal.processing import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_get_image_processor
+from vllm.triton_utils import HAS_TRITON
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -110,6 +111,18 @@ from vllm_ascend.ops.kimi_kda_state import kimi_kda_state_shape
 from vllm_ascend.transformers_utils.configs.kimi_k3 import KimiK3Config, KimiK3TextConfig, KimiK3VisionConfig
 from vllm_ascend.transformers_utils.processors.kimi_k3 import KimiK3Processor
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, vllm_version_is
+
+apply_attn_res: (
+    Callable[
+        [torch.Tensor, torch.Tensor, nn.Module, nn.Module],
+        torch.Tensor,
+    ]
+    | None
+) = None
+if HAS_TRITON:
+    from vllm_ascend.ops.triton.kimi_k3.attention_residual import apply_attn_res as triton_apply_attn_res
+
+    apply_attn_res = triton_apply_attn_res
 
 
 def _routed_latent_quant_config(
@@ -885,16 +898,19 @@ def _apply_attention_residual(
     norm: RMSNorm,
 ) -> torch.Tensor:
     """Apply K3's learned normalized mixture over residual block starts."""
-    values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-    values_fp32 = values.float()
-    normalized, _ = torch_npu.npu_rms_norm(
-        values_fp32,
-        norm.weight.float(),
-        norm.variance_epsilon,
-    )
-    scores = torch.matmul(normalized, projection.weight.t().float()).squeeze(-1)
-    probabilities = scores.softmax(-1).unsqueeze(1)
-    mixed = torch.matmul(probabilities, values_fp32).squeeze(1).to(values.dtype)
+    if apply_attn_res is not None and prefix_sum.device.type == "npu" and prefix_sum.numel() > 0:
+        mixed = apply_attn_res(prefix_sum, block_residual, projection, norm)
+    else:
+        values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
+        values_fp32 = values.float()
+        normalized, _ = torch_npu.npu_rms_norm(
+            values_fp32,
+            norm.weight.float(),
+            norm.variance_epsilon,
+        )
+        scores = torch.matmul(normalized, projection.weight.t().float()).squeeze(-1)
+        probabilities = scores.softmax(-1).unsqueeze(1)
+        mixed = torch.matmul(probabilities, values_fp32).squeeze(1).to(values.dtype)
     if _EXTRA_CTX.flash_comm_v1_enabled:
         # FlashComm changes the first decoder layer from the global token
         # layout to a TP-local layout.  The learned-residual arithmetic above
@@ -1155,6 +1171,9 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
         weights: Iterable[tuple[str, torch.Tensor] | tuple[str, torch.Tensor, dict[str, Any]]],
     ) -> set[str]:
         stacked_params_mapping = [
+            (".fused_qkv", ".q_proj", "q"),
+            (".fused_qkv", ".k_proj", "k"),
+            (".fused_qkv", ".v_proj", "v"),
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
             (".fused_qkv_a_proj", ".q_a_proj", 0),
@@ -1233,6 +1252,7 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
 
 class AscendKimiK3ForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid):
     packed_modules_mapping = {
+        "fused_qkv": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
         "experts": ["experts.0.w1", "experts.0.w3", "experts.0.w2"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
