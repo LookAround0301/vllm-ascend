@@ -1631,6 +1631,29 @@ class ExpertOffloadManager:
         predictor = self.expert_predictor
         if predictor is not None:
             predictor.finish(layer_idx)
+            
+    def _finish_next_layer_predict(self, layer_idx: int,
+                                   compute_stream) -> None:
+        """Dispatch a layer-shifted predictor's prediction for layer_idx + 1.
+
+        Called at the END of update_weights[_multi_card], after this layer's
+        reactive host callback has been enqueued. The event recorded here is the
+        ordering edge that keeps the prefetch H2D for layer_idx + 1 off the
+        report thread and off load_stream until layer_idx's on-demand load has
+        drained — the reactive callback internally synchronizes load_stream, so
+        the compute stream cannot reach this record until that transfer is done.
+
+        No-op for fate and for mode2_har (nothing is ever pending under the
+        next layer's key), and the event is only allocated when there is
+        something to dispatch, so neither method pays an extra Event per layer
+        per capture size.
+        """
+        predictor = self.expert_predictor
+        if predictor is None or not predictor.has_pending(layer_idx + 1):
+            return
+        ondemand_done = torch_npu.npu.Event()
+        compute_stream.record_event(ondemand_done)
+        predictor.finish(layer_idx + 1, ondemand_done)
 
     def update_weights(self, layer, topk_ids: torch.Tensor,
                         log2phy: torch.Tensor,
@@ -1757,6 +1780,11 @@ class ExpertOffloadManager:
             topk_ids[:, :self.topk].copy_(topk_ids_h[:, :self.topk],
                                           non_blocking=True)
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
+        
+        # dispatch a layer-shifted predictor's prediction for the NEXT
+        # layer here, behind an event recorded after this layer's on-demand
+        # load. No-op for fate and mode2_har.
+        self._finish_next_layer_predict(layer_idx, current_compute_stream)
 
     def _mc_handle_prefill_regime(self, layer_idx) -> bool:
         """Multi-card PREFILL (non-MC2 comm): load this rank's EP shard into the
@@ -2048,6 +2076,9 @@ class ExpertOffloadManager:
         # Copy the (host-func-mutated) log2phy_h back to the NPU tensor so the
         # MC2 dispatcher reads the fresh placement.
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
+        
+        # same layer-shifted dispatch as single-card update_weights.
+        self._finish_next_layer_predict(layer_idx, current_compute_stream)
 
     def _expert_src_storage(self, layer_idx, eid, which='w13'):
         """Return expert eid's bytes as UntypedStorage for H2D **read**.
@@ -3243,8 +3274,14 @@ class ExpertOffloadManager:
         on the compute stream, then _launch_host_func registers the prefetch as
         a host callback (re-run every replay). The callback runs the planner+H2D
         inner (load_stream inside gives overlap with subsequent compute) and
-        records load_done_event on load_stream for the next layer's reactive to
-        stream-join. Eager mode keeps the prefetch-stream overlap path.
+        records load_done_event for the next layer's reactive to stream-join.
+        Eager mode keeps the prefetch-stream overlap path.
+
+        The fork/callback/write-back/record block lives in _dispatch_prefetch,
+        which both this driver and a trained predictor end in. Nothing below
+        may reference topk_ids_h / next_layer / mc2_mask_h: those are elements
+        of the tuple _stage_predicted_topk returns, and they are unpacked
+        inside _dispatch_prefetch.
         """
         if not self.offload_config.expert_prefetch_enabled:
             return
@@ -3254,83 +3291,35 @@ class ExpertOffloadManager:
             layer_idx = self.moe_layers.index(layer)
         except ValueError:
             return
-
-        # arbitrate between the two prefetch METHODS by TARGET layer.
-        # A trained predictor takes the non-hash targets only; hash-routed
-        # targets stay here, because their experts come from the tid2eid table
+        # Arbitrate by TARGET COVERAGE, not by hash membership. This driver
+        # keeps every target the trained head does not own: the hash-routed
+        # layers (tid2eid is exact and free) and, for a layer-shifted method
+        # like mode2_prevhfr, the first covered MoE layer, whose predecessor was
+        # zero-filled during training. The two target sets stay disjoint, so
+        # _prefetch_layer_npu_event never collides.
         if (self.expert_predictor is not None
-                and (layer_idx + 1) not in self._hash_layer_indices):
+                and self.expert_predictor.covers(layer_idx + 1)):
             return
 
         staged = self._stage_predicted_topk(layer_idx, hidden_states)
         if staged is None:
             return
-        (topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx, mc2_mask_h) = staged
 
         ready_to_load_event = torch_npu.npu.Event()
-        torch_npu.npu.current_stream().record_event(ready_to_load_event) 
-        # the fork/callback/write-back/record block moved verbatim into
-        # _dispatch_prefetch so the trained-predictor driver ends in the same
-        # execution path. No behavioural change on this path.
+        torch_npu.npu.current_stream().record_event(ready_to_load_event)
         self._dispatch_prefetch(staged, ready_to_load_event)
-        
-        with torch_npu.npu.stream(self._prefetch_stream):
-            self._prefetch_stream.wait_event(ready_to_load_event)
-            current_compute_stream = torch_npu.npu.current_stream()
-            subscribed_compute_streams = get_subscribed_compute_streams()
-            if current_compute_stream not in subscribed_compute_streams:
-                torch_npu.npu._subscribe_report(current_compute_stream)
-                subscribed_compute_streams.add(current_compute_stream)
-
-            prefetch_fn, prefetch_args = self._build_prefetch_call(
-                topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx, mc2_mask_h)
-            nxt = next_idx
-
-            def _prefetch_host_cb(_args):
-                # snapshot the staged mapping first, and restore it if
-                # the callback dies. log2phy_h is mutated in place, and the H2D
-                # write-back below is a recorded node that replays regardless —
-                # so a partial failure would publish residency for experts whose
-                # H2D never happened (log2phy applied then clamped -> slot 0,
-                # silent misroute). Restoring makes the write-back a no-op.
-                saved = log2phy_h.clone()
-                try:
-                    prefetch_fn(_args)
-                except Exception:
-                    log2phy_h.copy_(saved)
-                    self._note_cb_failure("prefetch")
-
-            if _EXTRA_CTX.capturing:
-                # (merge): keep the incoming CB_SCHEDULE trace. It runs at
-                # capture time only, which is what it is for — it records the
-                # order in which ranks enqueue prefetch callbacks.
-                if self.enable_multi_card:
-                    self._log_mc_debug_schedule(
-                        next_idx, is_prefetch=True)
-                torch_npu.npu._launch_host_func(
-                    current_compute_stream, _prefetch_host_cb, prefetch_args)
-            else:
-                _prefetch_host_cb(prefetch_args)
-
-            next_layer.log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
-            # 记录一个传输流完成的事件，用于后续主流和它汇聚
-            load_done_event = torch_npu.npu.Event()
-            self._prefetch_stream.record_event(load_done_event)
-            with self._prefetch_state_lock:
-                self._prefetch_layer_npu_event[nxt] = load_done_event
                 
     def _dispatch_prefetch(self, staged, ready_event) -> None:
         """Fork the prefetch stream, plan+H2D, publish log2phy, record the join.
 
-        The tail of trigger_next_layer_prefetch, extracted so both prefetch
-        methods share one execution path. The heuristic method stages on the
+        The tail of trigger_next_layer_prefetch, extracted so every prefetch
+        method ends in one execution path. The heuristic method stages on the
         compute stream and passes an event to fork behind; a trained predictor
-        stages on the prefetch stream itself and passes ready_event=None,
-        because same-stream FIFO already orders the callback behind its staging.
+        stages on the prefetch stream itself and passes ready_event=None for
+        layer_delta=0 (same-stream FIFO already orders the callback), or the
+        on-demand-done event for layer_delta=1.
 
-        `staged` is _stage_predicted_topk's tuple:
-            (topk_ids_h, topk_weights_h, log2phy_h, log2phy_np,
-             next_layer, next_idx, mc2_mask_h)
+        `staged` is exactly _stage_predicted_topk's return tuple.
         """
         (topk_ids_h, topk_weights_h, log2phy_h, log2phy_np,
          next_layer, next_idx, mc2_mask_h) = staged
@@ -3362,9 +3351,6 @@ class ExpertOffloadManager:
                     self._note_cb_failure("prefetch")
 
             if _EXTRA_CTX.capturing:
-                # (merge): keep the incoming CB_SCHEDULE trace. It runs at
-                # capture time only, which is what it is for — it records the
-                # order in which ranks enqueue prefetch callbacks.
                 if self.enable_multi_card:
                     self._log_mc_debug_schedule(
                         next_idx, is_prefetch=True)
