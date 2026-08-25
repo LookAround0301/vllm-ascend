@@ -1021,6 +1021,12 @@ class ExpertOffloadConfig:
         "h2d_backend": "torch",  # Options: "torch", "memfabric"
         "memfabric_pool_size_gib": 0,
         "memfabric_log_level": 3,
+        # which prefetch METHOD drives the NON-HASH targets.
+        # "fate" == the existing hard-wired predictor driven from the four MoE
+        # apply() sites. Any other name selects a trained head from
+        # expert_predictor.py's registry, driven from the decoder layer
+        "expert_predictor": "fate",
+        "expert_predictor_ckpt": None,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -1218,6 +1224,34 @@ class ExpertOffloadConfig:
             raise TypeError("expert_substitution_threshold must be a number")
         if self.config["expert_substitution_threshold"] < 0:
             raise ValueError("expert_substitution_threshold must be >= 0")
+        # Validate the prefetch method against the expert predictor's registry
+        from vllm_ascend.expert_offload.expert_predictor import (
+            valid_predictor_names)
+        predictor = self.config["expert_predictor"]
+        if not isinstance(predictor, str):
+            raise TypeError("expert_predictor must be a string")
+        if predictor not in valid_predictor_names():
+            raise ValueError(
+                f"unknown expert_predictor {predictor!r}; valid names: "
+                f"{valid_predictor_names()}")
+        ckpt = self.config["expert_predictor_ckpt"]
+        if ckpt is not None and not isinstance(ckpt, str):
+            raise TypeError("expert_predictor_ckpt must be a string or null")
+        if predictor != "fate":
+            # A trained head is useless without its weights, and useless
+            # without the prefetch pipeline it drives. Both are startup errors,
+            # not runtime degradations.
+            if not ckpt:
+                raise ValueError(
+                    f"expert_predictor={predictor!r} requires "
+                    "expert_predictor_ckpt")
+            if not (os.path.exists(ckpt) and os.access(ckpt, os.R_OK)):
+                raise ValueError(
+                    f"expert_predictor_ckpt not found or unreadable: {ckpt}")
+            if not self.config["expert_prefetch_enabled"]:
+                raise ValueError(
+                    f"expert_predictor={predictor!r} requires "
+                    "expert_prefetch_enabled=true")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

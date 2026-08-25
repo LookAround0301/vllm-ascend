@@ -328,7 +328,7 @@ class DecodeStatsCollector:
             # both outside the lock: logging and file I/O must not serialise
             # against record_layer on the report thread.
             if beat is not None:
-                logger.info("[DECODE-STATS] heartbeat: steps=%d records=%d "
+                logger.debug("[DECODE-STATS] heartbeat: steps=%d records=%d "
                             "snapshots=%d spec_samples=%d out=%s",
                             beat[0], beat[1], beat[2], beat[3],
                             self._out_path or "<none>")
@@ -432,7 +432,7 @@ class DecodeStatsCollector:
         else:
             # Periodic flushes log one line, not the whole table — the table is in
             # the file. Logging it every interval would bury serve.log.
-            logger.info("[DECODE-STATS] flush #%d at %d decode steps -> %s",
+            logger.debug("[DECODE-STATS] flush #%d at %d decode steps -> %s",
                         flush_no, steps, self._out_path)
         self._write_files(text, rows, final)
 

@@ -17,6 +17,7 @@ from vllm.logger import logger
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
 from vllm_ascend.expert_offload.decode_stats import get_decode_stats
+from vllm_ascend.expert_offload.expert_predictor import maybe_create_driver
 from vllm_ascend.expert_offload.h2d_transfer import (
     H2DCopyTask,
     HostPointerSource,
@@ -295,6 +296,16 @@ class ExpertOffloadManager:
         # known after MoE layers register).
         self._prefetch_log2phy_h: torch.Tensor | None = None
         self._prefetch_log2phy_np = None
+
+        # MoE-layer indices whose routing comes from a tid2eid table.
+        # Filled in _finalize_offload; used by trigger_next_layer_prefetch to
+        # keep the hash targets on this driver even when a trained predictor is configured.
+        self._hash_layer_indices: frozenset[int] = frozenset()
+
+        # the trained-predictor prefetch method, or None to leave
+        # every target to the heuristic ("fate") method. Created HERE — before
+        # the model is built — so decoder layers can resolve their capture site during construction
+        self.expert_predictor = maybe_create_driver(self)
 
     def _resolve_ep_info(self) -> None:
         """Lazily resolve ep_rank/ep_size from the EP group on first access.
@@ -633,23 +644,25 @@ class ExpertOffloadManager:
                 age_weight=self.offload_config.cache_age_weight,
             )
 
-        # register the MoE-layer topology with the decode-statistics collector.
         # Hash-routed layers are identified by their gate carrying a
         # tid2eid table — the same test predict_next_layer_experts_npu uses —
         # so no new config key is needed and the notion cannot drift.
+        self._hash_layer_indices = frozenset(
+            index for index, moe_layer in enumerate(self.moe_layers)
+            if getattr(getattr(moe_layer, "gate", None), "tid2eid", None)
+            is not None
+        )
+
+        # register the MoE-layer topology with the decode-statistics collector.
         self._stats = get_decode_stats()
         if self._stats is not None:
-            hash_layers = {
-                index for index, moe_layer in enumerate(self.moe_layers)
-                if getattr(getattr(moe_layer, "gate", None), "tid2eid", None)
-                is not None
-            }
-            self._stats.set_topology(num_moe_layers, hash_layers,
+            self._stats.set_topology(num_moe_layers,
+                                     set(self._hash_layer_indices),
                                      multi_card=self.enable_multi_card)
             logger.info(
                 "[DECODE-STATS] topology: moe_layers=%d hash_layers=%s "
-                "multi_card=%s", num_moe_layers, sorted(hash_layers),
-                self.enable_multi_card)
+                "multi_card=%s", num_moe_layers,
+                sorted(self._hash_layer_indices), self.enable_multi_card)
         t3 = time.perf_counter()
 
         ntotal = self.num_total_experts
@@ -697,6 +710,12 @@ class ExpertOffloadManager:
                 self.num_total_experts, dtype=torch.int32,
                 device='cpu', pin_memory=True)
             self._prefetch_log2phy_np = self._prefetch_log2phy_h.numpy()
+            # load the trained head and allocate its buffers —
+            # after every weight has landed, and before graph capture, because
+            # the head's parameters must be resident when the graph is
+            # recorded and the model geometry is only known once the model exists.
+            if self.expert_predictor is not None:
+                self.expert_predictor.finalize(model)
         t7 = time.perf_counter()
         self._log_cpu_expert_memory()
         logger.info(
@@ -1582,8 +1601,36 @@ class ExpertOffloadManager:
             self._synchronize_h2d()
 
     # ------------------------------------------------------------------ #
-    #  Forward path: page in experts based on topk_ids                    #
+    #  Forward path: page in experts based on topk_ids                   #
     # ------------------------------------------------------------------ #
+    
+    def _finish_pending_predict(self, layer_idx: int) -> None:
+        """Consume a trained predictor's in-flight prediction for this layer.
+
+        Called from update_weights and update_weights_multi_card as their first
+        act, before the prefetch event pop — the latest point at which the
+        prefetch can still be dispatched, and the first at which the real
+        routed experts are known.
+
+        It lives here rather than in the decoder layer because the decoder
+        layer's forward is traced by Dynamo (DeepseekV4Model is
+        @support_torch_compile with fullgraph) and nothing the driver's
+        finish() does is traceable. This method is on the apply() side, already
+        behind the MoE custom-op boundary — the same boundary that has always
+        made this class's own streams, locks and host callbacks safe.
+
+        All four apply() implementations call update_weights /
+        update_weights_multi_card unconditionally inside their
+        `enable_expert_offload` block, before any prefill-regime branch, and a
+        layer can only have launched if it is one of those layers — so the
+        launch/finish pairing is structural.
+
+        No-op with the heuristic method (no driver), and for hash layers and
+        any layer that did not launch (no pending entry).
+        """
+        predictor = self.expert_predictor
+        if predictor is not None:
+            predictor.finish(layer_idx)
 
     def update_weights(self, layer, topk_ids: torch.Tensor,
                         log2phy: torch.Tensor,
@@ -1611,6 +1658,18 @@ class ExpertOffloadManager:
         Returns: number of CPU→NPU copies performed (decode path),
                  0 for prefill path (full-overwrite via pool).
         """
+        try:
+            layer_idx = self.moe_layers.index(layer)
+        except ValueError:
+            return 0
+        self._finish_pending_predict(layer_idx)
+        # Wait for prefetch NPU copies to complete before using the weights.
+        # Use stream wait (graphable) instead of host synchronize.
+        with self._prefetch_state_lock:
+            npu_event = self._prefetch_layer_npu_event.pop(layer_idx, None)
+        if npu_event is not None:
+            torch_npu.npu.current_stream().wait_event(npu_event)
+
         # Multi-card offload sets routed layers' log2phy=None (standard-EP
         # dispatch) and uses update_weights_multi_card instead. Shared experts
         # (per-card replicated, not dispatched) may still reach here with
@@ -1623,27 +1682,12 @@ class ExpertOffloadManager:
             # Prefill: layerwise reuse + full-overwrite of all experts
             if (self._prefill_initialized
                     and not self._skip_prefill):
-                try:
-                    layer_idx = self.moe_layers.index(layer)
-                except ValueError:
-                    return 0
+                # reuse the layer_idx resolved above
                 self._prefill_load_layer(layer_idx, log2phy)
                 return 0
             else:
                 # Profile run or pool not ready — bail out gracefully
                 return 0
-
-        try:
-            layer_idx = self.moe_layers.index(layer)
-        except ValueError:
-            return 0
-
-        # Wait for prefetch NPU copies to complete before using the weights.
-        # Use stream wait (graphable) instead of host synchronize.
-        with self._prefetch_state_lock:
-            npu_event = self._prefetch_layer_npu_event.pop(layer_idx, None)
-        if npu_event is not None:
-            torch_npu.npu.current_stream().wait_event(npu_event)
 
         topk_ids_h = self.topk_ids_h[:num_tokens]
         do_substitution = (
@@ -1887,6 +1931,7 @@ class ExpertOffloadManager:
             layer_idx = self.moe_layers.index(layer)
         except ValueError:
             return
+        self._finish_pending_predict(layer_idx)
         # Wait for this layer's prefetch (if any) to finish H2D before reading
         # the device slots — mirror the single-card update_weights stream-join
         # (graphable: stream wait_event, not host sync). Without it the reactive
@@ -3210,6 +3255,13 @@ class ExpertOffloadManager:
         except ValueError:
             return
 
+        # arbitrate between the two prefetch METHODS by TARGET layer.
+        # A trained predictor takes the non-hash targets only; hash-routed
+        # targets stay here, because their experts come from the tid2eid table
+        if (self.expert_predictor is not None
+                and (layer_idx + 1) not in self._hash_layer_indices):
+            return
+
         staged = self._stage_predicted_topk(layer_idx, hidden_states)
         if staged is None:
             return
@@ -3217,8 +3269,74 @@ class ExpertOffloadManager:
 
         ready_to_load_event = torch_npu.npu.Event()
         torch_npu.npu.current_stream().record_event(ready_to_load_event) 
+        # the fork/callback/write-back/record block moved verbatim into
+        # _dispatch_prefetch so the trained-predictor driver ends in the same
+        # execution path. No behavioural change on this path.
+        self._dispatch_prefetch(staged, ready_to_load_event)
+        
         with torch_npu.npu.stream(self._prefetch_stream):
             self._prefetch_stream.wait_event(ready_to_load_event)
+            current_compute_stream = torch_npu.npu.current_stream()
+            subscribed_compute_streams = get_subscribed_compute_streams()
+            if current_compute_stream not in subscribed_compute_streams:
+                torch_npu.npu._subscribe_report(current_compute_stream)
+                subscribed_compute_streams.add(current_compute_stream)
+
+            prefetch_fn, prefetch_args = self._build_prefetch_call(
+                topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx, mc2_mask_h)
+            nxt = next_idx
+
+            def _prefetch_host_cb(_args):
+                # snapshot the staged mapping first, and restore it if
+                # the callback dies. log2phy_h is mutated in place, and the H2D
+                # write-back below is a recorded node that replays regardless —
+                # so a partial failure would publish residency for experts whose
+                # H2D never happened (log2phy applied then clamped -> slot 0,
+                # silent misroute). Restoring makes the write-back a no-op.
+                saved = log2phy_h.clone()
+                try:
+                    prefetch_fn(_args)
+                except Exception:
+                    log2phy_h.copy_(saved)
+                    self._note_cb_failure("prefetch")
+
+            if _EXTRA_CTX.capturing:
+                # (merge): keep the incoming CB_SCHEDULE trace. It runs at
+                # capture time only, which is what it is for — it records the
+                # order in which ranks enqueue prefetch callbacks.
+                if self.enable_multi_card:
+                    self._log_mc_debug_schedule(
+                        next_idx, is_prefetch=True)
+                torch_npu.npu._launch_host_func(
+                    current_compute_stream, _prefetch_host_cb, prefetch_args)
+            else:
+                _prefetch_host_cb(prefetch_args)
+
+            next_layer.log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
+            # 记录一个传输流完成的事件，用于后续主流和它汇聚
+            load_done_event = torch_npu.npu.Event()
+            self._prefetch_stream.record_event(load_done_event)
+            with self._prefetch_state_lock:
+                self._prefetch_layer_npu_event[nxt] = load_done_event
+                
+    def _dispatch_prefetch(self, staged, ready_event) -> None:
+        """Fork the prefetch stream, plan+H2D, publish log2phy, record the join.
+
+        The tail of trigger_next_layer_prefetch, extracted so both prefetch
+        methods share one execution path. The heuristic method stages on the
+        compute stream and passes an event to fork behind; a trained predictor
+        stages on the prefetch stream itself and passes ready_event=None,
+        because same-stream FIFO already orders the callback behind its staging.
+
+        `staged` is _stage_predicted_topk's tuple:
+            (topk_ids_h, topk_weights_h, log2phy_h, log2phy_np,
+             next_layer, next_idx, mc2_mask_h)
+        """
+        (topk_ids_h, topk_weights_h, log2phy_h, log2phy_np,
+         next_layer, next_idx, mc2_mask_h) = staged
+        with torch_npu.npu.stream(self._prefetch_stream):
+            if ready_event is not None:
+                self._prefetch_stream.wait_event(ready_event)
             current_compute_stream = torch_npu.npu.current_stream()
             subscribed_compute_streams = get_subscribed_compute_streams()
             if current_compute_stream not in subscribed_compute_streams:
@@ -3366,20 +3484,21 @@ class ExpertOffloadManager:
         # (merge): the two sorted() calls sit here rather than at the top of the function.
         self.last_hit_experts[layer_idx] = sorted(hit_experts)
         self.last_miss_experts[layer_idx] = sorted(miss_experts)
-        logger.info(
-            "[EXPERT-OFFLOAD-CACHE] layer=%d cache_step=%d calls=%d policy_step=%d "
-            "hit_rate=%.4f hits=%d misses=%d last_hit=%s last_miss=%s resident=%s",
-            layer_idx,
-            self.cache_calls[layer_idx],
-            self.cache_calls[layer_idx],
-            policy_step,
-            hit_rate,
-            self.cache_hits[layer_idx],
-            self.cache_misses[layer_idx],
-            self.last_hit_experts[layer_idx],
-            self.last_miss_experts[layer_idx],
-            sorted(on_device),
-        )
+        if self._debug:
+            logger.info(
+                "[EXPERT-OFFLOAD-CACHE] layer=%d cache_step=%d calls=%d policy_step=%d "
+                "hit_rate=%.4f hits=%d misses=%d last_hit=%s last_miss=%s resident=%s",
+                layer_idx,
+                self.cache_calls[layer_idx],
+                self.cache_calls[layer_idx],
+                policy_step,
+                hit_rate,
+                self.cache_hits[layer_idx],
+                self.cache_misses[layer_idx],
+                self.last_hit_experts[layer_idx],
+                self.last_miss_experts[layer_idx],
+                sorted(on_device),
+            )
 
 
 

@@ -6,6 +6,10 @@
 #    source env_a5_0260.sh
 #    CARD=2 PORT=1161 TASKS=gpqa RUN=perf ./v4_target_aisbench.sh
 #
+#    EXPERT_PREDICTOR=mode2_har \
+#      EXPERT_PREDICTOR_CKPT=/path/har_prompt_std_dist_lowrank_w=1280_miss=0.pt \
+#      CARD=2 PORT=1161 TASKS=gpqa RUN=perf ./v4_target_aisbench.sh
+#
 #    DRY_RUN=1 print the plan only   LIST=1 list dataset configs
 #    MTP=0|1|2  spec decode: off | mtp | dspark
 #
@@ -68,6 +72,15 @@ EXPERT_PREFETCH_NUM="${EXPERT_PREFETCH_NUM:-2}"     # TRANSFER budget: predicted
                                          # loaded per layer per step. Single card only.
 EXPERT_PREFETCH_TOKENS="${EXPERT_PREFETCH_TOKENS:-1}"  # PREDICTION width: token rows the
                                          # predictor runs on. Orthogonal to _NUM.
+# Which prefetch METHOD drives the NON-HASH targets (layers 3..42). "fate" is the engine's
+# built-in hash/gate next-layer predictor and stays the default. "mode2_har" is the trained
+# lowrank head, launched at each MoE layer's first residual clone and run on the prefetch
+# stream in parallel with that layer's attention; it needs EXPERT_PREDICTOR_CKPT.
+# The three HASH-routed targets stay on fate in BOTH cases: their experts come from the
+# tid2eid table indexed by token id, which fate predicts exactly with one index_select and
+# no matmul — strictly better than any learned head can do for those layers.
+EXPERT_PREDICTOR="${EXPERT_PREDICTOR:-fate}"        # fate | mode2_har
+EXPERT_PREDICTOR_CKPT="${EXPERT_PREDICTOR_CKPT:-}"  # e.g. .../har_prompt_std_dist_lowrank_w=1280_miss=0.pt
 CACHE_STATS_LOG_INTERVAL="${CACHE_STATS_LOG_INTERVAL:-}"
 MOE_OFFLOAD_DEBUG="${MOE_OFFLOAD_DEBUG:-0}"      # per-layer trace INSIDE the host
                                          # callback — invalid for any timing run
@@ -176,6 +189,27 @@ print(",".join(sorted(map(str, o))) if isinstance(o, dict) and o else "none")
 PY
 }
 
+# the predictor checkpoint's own `meta`, so a geometry mismatch is caught in seconds
+# instead of after a two-minute model load. mmap keeps the ~460 MiB of bf16 head weights
+# out of RAM — only the small `meta` dict is touched. Echoes
+#   arch|in_dim|L|E|top_k|width   or   unreadable
+# and never fails, for the same reason model_rotation() never fails.
+predictor_meta() {   # $1 = .pt path
+  python3 - "$1" <<'PY'
+import sys
+try:
+    import torch
+    try:
+        s = torch.load(sys.argv[1], map_location="cpu", mmap=True, weights_only=False)
+    except TypeError:                     # torch predates mmap=
+        s = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+    m = s["meta"]
+    print("|".join(str(m[k]) for k in ("arch", "in_dim", "L", "E", "top_k", "hidden")))
+except Exception:
+    print("unreadable")
+PY
+}
+
 # one failure path for the rotation gate, so the WHY/SYMPTOM/FIX explanation is written
 # once instead of three times. $1 is the specific finding. guard() rather than die() to match
 # every other safety check here — ALLOW_UNSAFE=1 downgrades it to a warning.
@@ -265,6 +299,21 @@ if [[ "${H2D_BACKEND}" == memfabric ]]; then
     || die "multi-card MemFabric requires SHARD_PER_RANK=true: SHARED mode keeps the host weights sharded
        and shares the POINTERS. Replicated host weights have nothing to publish."
 fi
+# Same contract as the four above: expert_predictor / expert_predictor_ckpt are nested keys
+# in the CLOSED expert_offload_config set, and the engine raises on every one of these — but
+# only after the model has loaded.
+[[ "${EXPERT_PREDICTOR}" =~ ^(fate|mode2_har)$ ]] || die "EXPERT_PREDICTOR must be fate or mode2_har"
+if [[ "${EXPERT_PREDICTOR}" != fate ]]; then
+  [[ "${OFFLOAD}" == "1" ]] || die "EXPERT_PREDICTOR=${EXPERT_PREDICTOR} with OFFLOAD=0: the whole
+       expert_offload_config block is only emitted when OFFLOAD=1, so the key would never reach the
+       engine and the run would silently measure nothing."
+  [[ "${PREFETCH}" == "1" ]] || die "EXPERT_PREDICTOR=${EXPERT_PREDICTOR} needs PREFETCH=1: a trained
+       predictor drives the prefetch pipeline, and with prefetch disabled there is nothing to drive."
+  [[ -n "${EXPERT_PREDICTOR_CKPT}" ]] || die "EXPERT_PREDICTOR=${EXPERT_PREDICTOR} needs
+       EXPERT_PREDICTOR_CKPT (the trained head, e.g. har_prompt_std_dist_lowrank_w=1280_miss=0.pt)."
+  [[ -r "${EXPERT_PREDICTOR_CKPT}" ]] || die "EXPERT_PREDICTOR_CKPT not found or unreadable:
+       ${EXPERT_PREDICTOR_CKPT}"
+fi
 [[ -z "${REMOE_GATE}" || -e "${REMOE_GATE}" ]]                    || die "REMOE_GATE not found: ${REMOE_GATE}"
 # the two DeepSeek-V4-Flash builds have byte-identical config.json apart from
 # quantization_config vs expert_dtype, and every routing-relevant field (num_hash_layers=3,
@@ -307,10 +356,69 @@ PY
 [[ -n "${_CFG_TOPK}" ]] && TOPK="${_CFG_TOPK}"
 [[ "${TOPK}" =~ ^[1-9][0-9]*$ ]] || die "TOPK must be a positive integer (got '${TOPK}')"
 
+# Predictor geometry gate. Every failure mode of a mismatched head is SILENT — plausible
+# expert ids, a degraded hit rate, no error anywhere — so establish the mapping here, at a
+# few seconds, rather than reading it out of pred_acc after a benchmark. Only runs for a
+# trained predictor; a fate run does no extra work.
+PREDICTOR_NOTE="off (fate: built-in hash/gate next-layer predictor)"
+if [[ "${EXPERT_PREDICTOR}" != fate ]]; then
+  _geom="$(python3 - "${MODEL}/config.json" 2>/dev/null <<'PY'
+import json, sys
+try: c = json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+t = c.get("text_config") if isinstance(c.get("text_config"), dict) else {}
+g = lambda k: c.get(k, t.get(k))
+print("%s|%s|%s|%s" % (g("hc_mult"), g("hidden_size"),
+                       g("num_hidden_layers"), g("num_hash_layers")))
+PY
+)"
+  _pm="$(predictor_meta "${EXPERT_PREDICTOR_CKPT}")"
+  if [[ "${_pm}" == unreadable || -z "${_geom}" ]]; then
+    guard "cannot read the predictor checkpoint's meta or the model's geometry
+       (ckpt='${EXPERT_PREDICTOR_CKPT}' meta='${_pm}' model_geom='${_geom}'). The engine would
+       still validate at load time; ALLOW_UNSAFE=1 to proceed on its checks alone."
+    PREDICTOR_NOTE="${EXPERT_PREDICTOR} (meta unreadable — engine will validate)"
+  else
+    IFS='|' read -r _p_arch _p_in _p_L _p_E _p_k _p_w <<<"${_pm}"
+    IFS='|' read -r _hc _hid _nhl _nhash <<<"${_geom}"
+    [[ "${_p_arch}" == lowrank ]] || die "predictor checkpoint arch='${_p_arch}': the port implements
+       'lowrank' only (expert_predictor.py::_ARCH_HEADS). Retrain or extend the registry."
+    (( _p_in == _hc * _hid )) || die "predictor in_dim=${_p_in} but the model has hc_mult=${_hc} x
+       hidden_size=${_hid} = $(( _hc * _hid )). The 'har' atom is the FULL hyper-connection residual,
+       so in_dim must equal hc_mult*hidden_size — this checkpoint was trained on a different model."
+    # The dump either drops the leading hash-routed layers (L = 40) or covers all of them
+    # (L = 43). Both are handled at runtime; anything else silently shifts every head onto
+    # the wrong layer, which is the one failure this gate exists to catch.
+    if   (( _p_L == _nhl - _nhash )); then _map="layer_offset=${_nhash} (hash layers not in the dump)"
+    elif (( _p_L == _nhl ));          then _map="layer_offset=0 (dump covers all layers; hash skipped at runtime)"
+    else guard "predictor covers L=${_p_L} layers, but this model has num_hidden_layers=${_nhl} and
+       num_hash_layers=${_nhash}, so the only self-consistent values are $(( _nhl - _nhash )) or ${_nhl}.
+       Every head would be mapped onto the wrong layer, with no error and no crash — only a poor
+       pred_acc. Check metadata.json's dumped_layer_indices: they must be a contiguous TRAILING block."
+         _map="layer_offset=$(( _nhl - _p_L )) UNVERIFIED"
+    fi
+    (( _p_k == TOPK )) || echo "  warn    : predictor top_k=${_p_k} but the model routes top_k=${TOPK} —
+            the prediction width differs from the router's, which moves pred_acc and changes how many
+            candidates EXPERT_PREFETCH_NUM ranks."
+    # r = max(MIN_RANK=64, width//LOWRANK_DIV=4), per the study's _rank_of(). Head params are
+    # bf16 (the dtype the study saves); mu/sd stay fp32. This is HBM taken from the same
+    # budget the expert cache lives in, so it is worth seeing before the run, not after an OOM.
+    _r=$(( _p_w / 4 )); (( _r < 64 )) && _r=64
+    _mib=$(( (_p_L * _p_in * _r * 2 + _p_L * _r * _p_w * 2 + _p_L * _p_w * _p_E * 2 \
+              + 2 * _p_L * _p_in * 4) / 1048576 ))
+    PREDICTOR_NOTE="${EXPERT_PREDICTOR} arch=${_p_arch} L=${_p_L} ${_map} in_dim=${_p_in} width=${_p_w} rank=${_r} E=${_p_E} top_k=${_p_k} head~${_mib}MiB/rank"
+  fi
+fi
+
 THR=$(( NDE_MIN / TOPK ))          # offload_threshold, in MoE token ROWS
 NDE_FLOOR=$(( MOE_ROWS * TOPK ))   # smallest pool that keeps decode on the offload path
 THR_PER_RANK=$(( THR / DP ))       # largest safe per-rank capture size
-PF_TOK_EFF=$(( EXPERT_PREFETCH_TOKENS < MOE_ROWS ? EXPERT_PREFETCH_TOKENS : MOE_ROWS ))
+# fate predicts from the POST-prepare() MoE input, so its row ceiling is MOE_ROWS. A trained
+# predictor captures at the decoder layer, BEFORE prepare()'s DP all-gather, so its ceiling
+# is this rank's own decode token count. Same knob, different denominator.
+PF_ROWS_AVAIL="${MOE_ROWS}"
+[[ "${EXPERT_PREDICTOR}" != fate ]] && PF_ROWS_AVAIL="${DECODE_TOKENS}"
+PF_TOK_EFF=$(( EXPERT_PREFETCH_TOKENS < PF_ROWS_AVAIL ? EXPERT_PREFETCH_TOKENS : PF_ROWS_AVAIL ))
 
 CAPTURE_SIZES="${CUDAGRAPH_CAPTURE_SIZES}"; AUTO_NOTE=""
 if [[ "${CAPTURE_SIZES}" == auto || "${CAPTURE_SIZES}" == auto-safe ]]; then
@@ -731,6 +839,12 @@ if [[ "${OFFLOAD}" == "1" ]]; then
   [[ "${PREFETCH}" == "1" ]] && \
     p+=",\"expert_prefetch_enabled\":true,\"expert_prefetch_num\":${EXPERT_PREFETCH_NUM}\
 ,\"expert_prefetch_tokens\":${EXPERT_PREFETCH_TOKENS}"
+  # Emitted only when non-default, like every other knob here: a fate run sends exactly the
+  # JSON it sent before these keys existed, so old and new runs stay comparable.
+  if [[ "${EXPERT_PREDICTOR}" != fate ]]; then
+    p+=",\"expert_predictor\":\"${EXPERT_PREDICTOR}\""
+    p+=",\"expert_predictor_ckpt\":\"${EXPERT_PREDICTOR_CKPT}\""
+  fi
   if [[ "${EXPERT_SUBSTITUTION}" == "1" ]]; then
     p+=",\"expert_substitution_enabled\":true"
     [[ -n "${EXPERT_SUBSTITUTION_THRESHOLD}" ]] && p+=",\"expert_substitution_threshold\":${EXPERT_SUBSTITUTION_THRESHOLD}"
@@ -833,6 +947,9 @@ echo "  serve   : ${SERVED_NAME} on :${PORT} (card ${CARD}) tp=${TP} dp=${DP} pp
   || echo "  graph   : OFF (eager) — prefetch cannot overlap; TPOT is a debug number, accuracy is not"
 echo "  spec    : ${SPEC_METHOD:-off} num_spec_tokens=${NUM_SPEC_TOKENS} decode_tokens=${DECODE_TOKENS} moe_rows=${MOE_ROWS} (x dp=${DP})"
 echo "  offload : ${OFFLOAD} experts=${NUM_DEVICE_EXPERTS} layers=${NUM_DEVICE_LAYERS} lrc=${CACHE_POLICY} prefetch=${PREFETCH}/${EXPERT_PREFETCH_NUM} tokens=${EXPERT_PREFETCH_TOKENS}(eff ${PF_TOK_EFF}) subst=${EXPERT_SUBSTITUTION} multi_card=${ENABLE_MULTI_CARD} debug=${MOE_OFFLOAD_DEBUG}"
+echo "  predict : ${PREDICTOR_NOTE}"
+[[ "${EXPERT_PREDICTOR}" != fate ]] && echo "            ckpt=${EXPERT_PREDICTOR_CKPT}"
+[[ "${EXPERT_PREDICTOR}" != fate ]] && echo "            hash targets stay on fate (exact tid2eid lookup); the head owns the rest"
 echo "  h2d     : ${H2D_BACKEND}$([[ "${H2D_BACKEND}" == memfabric ]] && echo " pool=${MEMFABRIC_POOL_GIB}GiB/rank (aggregate $(( MEMFABRIC_POOL_GIB * EP_SIZE ))GiB) mode=$([[ "${ENABLE_MULTI_CARD}" == "1" ]] && echo shared || echo local)")"
 echo "  gate    : ${REMOE_GATE:-off (base router)}"
 [[ -n "${REMOE_GATE}" ]] && echo "            build rotation=${MODEL_ROT} (required=${REMOE_GATE_ROT}) — matched"
@@ -920,7 +1037,8 @@ echo "  repro   : $(for v in CARD PORT TASKS RUN THINK THINK_EFFORT NUM_PROMPTS 
       PERF_TEMP MAX_NUM_SEQS MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS SEED GPU_MEM_UTIL TP DP PP QUANTIZATION PREFIX_CACHING \
       ENFORCE_EAGER CUDAGRAPH_MODE CUDAGRAPH_CAPTURE_SIZES ENABLE_NPUGRAPH_EX ENABLE_STATIC_KERNEL \
       MTP NUM_SPEC_TOKENS OFFLOAD NUM_DEVICE_EXPERTS NUM_DEVICE_LAYERS TOPK EXPERT_MAP_PATH \
-      CACHE_POLICY PREFETCH EXPERT_PREFETCH_NUM EXPERT_PREFETCH_TOKENS CACHE_STATS_LOG_INTERVAL MOE_OFFLOAD_DEBUG REMOE_GATE REMOE_GATE_ROT \
+      CACHE_POLICY PREFETCH EXPERT_PREFETCH_NUM EXPERT_PREFETCH_TOKENS EXPERT_PREDICTOR EXPERT_PREDICTOR_CKPT \
+      CACHE_STATS_LOG_INTERVAL MOE_OFFLOAD_DEBUG REMOE_GATE REMOE_GATE_ROT \
       DECODE_STATS CSV CSV_PATH STATS_FLUSH_EVERY STATS_FLUSH_SECONDS STATS_QUIESCE WAIT HEALTH_GRACE ENGINE_GRACE REAP_WAIT \
       EXPERT_SUBSTITUTION EXPERT_SUBSTITUTION_THRESHOLD HOT_PRELOAD HOT_EXPERTS_FILE \
       ENABLE_MULTI_CARD SHARD_PER_RANK H2D_BACKEND MEMFABRIC_POOL_GIB MEMFABRIC_LOG_LEVEL \
@@ -1075,6 +1193,16 @@ if [[ "${SKIP_SERVE}" != "1" ]]; then
       && guard "H2D_BACKEND=memfabric but the engine did not log 'backend=memfabric' — this run
        is measuring the torch copy path under a memfabric label."
   fi
+  # A trained predictor announces its geometry once, at offload finalize, and then how many
+  # capture SITES it resolved. sites != the non-hash MoE layer count means the head mapped
+  # onto the wrong layers, or the decoder-layer hook never fired — both silent at runtime.
+  if [[ "${EXPERT_PREDICTOR}" != fate ]]; then
+    grep -o '\[PREFETCH-AI\].*$' "${SERVE_LOG}" | sort -u | sed 's/^/  predict : /'
+    grep -q '\[PREFETCH-AI\] armed' "${SERVE_LOG}" \
+      || guard "EXPERT_PREDICTOR=${EXPERT_PREDICTOR} but the engine never logged '[PREFETCH-AI] armed' —
+       the head did not load, or no decoder layer resolved a capture site. Every prefetch this run
+       makes would come from the built-in fate predictor on the hash targets alone."
+  fi
   if grep -q '\[DECODE-STATS\] config:' "${SERVE_LOG}"; then
     grep -o '\[DECODE-STATS\] \(config\|topology\|armed\|decode\):.*$' "${SERVE_LOG}" | sort -u | sed 's/^/  stats   : /'
     grep -q '\[DECODE-STATS\] armed' "${SERVE_LOG}" || \
@@ -1082,10 +1210,10 @@ if [[ "${SKIP_SERVE}" != "1" ]]; then
     # Draft MoE layers are excluded by a LAYER-NAME test; the registered count settles
     # whether it held for THIS drafter.
     _nml="$(grep -o 'topology: moe_layers=[0-9]*' "${SERVE_LOG}" | head -1 | grep -o '[0-9]*$')"
-    _nhl="$(python3 -c "
+    _nhl2="$(python3 -c "
 import json;print(json.load(open('${MODEL}/config.json')).get('num_hidden_layers',''))" 2>/dev/null)"
-    [[ -n "${_nml}" && -n "${_nhl}" && "${_nml}" != "${_nhl}" ]] && \
-      echo "  warn    : registered ${_nml} MoE layers but num_hidden_layers=${_nhl} — the drafter's MoE
+    [[ -n "${_nml}" && -n "${_nhl2}" && "${_nml}" != "${_nhl2}" ]] && \
+      echo "  warn    : registered ${_nml} MoE layers but num_hidden_layers=${_nhl2} — the drafter's MoE
             layers are being OFFLOADED, which the sizing model assumes never happens."
   elif [[ "${DECODE_STATS}" == "1" ]]; then
     guard "the engine never logged '[DECODE-STATS] config:' — the statistics keys were swallowed,
@@ -1218,6 +1346,29 @@ exit "${rc}"
 #  TRANSFERRED, and reaches the single-card path only. The prediction is topk-WIDE
 #  regardless, so _NUM=1 does not pin |P| to 1 — it caps |N|.
 #
+#  THE PREFETCH METHOD IS CHOSEN PER TARGET LAYER, NOT PER RUN. EXPERT_PREDICTOR only
+#  selects who drives the NON-HASH targets (layers 3..42). The three hash-routed layers
+#  stay on fate in every configuration, because their experts are tid2eid[token_id] — a
+#  [vocab_size, topk] table lookup, exact and free, which no learned head can improve on.
+#  Two consequences. First, `pf_loads_step / pf_loads` stays 40.0000 with either method:
+#  fate-only covers targets 1..42 (40 non-hash), and mode2_har covers 3..42 plus fate's
+#  1..2 — the same 40 contributing layers, so that ratio remains the cheapest proof that
+#  coverage did not shift. Second, `[PREFETCH-W]` should appear for l=1,2 AND l=3..42, and
+#  never for l=0: nothing precedes layer 0, so it has no prefetch under either method.
+#
+#  A MISMATCHED PREDICTOR CHECKPOINT FAILS SILENTLY. The head maps checkpoint index h to
+#  MoE layer h + (num_moe_layers - L). If L is neither num_hidden_layers - num_hash_layers
+#  nor num_hidden_layers, every head lands on the wrong layer: no crash, no error, just a
+#  poor pred_acc that reads like a weak model. The geometry gate above settles arch, in_dim
+#  (which must equal hc_mult x hidden_size for the 'har' atom), L and top_k in a few
+#  seconds. It cannot detect a BASIS mismatch — a rotated build preserves every shape and
+#  norm — so serve the head on the build its residuals were dumped from.
+#
+#  THE PREDICTOR HEAD IS ~460 MiB PER RANK, out of the same HBM the expert cache lives in
+#  (bf16 Wd dominates: L x hc_mult*hidden x rank x 2 bytes). The plan echo prints the exact
+#  figure. Re-check NUM_DEVICE_EXPERTS after enabling it — a head that costs six experts'
+#  worth of slots can cost more hit rate than it wins.
+#
 #  READ avg@n ONLY. AISBench de-interleaves the avg@n prediction list with the wrong
 #  stride; avg@n survives as a flat mean, pass@n and cons@n come out as 1-(1-p)^n and p^n.
 #  Pass@1 IS avg@n. At n=1 the 198-row gpqa set carries ~3.2 points of binomial noise.
@@ -1231,6 +1382,8 @@ exit "${rc}"
 #  EAGER TPOT IS NOT A BASELINE FOR GRAPH TPOT. In eager the prefetch callback runs inline
 #  and ends in load_stream.synchronize(), so PREFETCH=1 is SLOWER than PREFETCH=0. Use
 #  eager for accuracy parity — scores must match graph mode exactly — never for latency.
+#  This applies to EXPERT_PREDICTOR=mode2_har too, and more so: its head runs on the
+#  prefetch stream, which only overlaps anything under graph capture.
 #
 #  ais_bench EXITS 0 WHEN THE ENGINE IS DEAD: HTTP 500s are responses. engine_died_early()
 #  turns that back into a non-zero rc.
@@ -1250,7 +1403,9 @@ exit "${rc}"
 #
 #  DRAFT MoE LAYERS DO NOT OFFLOAD — the exclusion is a layer-NAME test ("mtp" as a path
 #  component). The post-health moe_layers check proves it held for the drafter in front of
-#  you; DSpark builds its layers with the same prefix, but verify rather than assume.
+#  you; DSpark builds its layers with the same prefix, but verify rather than assume. The
+#  trained predictor is excluded from the drafters twice over: by that same test, and by an
+#  is_draft_layer check at decoder-layer construction.
 #
 #  MODES ARE PER-REQUEST. chat_template_kwargs rides on each request, which is what lets acc
 #  and perf run different modes against one server. A kwarg the template does not declare is

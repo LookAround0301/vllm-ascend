@@ -969,6 +969,24 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
+        # resolve this layer's AI-predictor capture site, here.
+        # Must come after self.mlp is built — DeepseekV4MoE -> FusedMoE ->
+        # AscendMoERunner.__init__ is what registers the MoE layer with the
+        # offload manager, so its gate is only findable afterwards.
+        # Hash layers resolve to a site too, but the predictor's head_index
+        # returns None for them, so nothing launches — they stay on fate.
+        self._predict_moe_idx = None
+        self._predict_driver = None
+        if not is_draft_layer and not getattr(self.mlp, "is_sequence_parallel", False):
+            from vllm_ascend.expert_offload.expert_predictor import get_driver
+
+            driver = get_driver()
+            if driver is not None:
+                moe_idx = driver.register_site(self.mlp.gate)
+                if moe_idx is not None:
+                    self._predict_moe_idx = moe_idx
+                    self._predict_driver = driver
+
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         y = torch.ops._C_ascend.npu_hc_pre_v2(
             x, hc_fn, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.norm_eps, self.hc_eps
@@ -988,7 +1006,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        residual = hidden_states.clone()
+        if self._predict_driver is not None:
+            residual = torch.ops.vllm_ascend.expert_predictor_launch(
+                self._predict_moe_idx, hidden_states)
+        else:
+            residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hidden_states = self.input_layernorm(hidden_states)
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
