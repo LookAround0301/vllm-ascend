@@ -68,9 +68,9 @@ class AscendConfig:
         self.decode_stats_csv = additional_config.get("decode_stats_csv", False)
         self.decode_stats_path = additional_config.get("decode_stats_path",
                 additional_config.get("decode_stats_csv_path", None))
-        self.decode_stats_flush_every = additional_config.get("decode_stats_flush_every", 100)
+        self.decode_stats_flush_every = additional_config.get("decode_stats_flush_every", 500)
         # wall-clock flush interval, in seconds
-        self.decode_stats_flush_seconds = additional_config.get("decode_stats_flush_seconds", 30.0)
+        self.decode_stats_flush_seconds = additional_config.get("decode_stats_flush_seconds", 60.0)
         if not isinstance(self.decode_stats_enabled, bool):
             raise TypeError(
                 "decode_stats_enabled must be a boolean, got "
@@ -1027,6 +1027,8 @@ class ExpertOffloadConfig:
         # expert_predictor.py's registry, driven from the decoder layer
         "expert_predictor": "fate",
         "expert_predictor_ckpt": None,
+        # Measure the stall the prefetch path adds to the compute stream
+        "expert_prefetch_wait_timing": False,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -1252,6 +1254,14 @@ class ExpertOffloadConfig:
                 raise ValueError(
                     f"expert_predictor={predictor!r} requires "
                     "expert_prefetch_enabled=true")
+        if not isinstance(self.config["expert_prefetch_wait_timing"], bool):
+            raise TypeError("expert_prefetch_wait_timing must be a boolean")
+        if (self.config["expert_prefetch_wait_timing"]
+                and not self.config["expert_prefetch_enabled"]):
+            raise ValueError(
+                "expert_prefetch_wait_timing=true requires "
+                "expert_prefetch_enabled=true: with no prefetch there is no "
+                "join to measure")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

@@ -306,6 +306,21 @@ class ExpertOffloadManager:
         # every target to the heuristic ("fate") method. Created HERE — before
         # the model is built — so decoder layers can resolve their capture site during construction
         self.expert_predictor = maybe_create_driver(self)
+        
+        # Prefetch-stall timing. Per-layer device event pairs bracketing the
+        # join in update_weights[_multi_card]
+        self._pf_wait_timing = bool(
+            self.offload_config.expert_prefetch_wait_timing)
+        self._pf_wait_begin: list = []
+        self._pf_wait_end: list = []
+        self._pf_wait_armed: list[bool] = []
+        # Measured cost of the instrument itself (ms), subtracted from every
+        # sample so pf_wait reports the stall and not the two event records
+        # that bracket it. Calibrated in _finalize_offload.
+        self._pf_wait_bias = 0.0
+        self._pf_wait_ok = 0        # successful elapsed_time reads
+        self._pf_wait_fail = 0      # failed reads; first one logs
+        self._pf_wait_probed = False
 
     def _resolve_ep_info(self) -> None:
         """Lazily resolve ep_rank/ep_size from the EP group on first access.
@@ -716,6 +731,48 @@ class ExpertOffloadManager:
             # recorded and the model geometry is only known once the model exists.
             if self.expert_predictor is not None:
                 self.expert_predictor.finalize(model)
+            if self._pf_wait_timing:
+                # One pair per MoE layer, allocated ONCE and re-recorded every
+                # step. Creating them per call would add 2 events per layer per
+                # capture size and risk the 207008 stream/event ceiling; reusing
+                # them keeps the graph's event-record nodes pointing at stable
+                # handles, which is what makes elapsed_time meaningful on replay.
+                n = len(self.moe_layers)
+                self._pf_wait_begin = [
+                    torch_npu.npu.Event(enable_timing=True) for _ in range(n)]
+                self._pf_wait_end = [
+                    torch_npu.npu.Event(enable_timing=True) for _ in range(n)]
+                self._pf_wait_armed = [False] * n
+                # Calibrate the bracket's own cost, and validate elapsed_time
+                # HERE — before any graph is captured. A failure at this point
+                # disables recording cleanly
+                probe_a = torch_npu.npu.Event(enable_timing=True)
+                probe_b = torch_npu.npu.Event(enable_timing=True)
+                probe_stream = torch_npu.npu.current_stream()
+                try:
+                    samples = []
+                    for _ in range(16):
+                        probe_a.record(probe_stream)
+                        probe_b.record(probe_stream)
+                        probe_b.synchronize()
+                        samples.append(float(probe_a.elapsed_time(probe_b)))
+                    self._pf_wait_bias = min(samples)
+                    logger.info(
+                        "[PREFETCH-WAIT] timing enabled: %d event pairs; "
+                        "bracket cost %.4f ms is subtracted from every sample. "
+                        "pf_wait measures the compute stream's block at the "
+                        "prefetch join, so TPOT from this run is NOT a baseline",
+                        n, self._pf_wait_bias)
+                except Exception:
+                    self._pf_wait_timing = False
+                    self._pf_wait_begin = []
+                    self._pf_wait_end = []
+                    self._pf_wait_armed = []
+                    logger.warning(
+                        "[PREFETCH-WAIT] elapsed_time is not usable on this "
+                        "build; prefetch-stall timing disabled and NOTHING will "
+                        "be recorded into the graph. The run is otherwise "
+                        "unaffected.", exc_info=True)
         t7 = time.perf_counter()
         self._log_cpu_expert_memory()
         logger.info(
@@ -1604,6 +1661,73 @@ class ExpertOffloadManager:
     #  Forward path: page in experts based on topk_ids                   #
     # ------------------------------------------------------------------ #
     
+    def _read_pf_wait(self, layer_idx: int):
+        """Milliseconds the compute stream was blocked at this layer's join.
+
+        Called from the reactive host callback, which is stream-ordered after
+        the `end` record, so under graph replay both timestamps are already
+        committed. The explicit `end.synchronize()` covers eager, where the
+        callback runs inline on the forward thread and the compute stream may
+        not have reached the record yet.
+
+        `_pf_wait_bias` is the calibrated cost of the bracket itself (see
+        _finalize_offload) and is subtracted so the number approximates the
+        stall alone rather than stall + instrument.
+
+        Returns None rather than raising: a device that cannot time events
+        inside a captured graph must degrade to "no samples", not kill the run.
+        An all-None series makes the summary row VANISH rather than print zeros
+        (decode_stats._summarize_series returns None for an empty series), so
+        the log lines below are the only way to tell "no stall measured" apart
+        from "feature never applied".
+        """
+        if not self._pf_wait_timing:
+            return None
+        if layer_idx >= len(self._pf_wait_armed):
+            return None
+        if not self._pf_wait_probed:
+            # One line, on the first read attempt of the run, that separates
+            # every failure mode at once: armed=0 means no layer had a wait node
+            # to bracket, armed=N with no later "first sample" line means
+            # elapsed_time is failing inside the graph.
+            self._pf_wait_probed = True
+            logger.info(
+                "[PREFETCH-WAIT] first read: layer=%d armed=%d/%d bias=%.4f ms",
+                layer_idx, sum(self._pf_wait_armed),
+                len(self._pf_wait_armed), self._pf_wait_bias)
+        if not self._pf_wait_armed[layer_idx]:
+            return None
+        try:
+            end = self._pf_wait_end[layer_idx]
+            end.synchronize()
+            raw = float(self._pf_wait_begin[layer_idx].elapsed_time(end))
+        except Exception:
+            self._pf_wait_fail += 1
+            if self._pf_wait_fail == 1:
+                # count and carry on. Latching _pf_wait_timing off here
+                # also stopped the RECORDING, and because the eager warmup runs
+                # before the capture, that silently emptied the captured graph.
+                logger.warning(
+                    "[PREFETCH-WAIT] elapsed_time failed; pf_wait samples will "
+                    "be dropped (recording left on so a warmup-only failure "
+                    "does not empty the captured graph)", exc_info=True)
+            return None
+        # Clamp: a stall shorter than the bracket's own cost is indistinguishable
+        # from no stall, and a negative millisecond in the summary is worse than
+        # a zero.
+        value = raw - self._pf_wait_bias
+        if value < 0.0:
+            value = 0.0
+        self._pf_wait_ok += 1
+        if self._pf_wait_ok == 1:
+            # Mirrors '[DECODE-STATS] first sample recorded' — a positive
+            # signal, so an empty summary row is never ambiguous.
+            logger.info(
+                "[PREFETCH-WAIT] first sample: layer=%d stall=%.3f ms "
+                "(raw=%.3f bias=%.4f)", layer_idx, value, raw,
+                self._pf_wait_bias)
+        return value
+        
     def _finish_pending_predict(self, layer_idx: int) -> None:
         """Consume a trained predictor's in-flight prediction for this layer.
 
@@ -1691,7 +1815,24 @@ class ExpertOffloadManager:
         with self._prefetch_state_lock:
             npu_event = self._prefetch_layer_npu_event.pop(layer_idx, None)
         if npu_event is not None:
-            torch_npu.npu.current_stream().wait_event(npu_event)
+            wait_stream = torch_npu.npu.current_stream()
+            # Bracket the join with device events so the stall is measurable
+            # under graph replay, where no Python runs. Both records are graph
+            # nodes re-executed every replay; _read_pf_wait consumes them from
+            # the reactive callback. Nothing is recorded when the key is off.
+            if self._pf_wait_timing:
+                self._pf_wait_begin[layer_idx].record(wait_stream)
+            wait_stream.wait_event(npu_event)
+            if self._pf_wait_timing:
+                self._pf_wait_end[layer_idx].record(wait_stream)
+                self._pf_wait_armed[layer_idx] = True
+        elif (self._pf_wait_timing
+              and layer_idx < len(self._pf_wait_armed)
+              # only a DECODE-regime call may clear the flag
+              and topk_ids.size(0) <= self.offload_threshold):
+            # No prefetch for this layer this step: no wait node exists, so
+            # there is nothing to time and the layer contributes no sample.
+            self._pf_wait_armed[layer_idx] = False
 
         # Multi-card offload sets routed layers' log2phy=None (standard-EP
         # dispatch) and uses update_weights_multi_card instead. Shared experts
@@ -1967,7 +2108,19 @@ class ExpertOffloadManager:
         with self._prefetch_state_lock:
             npu_event = self._prefetch_layer_npu_event.pop(layer_idx, None)
         if npu_event is not None:
-            torch_npu.npu.current_stream().wait_event(npu_event)
+            wait_stream = torch_npu.npu.current_stream()
+            if self._pf_wait_timing:
+                self._pf_wait_begin[layer_idx].record(wait_stream)
+            wait_stream.wait_event(npu_event)
+            if self._pf_wait_timing:
+                self._pf_wait_end[layer_idx].record(wait_stream)
+                self._pf_wait_armed[layer_idx] = True
+        elif (self._pf_wait_timing
+              and layer_idx < len(self._pf_wait_armed)
+              # decode-regime calls only
+              and topk_ids.size(0) <= self.offload_threshold):
+            self._pf_wait_armed[layer_idx] = False
+            
         num_tokens = topk_ids.size(0)
 
         # NOTE: the decode profile dummy must use the real dynamic placement
@@ -3038,6 +3191,10 @@ class ExpertOffloadManager:
                             layer_idx, None)
                     pred_acc = pred_prec = pf_in_lrc = pf_useful = None
                     psize = pf_loads = pf_hit = pf_waste = None
+                    # the compute stream's block at this layer's prefetch
+                    # join. Read here because this callback is stream-ordered
+                    # after the `end` record and runs on every graph replay.
+                    pf_wait = (self._read_pf_wait(layer_idx) if self._pf_wait_timing else None)
                     if pending is not None:
                         predicted, n_already, transferred = pending
                         psize = float(len(predicted))
@@ -3074,6 +3231,7 @@ class ExpertOffloadManager:
                         pred_prec=pred_prec,
                         pf_in_lrc=pf_in_lrc,
                         pf_useful=pf_useful,
+                        pf_wait=pf_wait,
                     )
 
             # (merge): _synchronize_h2d() replaces load_stream.synchronize(). On the torch backend they are the same

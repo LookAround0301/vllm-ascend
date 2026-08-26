@@ -10,6 +10,10 @@
 #      EXPERT_PREDICTOR_CKPT=/path/har_prompt_std_dist_lowrank_w=1280_miss=0.pt \
 #      CARD=2 PORT=1161 TASKS=gpqa RUN=perf ./v4_target_aisbench.sh
 #
+#    EXPERT_PREDICTOR=mode2_prevhfr \
+#      EXPERT_PREDICTOR_CKPT=/path/prevhfr_prompt_std_dist_lowrank_w=1280_miss=0.pt \
+#      EXPERT_PREFETCH_WAIT_TIMING=1 CARD=2 PORT=1161 TASKS=gpqa RUN=perf ./v4_target_aisbench.sh
+#
 #    DRY_RUN=1 print the plan only   LIST=1 list dataset configs
 #    MTP=0|1|2  spec decode: off | mtp | dspark
 #
@@ -72,15 +76,25 @@ EXPERT_PREFETCH_NUM="${EXPERT_PREFETCH_NUM:-2}"     # TRANSFER budget: predicted
                                          # loaded per layer per step. Single card only.
 EXPERT_PREFETCH_TOKENS="${EXPERT_PREFETCH_TOKENS:-1}"  # PREDICTION width: token rows the
                                          # predictor runs on. Orthogonal to _NUM.
-# Which prefetch METHOD drives the NON-HASH targets (layers 3..42). "fate" is the engine's
-# built-in hash/gate next-layer predictor and stays the default. "mode2_har" is the trained
-# lowrank head, launched at each MoE layer's first residual clone and run on the prefetch
-# stream in parallel with that layer's attention; it needs EXPERT_PREDICTOR_CKPT.
-# The three HASH-routed targets stay on fate in BOTH cases: their experts come from the
-# tid2eid table indexed by token id, which fate predicts exactly with one index_select and
-# no matmul — strictly better than any learned head can do for those layers.
-EXPERT_PREDICTOR="${EXPERT_PREDICTOR:-fate}"        # fate | mode2_har
+# Which prefetch METHOD drives the targets a trained head COVERS. "fate" is the engine's
+# built-in hash/gate next-layer predictor and stays the default; it also keeps every target
+# a trained head does not own, in every configuration.
+#   fate           targets 1..42, predicted from the post-prepare() MoE input of ell-1
+#   mode2_har      targets 3..42 from each layer's OWN pre-attention residual; fate keeps 1,2
+#   mode2_prevhfr  targets 4..42 from the PREVIOUS layer's post-attention residual, which
+#                  buys a full extra layer of transfer window; fate keeps 1,2,3 — layer 3's
+#                  predecessor was zero-filled in the study's dump, so that head never saw a
+#                  real input and must not be used.
+# The hash-routed targets stay on fate always: their experts come from the tid2eid table
+# indexed by token id, which fate predicts exactly with one index_select and no matmul.
+EXPERT_PREDICTOR="${EXPERT_PREDICTOR:-fate}"        # fate | mode2_har | mode2_prevhfr
 EXPERT_PREDICTOR_CKPT="${EXPERT_PREDICTOR_CKPT:-}"  # e.g. .../har_prompt_std_dist_lowrank_w=1280_miss=0.pt
+# Measure the latency the prefetch path ADDS to the critical path: milliseconds the main
+# compute stream spends blocked at the prefetch join before the on-demand load can start.
+# Device events bracket the join, so the number is correct under graph replay, where no
+# Python runs. Costs two event records per covered layer per step plus 2*num_moe_layers
+# timing events — so a run with this on is NOT a TPOT baseline. Off by default.
+EXPERT_PREFETCH_WAIT_TIMING="${EXPERT_PREFETCH_WAIT_TIMING:-0}"
 CACHE_STATS_LOG_INTERVAL="${CACHE_STATS_LOG_INTERVAL:-}"
 MOE_OFFLOAD_DEBUG="${MOE_OFFLOAD_DEBUG:-0}"      # per-layer trace INSIDE the host
                                          # callback — invalid for any timing run
@@ -285,7 +299,7 @@ NDE_MIN="${NUM_DEVICE_EXPERTS}"
 [[ "${HOT_PRELOAD}" != "1" || -n "${HOT_EXPERTS_FILE}" ]]         || die "HOT_PRELOAD=1 needs HOT_EXPERTS_FILE (a .json)"
 [[ "${PP}" =~ ^[1-9][0-9]*$ ]]                                    || die "PP must be a positive integer"
 [[ "${NCARDS}" == "${WORLD_SIZE}" ]] || die "CARD lists ${NCARDS} device(s) but TP*DP*PP=${WORLD_SIZE}"
-# These four mirror ExpertOffloadConfig._validate_config exactly. The nested key set is
+# These mirror ExpertOffloadConfig._validate_config exactly. The nested key set is
 # CLOSED, so the engine would raise on them anyway — but two minutes into a model load.
 [[ "${H2D_BACKEND}" =~ ^(torch|memfabric)$ ]]                     || die "H2D_BACKEND must be torch or memfabric"
 [[ "${MEMFABRIC_POOL_GIB}" =~ ^[0-9]+$ ]]                         || die "MEMFABRIC_POOL_GIB must be a non-negative integer"
@@ -299,10 +313,10 @@ if [[ "${H2D_BACKEND}" == memfabric ]]; then
     || die "multi-card MemFabric requires SHARD_PER_RANK=true: SHARED mode keeps the host weights sharded
        and shares the POINTERS. Replicated host weights have nothing to publish."
 fi
-# Same contract as the four above: expert_predictor / expert_predictor_ckpt are nested keys
-# in the CLOSED expert_offload_config set, and the engine raises on every one of these — but
-# only after the model has loaded.
-[[ "${EXPERT_PREDICTOR}" =~ ^(fate|mode2_har)$ ]] || die "EXPERT_PREDICTOR must be fate or mode2_har"
+# Same contract as the block above: expert_predictor / expert_predictor_ckpt /
+# expert_prefetch_wait_timing are nested keys in the CLOSED expert_offload_config set, and
+# the engine raises on every one of these — but only after the model has loaded.
+[[ "${EXPERT_PREDICTOR}" =~ ^(fate|mode2_har|mode2_prevhfr)$ ]] || die "EXPERT_PREDICTOR must be fate, mode2_har or mode2_prevhfr"
 if [[ "${EXPERT_PREDICTOR}" != fate ]]; then
   [[ "${OFFLOAD}" == "1" ]] || die "EXPERT_PREDICTOR=${EXPERT_PREDICTOR} with OFFLOAD=0: the whole
        expert_offload_config block is only emitted when OFFLOAD=1, so the key would never reach the
@@ -313,6 +327,12 @@ if [[ "${EXPERT_PREDICTOR}" != fate ]]; then
        EXPERT_PREDICTOR_CKPT (the trained head, e.g. har_prompt_std_dist_lowrank_w=1280_miss=0.pt)."
   [[ -r "${EXPERT_PREDICTOR_CKPT}" ]] || die "EXPERT_PREDICTOR_CKPT not found or unreadable:
        ${EXPERT_PREDICTOR_CKPT}"
+fi
+[[ "${EXPERT_PREFETCH_WAIT_TIMING}" =~ ^[01]$ ]] || die "EXPERT_PREFETCH_WAIT_TIMING must be 0 or 1"
+if [[ "${EXPERT_PREFETCH_WAIT_TIMING}" == "1" ]]; then
+  [[ "${OFFLOAD}" == "1" && "${PREFETCH}" == "1" ]] || die "EXPERT_PREFETCH_WAIT_TIMING=1 needs
+       OFFLOAD=1 and PREFETCH=1: with no prefetch there is no join for the compute stream to
+       block on, so there is nothing to measure."
 fi
 [[ -z "${REMOE_GATE}" || -e "${REMOE_GATE}" ]]                    || die "REMOE_GATE not found: ${REMOE_GATE}"
 # the two DeepSeek-V4-Flash builds have byte-identical config.json apart from
@@ -361,6 +381,7 @@ PY
 # few seconds, rather than reading it out of pred_acc after a benchmark. Only runs for a
 # trained predictor; a fate run does no extra work.
 PREDICTOR_NOTE="off (fate: built-in hash/gate next-layer predictor)"
+FATE_KEEPS=""
 if [[ "${EXPERT_PREDICTOR}" != fate ]]; then
   _geom="$(python3 - "${MODEL}/config.json" 2>/dev/null <<'PY'
 import json, sys
@@ -384,8 +405,9 @@ PY
     [[ "${_p_arch}" == lowrank ]] || die "predictor checkpoint arch='${_p_arch}': the port implements
        'lowrank' only (expert_predictor.py::_ARCH_HEADS). Retrain or extend the registry."
     (( _p_in == _hc * _hid )) || die "predictor in_dim=${_p_in} but the model has hc_mult=${_hc} x
-       hidden_size=${_hid} = $(( _hc * _hid )). The 'har' atom is the FULL hyper-connection residual,
-       so in_dim must equal hc_mult*hidden_size — this checkpoint was trained on a different model."
+       hidden_size=${_hid} = $(( _hc * _hid )). Both the 'har' and 'hfr' atoms are the FULL
+       hyper-connection residual, so in_dim must equal hc_mult*hidden_size — this checkpoint was
+       trained on a different model."
     # The dump either drops the leading hash-routed layers (L = 40) or covers all of them
     # (L = 43). Both are handled at runtime; anything else silently shifts every head onto
     # the wrong layer, which is the one failure this gate exists to catch.
@@ -407,6 +429,13 @@ PY
     _mib=$(( (_p_L * _p_in * _r * 2 + _p_L * _r * _p_w * 2 + _p_L * _p_w * _p_E * 2 \
               + 2 * _p_L * _p_in * 4) / 1048576 ))
     PREDICTOR_NOTE="${EXPERT_PREDICTOR} arch=${_p_arch} L=${_p_L} ${_map} in_dim=${_p_in} width=${_p_w} rank=${_r} E=${_p_E} top_k=${_p_k} head~${_mib}MiB/rank"
+    # A layer-shifted atom cannot cover the first dumped layer — the study zero-filled it
+    # during training — so fate keeps one more target than it does under mode2_har.
+    if [[ "${EXPERT_PREDICTOR}" == mode2_prevhfr ]]; then
+      FATE_KEEPS="targets 1..${_nhash} (hash, exact tid2eid) and target ${_nhash} + 1 (first MoE layer: no predecessor in the dump)"
+    else
+      FATE_KEEPS="targets 1..$(( _nhash - 1 )) (hash, exact tid2eid)"
+    fi
   fi
 fi
 
@@ -692,6 +721,23 @@ report_stats() {
   grep -q 'host callback failed' "${SERVE_LOG}" 2>/dev/null && {
     echo "[stats]  WARNING: expert-offload host callback failures — paging did not complete"
     grep -m3 'host callback failed' "${SERVE_LOG}" | sed 's/^/           /'; }
+  # pf_wait degrades to "no samples" rather than raising, and decode_stats omits
+  # a metric with an empty series entirely — so an absent row looks identical to
+  # a key that never took. These two checks are the only thing that tells them
+  # apart. Runtime signals, so they belong here, after decoding.
+  if [[ "${EXPERT_PREFETCH_WAIT_TIMING}" == "1" ]]; then
+    grep -qE 'elapsed_time (failed|is not usable)' "${SERVE_LOG}" 2>/dev/null && {
+      echo "[stats]  WARNING: prefetch-stall timing failed at runtime — the pf_wait rows are"
+      echo "           ABSENT, not zero. Traceback in serve.log."
+      grep -m2 -E 'elapsed_time (failed|is not usable)' "${SERVE_LOG}" | sed 's/^/           /'; }
+    grep -q 'PREFETCH-WAIT. first sample' "${SERVE_LOG}" 2>/dev/null || {
+      echo "[stats]  WARNING: timing armed but produced NO samples — the pf_wait rows are ABSENT,"
+      echo "           not zero. Read the '[PREFETCH-WAIT] first read' line below:"
+      echo "             armed=0   no layer had a wait node when the first sample was read."
+      echo "                       A prefill between capture and decode can clear every flag."
+      echo "             armed>0   elapsed_time is failing inside the captured graph."
+      grep -m3 'PREFETCH-WAIT' "${SERVE_LOG}" | sed 's/^/           /'; }
+  fi
   return 0
 }
 
@@ -845,6 +891,7 @@ if [[ "${OFFLOAD}" == "1" ]]; then
     p+=",\"expert_predictor\":\"${EXPERT_PREDICTOR}\""
     p+=",\"expert_predictor_ckpt\":\"${EXPERT_PREDICTOR_CKPT}\""
   fi
+  [[ "${EXPERT_PREFETCH_WAIT_TIMING}" == "1" ]] && p+=",\"expert_prefetch_wait_timing\":true"
   if [[ "${EXPERT_SUBSTITUTION}" == "1" ]]; then
     p+=",\"expert_substitution_enabled\":true"
     [[ -n "${EXPERT_SUBSTITUTION_THRESHOLD}" ]] && p+=",\"expert_substitution_threshold\":${EXPERT_SUBSTITUTION_THRESHOLD}"
@@ -949,7 +996,12 @@ echo "  spec    : ${SPEC_METHOD:-off} num_spec_tokens=${NUM_SPEC_TOKENS} decode_
 echo "  offload : ${OFFLOAD} experts=${NUM_DEVICE_EXPERTS} layers=${NUM_DEVICE_LAYERS} lrc=${CACHE_POLICY} prefetch=${PREFETCH}/${EXPERT_PREFETCH_NUM} tokens=${EXPERT_PREFETCH_TOKENS}(eff ${PF_TOK_EFF}) subst=${EXPERT_SUBSTITUTION} multi_card=${ENABLE_MULTI_CARD} debug=${MOE_OFFLOAD_DEBUG}"
 echo "  predict : ${PREDICTOR_NOTE}"
 [[ "${EXPERT_PREDICTOR}" != fate ]] && echo "            ckpt=${EXPERT_PREDICTOR_CKPT}"
-[[ "${EXPERT_PREDICTOR}" != fate ]] && echo "            hash targets stay on fate (exact tid2eid lookup); the head owns the rest"
+[[ -n "${FATE_KEEPS}" ]] && echo "            fate keeps ${FATE_KEEPS}; the head owns the rest"
+echo "  wait-t  : ${EXPERT_PREFETCH_WAIT_TIMING} (prefetch stall on the compute stream -> pf_wait rows)"
+[[ "${EXPERT_PREFETCH_WAIT_TIMING}" == "1" ]] && \
+  echo "  warn    : EXPERT_PREFETCH_WAIT_TIMING=1 adds two device-event records per covered layer per
+            step at the prefetch join — TPOT from this run is NOT a baseline. Use it to attribute
+            latency, then turn it off to report."
 echo "  h2d     : ${H2D_BACKEND}$([[ "${H2D_BACKEND}" == memfabric ]] && echo " pool=${MEMFABRIC_POOL_GIB}GiB/rank (aggregate $(( MEMFABRIC_POOL_GIB * EP_SIZE ))GiB) mode=$([[ "${ENABLE_MULTI_CARD}" == "1" ]] && echo shared || echo local)")"
 echo "  gate    : ${REMOE_GATE:-off (base router)}"
 [[ -n "${REMOE_GATE}" ]] && echo "            build rotation=${MODEL_ROT} (required=${REMOE_GATE_ROT}) — matched"
@@ -976,6 +1028,10 @@ fi
        the tracer table reads all zeros while the run is fine."
 [[ "${GRAPH_ON}" == "1" && "${ASCEND_LAUNCH_BLOCKING:-0}" != "0" ]] && \
   echo "  warn    : ASCEND_LAUNCH_BLOCKING=1 in graph mode — the prefetch stream cannot overlap anything."
+[[ "${EXPERT_PREFETCH_WAIT_TIMING}" == "1" && "${GRAPH_ON}" != "1" ]] && \
+  echo "  note    : wait timing in EAGER measures a stream the prefetch never overlaps, so pf_wait
+            will read near zero for a reason that has nothing to do with the prefetch's cost.
+            The number is only meaningful under graph capture."
 [[ "${OFFLOAD}" == "1" && -z "${QUANTIZATION}" ]] && \
   echo "  note    : QUANTIZATION='' — the engine resolves it from the checkpoint. Only a genuinely
             unquantized model (quant_type NONE) makes OFFLOAD=1 a no-op; the post-health
@@ -1038,7 +1094,7 @@ echo "  repro   : $(for v in CARD PORT TASKS RUN THINK THINK_EFFORT NUM_PROMPTS 
       ENFORCE_EAGER CUDAGRAPH_MODE CUDAGRAPH_CAPTURE_SIZES ENABLE_NPUGRAPH_EX ENABLE_STATIC_KERNEL \
       MTP NUM_SPEC_TOKENS OFFLOAD NUM_DEVICE_EXPERTS NUM_DEVICE_LAYERS TOPK EXPERT_MAP_PATH \
       CACHE_POLICY PREFETCH EXPERT_PREFETCH_NUM EXPERT_PREFETCH_TOKENS EXPERT_PREDICTOR EXPERT_PREDICTOR_CKPT \
-      CACHE_STATS_LOG_INTERVAL MOE_OFFLOAD_DEBUG REMOE_GATE REMOE_GATE_ROT \
+      EXPERT_PREFETCH_WAIT_TIMING CACHE_STATS_LOG_INTERVAL MOE_OFFLOAD_DEBUG REMOE_GATE REMOE_GATE_ROT \
       DECODE_STATS CSV CSV_PATH STATS_FLUSH_EVERY STATS_FLUSH_SECONDS STATS_QUIESCE WAIT HEALTH_GRACE ENGINE_GRACE REAP_WAIT \
       EXPERT_SUBSTITUTION EXPERT_SUBSTITUTION_THRESHOLD HOT_PRELOAD HOT_EXPERTS_FILE \
       ENABLE_MULTI_CARD SHARD_PER_RANK H2D_BACKEND MEMFABRIC_POOL_GIB MEMFABRIC_LOG_LEVEL \
@@ -1194,14 +1250,23 @@ if [[ "${SKIP_SERVE}" != "1" ]]; then
        is measuring the torch copy path under a memfabric label."
   fi
   # A trained predictor announces its geometry once, at offload finalize, and then how many
-  # capture SITES it resolved. sites != the non-hash MoE layer count means the head mapped
-  # onto the wrong layers, or the decoder-layer hook never fired — both silent at runtime.
+  # TARGETS it resolved. A count that is not (non-hash layers - layer_delta) means the head
+  # mapped onto the wrong layers, or the decoder-layer hook never fired — both silent at runtime.
   if [[ "${EXPERT_PREDICTOR}" != fate ]]; then
     grep -o '\[PREFETCH-AI\].*$' "${SERVE_LOG}" | sort -u | sed 's/^/  predict : /'
     grep -q '\[PREFETCH-AI\] armed' "${SERVE_LOG}" \
       || guard "EXPERT_PREDICTOR=${EXPERT_PREDICTOR} but the engine never logged '[PREFETCH-AI] armed' —
        the head did not load, or no decoder layer resolved a capture site. Every prefetch this run
-       makes would come from the built-in fate predictor on the hash targets alone."
+       makes would come from the built-in fate predictor on its own targets alone."
+  fi
+  # The stall timer arms once, at offload finalize — that IS a startup signal.
+  # Whether it produced samples is a RUNTIME question and is checked in
+  # report_stats, after decoding; testing it here fires on every run.
+  if [[ "${EXPERT_PREFETCH_WAIT_TIMING}" == "1" ]]; then
+    grep -o '\[PREFETCH-WAIT\].*$' "${SERVE_LOG}" | sort -u | sed 's/^/  wait-t  : /'
+    grep -q '\[PREFETCH-WAIT\] timing enabled' "${SERVE_LOG}" \
+      || guard "EXPERT_PREFETCH_WAIT_TIMING=1 but the engine never logged
+       '[PREFETCH-WAIT] timing enabled' — the key was not applied and this run measures no stall."
   fi
   if grep -q '\[DECODE-STATS\] config:' "${SERVE_LOG}"; then
     grep -o '\[DECODE-STATS\] \(config\|topology\|armed\|decode\):.*$' "${SERVE_LOG}" | sort -u | sed 's/^/  stats   : /'
@@ -1346,28 +1411,47 @@ exit "${rc}"
 #  TRANSFERRED, and reaches the single-card path only. The prediction is topk-WIDE
 #  regardless, so _NUM=1 does not pin |P| to 1 — it caps |N|.
 #
-#  THE PREFETCH METHOD IS CHOSEN PER TARGET LAYER, NOT PER RUN. EXPERT_PREDICTOR only
-#  selects who drives the NON-HASH targets (layers 3..42). The three hash-routed layers
-#  stay on fate in every configuration, because their experts are tid2eid[token_id] — a
-#  [vocab_size, topk] table lookup, exact and free, which no learned head can improve on.
-#  Two consequences. First, `pf_loads_step / pf_loads` stays 40.0000 with either method:
-#  fate-only covers targets 1..42 (40 non-hash), and mode2_har covers 3..42 plus fate's
-#  1..2 — the same 40 contributing layers, so that ratio remains the cheapest proof that
-#  coverage did not shift. Second, `[PREFETCH-W]` should appear for l=1,2 AND l=3..42, and
-#  never for l=0: nothing precedes layer 0, so it has no prefetch under either method.
+#  THE PREFETCH METHOD IS CHOSEN PER TARGET LAYER, NOT PER RUN. EXPERT_PREDICTOR selects
+#  who drives the targets the trained head COVERS; fate keeps every other target, in every
+#  configuration. That is layers 1-2 under mode2_har, and layers 1-3 under mode2_prevhfr —
+#  a layer-shifted atom has no predecessor at the first covered layer, and the study
+#  zero-filled it during training, so that head never saw a real input. Either way 40
+#  layers contribute, so pf_loads_step / pf_loads stays 40.0000 and remains the cheapest
+#  proof that coverage did not shift. [PREFETCH-W] should appear for l=1,2 (har) or
+#  l=1,2,3 (prevhfr) plus the head's range, and never for l=0: nothing precedes layer 0.
 #
 #  A MISMATCHED PREDICTOR CHECKPOINT FAILS SILENTLY. The head maps checkpoint index h to
 #  MoE layer h + (num_moe_layers - L). If L is neither num_hidden_layers - num_hash_layers
 #  nor num_hidden_layers, every head lands on the wrong layer: no crash, no error, just a
 #  poor pred_acc that reads like a weak model. The geometry gate above settles arch, in_dim
-#  (which must equal hc_mult x hidden_size for the 'har' atom), L and top_k in a few
-#  seconds. It cannot detect a BASIS mismatch — a rotated build preserves every shape and
-#  norm — so serve the head on the build its residuals were dumped from.
+#  (which must equal hc_mult x hidden_size for both the 'har' and 'hfr' atoms), L and top_k
+#  in a few seconds. It cannot detect a BASIS mismatch — a rotated build preserves every
+#  shape and norm — so serve the head on the build its residuals were dumped from.
 #
 #  THE PREDICTOR HEAD IS ~460 MiB PER RANK, out of the same HBM the expert cache lives in
 #  (bf16 Wd dominates: L x hc_mult*hidden x rank x 2 bytes). The plan echo prints the exact
 #  figure. Re-check NUM_DEVICE_EXPERTS after enabling it — a head that costs six experts'
 #  worth of slots can cost more hit rate than it wins.
+#
+#  pf_wait IS THE ONLY NUMBER THAT MEASURES WHAT THE PREFETCH COSTS. Every other prefetch
+#  metric describes what it BUYS (|N&G| avoided, |A|/|P| resident, pred_acc). pf_wait is
+#  the milliseconds the compute stream is blocked at the join before the on-demand load can
+#  start, so pf_wait_step (ms/step) is the additive half of the trade and is directly
+#  comparable to a TPOT delta. It is measured with device events bracketing the join, which
+#  is the only instrument that works under graph replay — no Python runs there, so a host
+#  timer would measure nothing. Two consequences. First, EXPERT_PREFETCH_WAIT_TIMING=1 adds
+#  two event records per covered layer per step, so that run is not a TPOT baseline: read
+#  pf_wait from it, then turn it off and measure TPOT. Second, in EAGER the prefetch never
+#  overlaps anything, so pf_wait reads near zero for a reason unrelated to its cost — the
+#  number is only meaningful under graph capture.
+#
+#  IF pf_wait IS ALL ZEROS OR ALL IDENTICAL, DO NOT BELIEVE IT. Timing events recorded
+#  inside a captured ACL graph are not exercised anywhere else in this tree, so the
+#  mechanism can silently return a constant instead of a per-replay timestamp. The engine
+#  latches the feature off and logs 'elapsed_time unavailable' if the call raises, and
+#  report_stats surfaces that — but a constant is not an error. Confirm by running two
+#  EXPERT_PREFETCH_NUM values: pf_wait must move with the transfer volume. If it does not,
+#  the numbers are not per-replay and the feature is measuring nothing.
 #
 #  READ avg@n ONLY. AISBench de-interleaves the avg@n prediction list with the wrong
 #  stride; avg@n survives as a flat mean, pass@n and cons@n come out as 1-(1-p)^n and p^n.
@@ -1382,8 +1466,8 @@ exit "${rc}"
 #  EAGER TPOT IS NOT A BASELINE FOR GRAPH TPOT. In eager the prefetch callback runs inline
 #  and ends in load_stream.synchronize(), so PREFETCH=1 is SLOWER than PREFETCH=0. Use
 #  eager for accuracy parity — scores must match graph mode exactly — never for latency.
-#  This applies to EXPERT_PREDICTOR=mode2_har too, and more so: its head runs on the
-#  prefetch stream, which only overlaps anything under graph capture.
+#  This applies to both trained methods too, and more so: their heads run on the prefetch
+#  stream, which only overlaps anything under graph capture.
 #
 #  ais_bench EXITS 0 WHEN THE ENGINE IS DEAD: HTTP 500s are responses. engine_died_early()
 #  turns that back into a non-zero rc.
@@ -1404,8 +1488,8 @@ exit "${rc}"
 #  DRAFT MoE LAYERS DO NOT OFFLOAD — the exclusion is a layer-NAME test ("mtp" as a path
 #  component). The post-health moe_layers check proves it held for the drafter in front of
 #  you; DSpark builds its layers with the same prefix, but verify rather than assume. The
-#  trained predictor is excluded from the drafters twice over: by that same test, and by an
-#  is_draft_layer check at decoder-layer construction.
+#  trained predictors are excluded from the drafters twice over: by that same test, and by
+#  an is_draft_layer check at decoder-layer construction.
 #
 #  MODES ARE PER-REQUEST. chat_template_kwargs rides on each request, which is what lets acc
 #  and perf run different modes against one server. A kwarg the template does not declare is

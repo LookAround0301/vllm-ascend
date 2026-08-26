@@ -48,6 +48,8 @@ _METRICS = (
     ("pred_acc",     "demand covered       |P&G|/|G|", "pred_acc",  "mean", True),
     ("pf_in_lrc",    "predicted resident   |A|/|P|",   "pf_in_lrc", "mean", True),
     ("pf_useful",    "prefetch useful    |N&G|/|N|",   "pf_useful", "mean", True),
+    ("pf_wait",      "prefetch stall  ms /layer",      "pf_wait",   "mean", True),
+    ("pf_wait_step", "prefetch stall  ms /step",       "pf_wait",   "sum",  False),
 )
 
 # The per-layer slots a single record_layer() call may fill.
@@ -212,7 +214,8 @@ class DecodeStatsCollector:
     def record_layer(self, layer_idx: int, *, gsize=None, psize=None,
                 hit_post=None, hit_pre=None, loads=None, pf_loads=None,
                 pf_hit=None, pf_waste=None, subst=None, pred_acc=None,
-                pred_prec=None, pf_in_lrc=None, pf_useful=None) -> None:
+                pred_prec=None, pf_in_lrc=None, pf_useful=None,
+                pf_wait=None) -> None:
         """Record one MoE layer's reactive pass within the current decode step.
 
         ``None`` means "no sample for this metric on this layer this step" and is
@@ -239,6 +242,8 @@ class DecodeStatsCollector:
             "pf_hit": pf_hit, "pf_waste": pf_waste,
             "subst": subst, "pred_acc": pred_acc, "pred_prec": pred_prec,
             "pf_in_lrc": pf_in_lrc, "pf_useful": pf_useful,
+            # milliseconds the compute stream was blocked at this layer's prefetch join.
+            "pf_wait": pf_wait,
         }
         # This method runs inside the paging host callback, which blocks its stream until it returns, 
         # so the summary formatting and two file writes were a decode stall that grew
