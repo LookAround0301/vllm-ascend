@@ -29,6 +29,7 @@ from vllm_ascend.ops.fused_moe.experts_selector import (
     commit_expert_substitutions,
     plan_expert_substitutions,
     substitute_experts,
+    substitute_experts_device,
 )
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
@@ -684,6 +685,14 @@ class ExpertOffloadManager:
         self.topk_ids_h = torch.zeros(
             [self.offload_threshold, self.topk],
             dtype=torch.int32, device="cpu", pin_memory=True)
+        # pre-substitution routed ids. Substitution now runs on the NPU
+        # before topk_ids_h is staged, so the host callback can no longer clone
+        # the "before" ids out of topk_ids_h.
+        self.topk_ids_gt_h = None
+        if self.offload_config.expert_substitution_enabled:
+            self.topk_ids_gt_h = torch.zeros(
+                [self.offload_threshold, self.topk],
+                dtype=torch.int32, device="cpu", pin_memory=True)
         self.topk_weights_h = torch.zeros(
             [self.offload_threshold, self.topk],
             dtype=torch.float32, device="cpu", pin_memory=True)
@@ -1873,17 +1882,35 @@ class ExpertOffloadManager:
                 and self.offload_config.cache_router_weight != 0):
             topk_weights_h = self.topk_weights_h[:num_tokens]
             topk_weights_h.copy_(topk_weights.to(dtype=torch.float32), non_blocking=_EXTRA_CTX.capturing)
-        router_logits_h = None
-        correction_bias_h = None
+        # substitution now runs on the NPU
+        # Replaces the router_logits_h / e_score_correction_bias_h staging (an
+        # [n, 256] fp32 D2H per layer per step) and the whole
+        # plan_expert_substitutions Python block
+        topk_ids_gt_h = None
         if do_substitution:
-            router_logits_h = self.router_logits_h[:num_tokens]
-            router_logits_h.copy_(router_logits.to(dtype=torch.float32),
-                                  non_blocking=_EXTRA_CTX.capturing)
-            if e_score_correction_bias is not None:
-                correction_bias_h = self.e_score_correction_bias_h
-                correction_bias_h.copy_(
-                    e_score_correction_bias.to(dtype=torch.float32),
-                    non_blocking=_EXTRA_CTX.capturing)
+            if self.topk_ids_gt_h is not None:
+                # Ground truth G for hit_pre / pred_acc / subst (§3.6), staged
+                # BEFORE the mutation below. Deliberately NOT gated on
+                # stats.collecting the way the old host clone was: this line is
+                # captured, so a branch on a flag that flips at arming time
+                # would be frozen to whatever it was at capture. 72 bytes.
+                topk_ids_gt_h = self.topk_ids_gt_h[:num_tokens]
+                topk_ids_gt_h.copy_(topk_ids[:, :self.topk],
+                                    non_blocking=_EXTRA_CTX.capturing)
+            substituted_ids = substitute_experts_device(
+                router_logits,
+                topk_ids[:, :self.topk],
+                log2phy,
+                expert_substitution_threshold=(
+                    self.offload_config.expert_substitution_threshold),
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+            )
+            # In-place so every downstream consumer (log2phy gather, dispatch,
+            # GMM) sees the substituted ids. The previous code mutated this
+            # same tensor the same way, just after the callback instead of
+            # before. Same stream, so the gt D2H above reads pre-mutation.
+            topk_ids[:, :self.topk].copy_(substituted_ids)
         log2phy_h = self.log2phy_h
         log2phy_np = self.log2phy_np
         topk_ids_h.copy_(topk_ids, non_blocking=_EXTRA_CTX.capturing)
@@ -1895,6 +1922,10 @@ class ExpertOffloadManager:
             torch_npu.npu._subscribe_report(current_compute_stream)
             subscribed_compute_streams.add(current_compute_stream)
         self._is_prefetch = False
+        # router_logits_h / scoring_func / correction_bias_h
+        # are gone (the callback no longer substitutes); topk_ids_gt_h carries
+        # the pre-substitution ids the statistics need. The 6-tuple prefetch
+        # form built by _build_prefetch_call is unchanged.
         args = (
             topk_ids_h,
             log2phy_np,
@@ -1903,9 +1934,7 @@ class ExpertOffloadManager:
             topk_weights_h,
             self._is_prefetch,
             do_substitution,
-            router_logits_h,
-            scoring_func,
-            correction_bias_h,
+            topk_ids_gt_h,
         )
         # launch the guarded wrapper — see _note_cb_failure.
         if _EXTRA_CTX.capturing:
@@ -1917,11 +1946,10 @@ class ExpertOffloadManager:
         else:
             self._update_weights_guarded(args)
 
-        if do_substitution:
-            topk_ids[:, :self.topk].copy_(topk_ids_h[:, :self.topk],
-                                          non_blocking=True)
+        # The substituted ids were written into topk_ids on the device above,
+        # so this H2D write-back has nothing left to publish.
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
-        
+
         # dispatch a layer-shifted predictor's prediction for the NEXT
         # layer here, behind an event recorded after this layer's on-demand
         # load. No-op for fate and mode2_har.
@@ -2979,17 +3007,18 @@ class ExpertOffloadManager:
             self._note_cb_failure("update_weights_multi_card")
 
     def _update_weights(self, args):
+        # the reactive form is now an 8-tuple — substitution moved to
+        # the device in update_weights, so router_logits_h / scoring_func /
+        # correction_bias_h are no longer passed, and topk_ids_gt_h carries the
+        # pre-substitution ids. The 6-element prefetch form is unchanged.
         if len(args) == 6:
             (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
              is_prefetch) = args
             do_substitution = False
-            router_logits_h = None
-            scoring_func = "softmax"
-            correction_bias_h = None
+            topk_ids_gt_h = None
         else:
             (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
-             is_prefetch, do_substitution, router_logits_h, scoring_func,
-             correction_bias_h) = args
+             is_prefetch, do_substitution, topk_ids_gt_h) = args
         # resolve the collector once per call. `collecting` is False during
         # profile_run, warmups and graph capture, and is re-read on every graph
         # replay because this is a plain attribute read inside the callback body
@@ -2998,36 +3027,16 @@ class ExpertOffloadManager:
                                 and self._stats.collecting) else None
         gt_ids = None      # pre-substitution routed set, the ground truth
         subst_count = 0.0
-        if do_substitution:
-            # Was cloned only under _debug. The pre-substitution ids are
-            # now also the ground truth G for the prefetch-accuracy fractions
-            # and the denominator of the pre-substitution hit rate, so clone
-            # whenever either consumer is active. Note the cache policy still
-            # observes the SUBSTITUTED ids below
-            original_ids = (
-                topk_ids_h[:, :self.topk].clone()
-                if (self._debug or stats is not None) else None
-            )
-            substituted_ids = substitute_experts(
-                router_logits_h,
-                topk_ids_h[:, :self.topk],
-                torch.from_numpy(log2phy_np),
-                expert_substitution_threshold=(
-                    self.offload_config.expert_substitution_threshold),
-                scoring_func=scoring_func,
-                e_score_correction_bias=correction_bias_h,
-            )
-            if original_ids is not None:
-                # Guard on _debug explicitly. original_ids can now be
-                # non-None with debug off, and this log must stay debug-only.
-                if self._debug:
-                    self._log_expert_substitution(
-                        layer_idx, original_ids, substituted_ids)
-                if stats is not None:
-                    gt_ids = set(original_ids.reshape(-1).tolist())
-                    subst_count = float((original_ids != substituted_ids).sum())
-                    
-            topk_ids_h[:, :self.topk].copy_(substituted_ids)
+        # substitution already happened on the NPU before this callback
+        # was launched, so all that remains is reading two [n, topk] int32
+        # pinned buffers
+        if do_substitution and topk_ids_gt_h is not None:
+            if self._debug:
+                self._log_expert_substitution(
+                    layer_idx, topk_ids_gt_h, topk_ids_h)
+            if stats is not None:
+                gt_ids = set(topk_ids_gt_h.reshape(-1).tolist())
+                subst_count = float((topk_ids_gt_h != topk_ids_h).sum())
         with torch_npu.npu.stream(self.load_stream):
             # Hotness observation only on the reactive (non-prefetch) H2D path
             # with LRC policy enabled.
