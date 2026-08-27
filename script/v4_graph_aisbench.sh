@@ -29,20 +29,20 @@
 set -uo pipefail
 
 # ── server ───────────────────────────────────────────────────────────────────
-MODEL="${MODEL:-/mnt/data/models/DeepSeek-V4-Flash}"
-SERVED_NAME="${SERVED_NAME:-A5-deepseekv4-flash-w4a8}"
-TOKENIZER="${TOKENIZER:-/home/keyi/llms/benchmarks/dsv4-tokenizer}"
-AIS_BENCH_DATASETS_CACHE="${AIS_BENCH_DATASETS_CACHE-/home/keyi/llms/benchmarks}"
+MODEL="${MODEL:-}"
+SERVED_NAME="${SERVED_NAME:-}"
+TOKENIZER="${TOKENIZER:-}"
+AIS_BENCH_DATASETS_CACHE="${AIS_BENCH_DATASETS_CACHE-}"
 REMOE_GATE="${REMOE_GATE:-}"                # fine-tuned MoE router gates, swapped in at load
 REMOE_GATE_ROT="${REMOE_GATE_ROT:-quarot}"  # the rotation the REMOE_GATE checkpoints were fine-tuned against
 CARD="${CARD:-6}"; PORT="${PORT:-7001}"
 TP="${TP:-1}"; DP="${DP:-1}"; PP="${PP:-1}"   # EP spans TP*DP; the card list must be TP*DP*PP
 SEED="${SEED:-1024}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"       # empty = the checkpoint's own
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
-QUANTIZATION="${QUANTIZATION-}"          # non-empty -> --quantization <v>; empty -> flag
+QUANTIZATION="${QUANTIZATION-ascend}"          # non-empty -> --quantization <v>; empty -> flag
                                          # omitted, engine resolves it from the checkpoint.
                                          # That is ALL this variable does.
 API_SERVER_COUNT="${API_SERVER_COUNT:-1}"
@@ -66,8 +66,8 @@ NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-2}"
 
 # ── MoE offload ──────────────────────────────────────────────────────────────
 OFFLOAD="${OFFLOAD:-1}"
-NUM_DEVICE_EXPERTS="${NUM_DEVICE_EXPERTS:-60}"   # int, or a JSON list "[60,60,...]"
-NUM_DEVICE_LAYERS="${NUM_DEVICE_LAYERS:-2}"
+NUM_DEVICE_EXPERTS="${NUM_DEVICE_EXPERTS:-36}"   # int, or a JSON list "[60,60,...]"
+NUM_DEVICE_LAYERS="${NUM_DEVICE_LAYERS:-1}"
 TOPK="${TOPK:-6}"                        # overridden from the checkpoint config below
 EXPERT_MAP_PATH="${EXPERT_MAP_PATH:-}"
 CACHE_POLICY="${CACHE_POLICY:-1}"        # 1 = LRC, required by prefetch
