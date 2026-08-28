@@ -54,6 +54,52 @@ class AscendConfig:
         expert_offload_config = additional_config.get("expert_offload_config", {})
         self.expert_offload_config = ExpertOffloadConfig(expert_offload_config)
 
+        # ReMoE router-gate override
+        self.moe_gate_override_path = additional_config.get("moe_gate_override_path", None)
+        if self.moe_gate_override_path is not None and not isinstance(self.moe_gate_override_path, str):
+            raise TypeError(
+                "moe_gate_override_path must be a string or null, got "
+                f"{type(self.moe_gate_override_path).__name__}"
+            )
+        logger.info("[GATE-OVERRIDE] config: moe_gate_override_path=%s", self.moe_gate_override_path)
+        
+        # decode-time statistics
+        self.decode_stats_enabled = additional_config.get("decode_stats_enabled", True)
+        self.decode_stats_csv = additional_config.get("decode_stats_csv", False)
+        self.decode_stats_path = additional_config.get("decode_stats_path",
+                additional_config.get("decode_stats_csv_path", None))
+        self.decode_stats_flush_every = additional_config.get("decode_stats_flush_every", 500)
+        # wall-clock flush interval, in seconds
+        self.decode_stats_flush_seconds = additional_config.get("decode_stats_flush_seconds", 60.0)
+        if not isinstance(self.decode_stats_enabled, bool):
+            raise TypeError(
+                "decode_stats_enabled must be a boolean, got "
+                f"{type(self.decode_stats_enabled).__name__}")
+        if not isinstance(self.decode_stats_csv, bool):
+            raise TypeError(
+                "decode_stats_csv must be a boolean, got "
+                f"{type(self.decode_stats_csv).__name__}")
+        if self.decode_stats_path is not None and not isinstance(self.decode_stats_path, str):
+            raise TypeError(
+                "decode_stats_path must be a string or null, got "
+                f"{type(self.decode_stats_path).__name__}")
+        if not isinstance(self.decode_stats_flush_every, int) or self.decode_stats_flush_every < 1:
+            raise ValueError(
+                "decode_stats_flush_every must be an integer >= 1, got "
+                f"{self.decode_stats_flush_every!r}")
+        if (not isinstance(self.decode_stats_flush_seconds, (int, float))
+                or isinstance(self.decode_stats_flush_seconds, bool)
+                or self.decode_stats_flush_seconds <= 0):
+            raise ValueError(
+                "decode_stats_flush_seconds must be a positive number, got "
+                f"{self.decode_stats_flush_seconds!r}")
+        self.decode_stats_flush_seconds = float(self.decode_stats_flush_seconds)
+        logger.info(
+            "[DECODE-STATS] config: enabled=%s csv=%s path=%s flush_every=%s flush_seconds=%s",
+            self.decode_stats_enabled, self.decode_stats_csv,
+            self.decode_stats_path, self.decode_stats_flush_every,
+            self.decode_stats_flush_seconds)
+
         self.scheduler_config = SchedulerConfig(
             additional_config,
             balance_env_value=ascend_envs.VLLM_ASCEND_BALANCE_SCHEDULING,
@@ -962,17 +1008,27 @@ class ExpertOffloadConfig:
         "moe_offload_debug": False,
         "expert_prefetch_enabled": False,
         "expert_prefetch_num": 2,
+        # How many token rows of the forward the next-layer predictor runs on
+        "expert_prefetch_tokens": 1,
         "shard_per_rank": True,
         "enable_multi_card": False,
         "hot_expert_preload": False,
         "hot_experts_file": "",
         "expert_substitution_enabled": False,
-        "expert_substitution_threshold": 0.25,
+        "expert_substitution_threshold": 0.02,
         # Expert weight H2D backend. MemFabric selects LOCAL for single-card
         # and SHARED DRAM for multi-card expert offload.
         "h2d_backend": "torch",  # Options: "torch", "memfabric"
         "memfabric_pool_size_gib": 0,
         "memfabric_log_level": 3,
+        # which prefetch METHOD drives the NON-HASH targets.
+        # "fate" == the existing hard-wired predictor driven from the four MoE
+        # apply() sites. Any other name selects a trained head from
+        # expert_predictor.py's registry, driven from the decoder layer
+        "expert_predictor": "fate",
+        "expert_predictor_ckpt": None,
+        # Measure the stall the prefetch path adds to the compute stream
+        "expert_prefetch_wait_timing": False,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -1131,6 +1187,15 @@ class ExpertOffloadConfig:
             raise ValueError(
                 f"expert_prefetch_num must >= 1; "
                 f"got {self.config['expert_prefetch_num']} instead")
+        # No upper bound here: the ceiling is the forward's token count
+        if not isinstance(self.config["expert_prefetch_tokens"], int):
+            raise TypeError("expert_prefetch_tokens must be an integer")
+        if self.config["expert_prefetch_tokens"] < 1:
+            raise ValueError(
+                f"expert_prefetch_tokens must >= 1; "
+                f"got {self.config['expert_prefetch_tokens']} instead")
+        if not isinstance(self.config["enable_multi_card"], bool):
+            raise TypeError("enable_multi_card must be a boolean")
         if not isinstance(self.config["enable_multi_card"], bool):
             raise TypeError("enable_multi_card must be a boolean")
         if self.config["h2d_backend"] not in ("torch", "memfabric"):
@@ -1161,6 +1226,42 @@ class ExpertOffloadConfig:
             raise TypeError("expert_substitution_threshold must be a number")
         if self.config["expert_substitution_threshold"] < 0:
             raise ValueError("expert_substitution_threshold must be >= 0")
+        # Validate the prefetch method against the expert predictor's registry
+        from vllm_ascend.expert_offload.expert_predictor import (
+            valid_predictor_names)
+        predictor = self.config["expert_predictor"]
+        if not isinstance(predictor, str):
+            raise TypeError("expert_predictor must be a string")
+        if predictor not in valid_predictor_names():
+            raise ValueError(
+                f"unknown expert_predictor {predictor!r}; valid names: "
+                f"{valid_predictor_names()}")
+        ckpt = self.config["expert_predictor_ckpt"]
+        if ckpt is not None and not isinstance(ckpt, str):
+            raise TypeError("expert_predictor_ckpt must be a string or null")
+        if predictor != "fate":
+            # A trained head is useless without its weights, and useless
+            # without the prefetch pipeline it drives. Both are startup errors,
+            # not runtime degradations.
+            if not ckpt:
+                raise ValueError(
+                    f"expert_predictor={predictor!r} requires "
+                    "expert_predictor_ckpt")
+            if not (os.path.exists(ckpt) and os.access(ckpt, os.R_OK)):
+                raise ValueError(
+                    f"expert_predictor_ckpt not found or unreadable: {ckpt}")
+            if not self.config["expert_prefetch_enabled"]:
+                raise ValueError(
+                    f"expert_predictor={predictor!r} requires "
+                    "expert_prefetch_enabled=true")
+        if not isinstance(self.config["expert_prefetch_wait_timing"], bool):
+            raise TypeError("expert_prefetch_wait_timing must be a boolean")
+        if (self.config["expert_prefetch_wait_timing"]
+                and not self.config["expert_prefetch_enabled"]):
+            raise ValueError(
+                "expert_prefetch_wait_timing=true requires "
+                "expert_prefetch_enabled=true: with no prefetch there is no "
+                "join to measure")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

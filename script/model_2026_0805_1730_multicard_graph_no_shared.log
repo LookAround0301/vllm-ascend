@@ -1,0 +1,1183 @@
+performance
+vm.swappiness = 0
+kernel.numa_balancing = 0
+sysctl: cannot stat /proc/sys/kernel/sched_migration_cost_ns: No such file or directory
+INFO 08-06 15:08:40 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 08-06 15:08:40 [__init__.py:54] - ascend -> vllm_ascend:register
+INFO 08-06 15:08:40 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 08-06 15:08:40 [__init__.py:237] Platform plugin ascend is activated
+INFO 08-06 15:08:40 [platform.py:61] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+INFO 08-06 15:08:44 [__init__.py:112] Registered model loader `<class 'vllm_ascend.model_loader.netloader.netloader.ModelNetLoaderElastic'>` with load format `netloader`
+INFO 08-06 15:08:44 [__init__.py:112] Registered model loader `<class 'vllm_ascend.model_loader.rfork.rfork_loader.RForkModelLoader'>` with load format `rfork`
+(APIServer pid=177212) INFO 08-06 15:08:44 [api_utils.py:345] 
+(APIServer pid=177212) INFO 08-06 15:08:44 [api_utils.py:345]        █     █     █▄   ▄█
+(APIServer pid=177212) INFO 08-06 15:08:44 [api_utils.py:345]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.26.1.dev0+g568afb3a1.d20260801
+(APIServer pid=177212) INFO 08-06 15:08:44 [api_utils.py:345]   █▄█▀ █     █     █     █  model   /home/g00955623/weights/DeepSeek-V4-Flash
+(APIServer pid=177212) INFO 08-06 15:08:44 [api_utils.py:345]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+(APIServer pid=177212) INFO 08-06 15:08:44 [api_utils.py:345] 
+(APIServer pid=177212) INFO 08-06 15:08:44 [api_utils.py:273] non-default args: {'model_tag': '/home/g00955623/weights/DeepSeek-V4-Flash', 'enable_auto_tool_choice': True, 'tool_call_parser': 'deepseek_v4', 'host': '0.0.0.0', 'port': 8150, 'model': '/home/g00955623/weights/DeepSeek-V4-Flash', 'tokenizer_mode': 'deepseek_v4', 'trust_remote_code': True, 'seed': 1024, 'max_model_len': 150000, 'served_model_name': ['glm-5'], 'safetensors_load_strategy': 'prefetch', 'reasoning_parser': 'deepseek_v4', 'data_parallel_size': 2, 'enable_expert_parallel': True, 'gpu_memory_utilization': 0.95, 'enable_prefix_caching': True, 'max_num_batched_tokens': 8192, 'max_num_seqs': 1, 'enable_chunked_prefill': True, 'speculative_config': {'num_speculative_tokens': 3, 'method': 'mtp', 'enforce_eager': True}, 'compilation_config': {'mode': None, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'vllm_ascend.compilation.compiler_interface.AscendCompiler', 'custom_ops': [], 'ir_enable_torch_wrap': None, 'splitting_ops': None, 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': None, 'compile_ranges_endpoints': None, 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_DECODE_ONLY: (2, 0)>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [1, 2, 4], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': None, 'pass_config': {}, 'max_cudagraph_capture_size': None, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': None, 'static_all_moe_layers': []}, 'additional_config': {'multistream_overlap_shared_expert': False, 'enable_cpu_binding': True, 'expert_offload_config': {'expert_offload': True, 'enable_multi_card': True, 'shard_per_rank': False, 'num_device_experts': 24, 'num_device_layers': 2, 'cache_policy_enabled': True, 'expert_prefetch_enabled': True, 'expert_prefetch_num': 1, 'hot_expert_preload': False, 'hot_experts_file': 'expert_rank_gsm8k.json', 'expert_substitution_enabled': True, 'expert_substitution_threshold': 0.25, 'moe_offload_debug': True}}, 'aggregate_engine_logging': True}
+(APIServer pid=177212) WARNING 08-06 15:08:44 [envs.py:2096] Unknown vLLM environment variable detected: VLLM_VERSION
+(APIServer pid=177212) WARNING 08-06 15:08:44 [envs.py:2096] Unknown vLLM environment variable detected: VLLM_ASCEND_ENABLE_NZ
+(APIServer pid=177212) WARNING 08-06 15:08:44 [envs.py:2096] Unknown vLLM environment variable detected: VLLM_ASCEND_ENABLE_FUSED_MC2
+(APIServer pid=177212) WARNING 08-06 15:08:44 [envs.py:2096] Unknown vLLM environment variable detected: VLLM_RPC_TIMEOUT
+(APIServer pid=177212) WARNING 08-06 15:08:44 [envs.py:2096] Unknown vLLM environment variable detected: VLLM_USE_V1
+(APIServer pid=177212) INFO 08-06 15:08:44 [config.py:776] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+(APIServer pid=177212) INFO 08-06 15:08:44 [model.py:623] Resolved architecture: DeepseekV4ForCausalLM
+(APIServer pid=177212) INFO 08-06 15:08:44 [model.py:1788] Using max model len 150000
+(APIServer pid=177212) INFO 08-06 15:08:44 [model.py:623] Resolved architecture: DeepSeekV4MTPModel
+(APIServer pid=177212) INFO 08-06 15:08:44 [model.py:1788] Using max model len 1048576
+(APIServer pid=177212) WARNING 08-06 15:08:44 [speculative.py:901] Enabling num_speculative_tokens > 1 will run multiple times of forward on same MTP layer,which may result in lower acceptance rate
+(APIServer pid=177212) INFO 08-06 15:08:44 [speculative.py:1126] Overriding draft model max model len from 1048576 to 150000
+(APIServer pid=177212) INFO 08-06 15:08:44 [scheduler.py:252] Chunked prefill is enabled with max_num_batched_tokens=8192.
+(APIServer pid=177212) INFO 08-06 15:08:44 [vllm.py:1109] Asynchronous scheduling is enabled.
+(APIServer pid=177212) INFO 08-06 15:08:44 [vllm.py:1119] Disabling NCCL for DP synchronization when using async scheduling.
+(APIServer pid=177212) INFO 08-06 15:08:44 [vllm.py:1197] Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out.
+(APIServer pid=177212) INFO 08-06 15:08:44 [kernel.py:295] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+(APIServer pid=177212) WARNING 08-06 15:08:44 [platform.py:1047] GPU-specific parameter is not supported on Ascend. parameter=disable_cascade_attn, value=True, action: resetting to False.
+(APIServer pid=177212) WARNING 08-06 15:08:44 [platform.py:1105] Speculative quantization is set but Ascend automatically uses the main model's quantization method. parameter=quantization, action: resetting to None. 
+(APIServer pid=177212) INFO 08-06 15:08:44 [ascend_config.py:837] Dynamic EPLB is False
+(APIServer pid=177212) INFO 08-06 15:08:44 [ascend_config.py:838] The number of redundant experts is 0
+(APIServer pid=177212) INFO 08-06 15:08:44 [ascend_config.py:301] AscendConfig.enable_fused_mc2 falls back to environment variable VLLM_ASCEND_ENABLE_FUSED_MC2 with value 0. Please use additional_config.enable_fused_mc2 instead, because VLLM_ASCEND_ENABLE_FUSED_MC2 will be removed in the next release.
+(APIServer pid=177212) INFO 08-06 15:08:44 [ascend_config.py:301] AscendConfig.weight_nz_mode falls back to environment variable VLLM_ASCEND_ENABLE_NZ with value 1. Please use additional_config.weight_nz_mode instead, because VLLM_ASCEND_ENABLE_NZ will be removed in the next release.
+(APIServer pid=177212) WARNING 08-06 15:08:44 [utils.py:1254] For deepseek_v4 model, block size should be 32, 64 or 128. Setting block size to 32 for better performance.
+(APIServer pid=177212) INFO 08-06 15:08:44 [platform.py:771] Set PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+(APIServer pid=177212) INFO 08-06 15:08:44 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+INFO 08-06 15:08:49 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 08-06 15:08:49 [__init__.py:54] - ascend -> vllm_ascend:register
+INFO 08-06 15:08:49 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 08-06 15:08:49 [__init__.py:237] Platform plugin ascend is activated
+INFO 08-06 15:08:49 [platform.py:61] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+(APIServer pid=177212) INFO 08-06 15:08:51 [utils.py:1127] Started DP Coordinator process (PID: 177538)
+INFO 08-06 15:08:56 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 08-06 15:08:56 [__init__.py:54] - ascend -> vllm_ascend:register
+INFO 08-06 15:08:56 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 08-06 15:08:56 [__init__.py:237] Platform plugin ascend is activated
+INFO 08-06 15:08:56 [platform.py:61] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+INFO 08-06 15:08:57 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 08-06 15:08:57 [__init__.py:54] - ascend -> vllm_ascend:register
+INFO 08-06 15:08:57 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 08-06 15:08:57 [__init__.py:237] Platform plugin ascend is activated
+INFO 08-06 15:08:57 [platform.py:61] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+(EngineCore_DP0 pid=177596) INFO 08-06 15:09:01 [__init__.py:112] Registered model loader `<class 'vllm_ascend.model_loader.netloader.netloader.ModelNetLoaderElastic'>` with load format `netloader`
+(EngineCore_DP1 pid=177597) INFO 08-06 15:09:01 [__init__.py:112] Registered model loader `<class 'vllm_ascend.model_loader.netloader.netloader.ModelNetLoaderElastic'>` with load format `netloader`
+(EngineCore_DP0 pid=177596) INFO 08-06 15:09:01 [__init__.py:112] Registered model loader `<class 'vllm_ascend.model_loader.rfork.rfork_loader.RForkModelLoader'>` with load format `rfork`
+(EngineCore_DP0 pid=177596) INFO 08-06 15:09:01 [core.py:116] Initializing a V1 LLM engine (v0.26.1.dev0+g568afb3a1.d20260801) with config: model='/home/g00955623/weights/DeepSeek-V4-Flash', speculative_config=SpeculativeConfig(method='mtp', model='/home/g00955623/weights/DeepSeek-V4-Flash', num_spec_tokens=3), tokenizer='/home/g00955623/weights/DeepSeek-V4-Flash', skip_tokenizer_init=False, tokenizer_mode=deepseek_v4, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=150000, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=2, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=True, quantization=fp8, quantization_config=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=bfloat16, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='deepseek_v4', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=1024, served_model_name=glm-5, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'vllm_ascend.compilation.compiler_interface.AscendCompiler', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_DECODE_ONLY: (2, 0)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 4, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+(EngineCore_DP0 pid=177596) INFO 08-06 15:09:01 [multiproc_executor.py:140] DP group leader: node_rank=0, node_rank_within_dp=0, master_addr=127.0.0.1, mq_connect_ip=90.90.93.34 (local), world_size=1, local_world_size=1
+(EngineCore_DP1 pid=177597) INFO 08-06 15:09:01 [__init__.py:112] Registered model loader `<class 'vllm_ascend.model_loader.rfork.rfork_loader.RForkModelLoader'>` with load format `rfork`
+(EngineCore_DP1 pid=177597) INFO 08-06 15:09:01 [multiproc_executor.py:140] DP group leader: node_rank=0, node_rank_within_dp=0, master_addr=127.0.0.1, mq_connect_ip=90.90.93.34 (local), world_size=1, local_world_size=1
+INFO 08-06 15:09:06 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 08-06 15:09:06 [__init__.py:54] - ascend -> vllm_ascend:register
+INFO 08-06 15:09:06 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 08-06 15:09:06 [__init__.py:237] Platform plugin ascend is activated
+INFO 08-06 15:09:06 [platform.py:61] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+INFO 08-06 15:09:06 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 08-06 15:09:06 [__init__.py:54] - ascend -> vllm_ascend:register
+INFO 08-06 15:09:06 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 08-06 15:09:06 [__init__.py:237] Platform plugin ascend is activated
+INFO 08-06 15:09:06 [platform.py:61] Breakable cudagraph is force disabled on Ascend because DeepSeek V4 PIECEWISE cudagraph is not supported yet.
+INFO 08-06 15:09:09 [__init__.py:112] Registered model loader `<class 'vllm_ascend.model_loader.netloader.netloader.ModelNetLoaderElastic'>` with load format `netloader`
+INFO 08-06 15:09:09 [__init__.py:112] Registered model loader `<class 'vllm_ascend.model_loader.rfork.rfork_loader.RForkModelLoader'>` with load format `rfork`
+INFO 08-06 15:09:09 [__init__.py:112] Registered model loader `<class 'vllm_ascend.model_loader.netloader.netloader.ModelNetLoaderElastic'>` with load format `netloader`
+INFO 08-06 15:09:09 [__init__.py:112] Registered model loader `<class 'vllm_ascend.model_loader.rfork.rfork_loader.RForkModelLoader'>` with load format `rfork`
+[W806 15:09:10.665178713 OptionRegister.cpp:95] Warning: Current device only support allow_internal_format=False, the requested value True is invalid and has been reverted to False. (function operator())
+INFO 08-06 15:09:10 [ascend_config.py:837] Dynamic EPLB is False
+INFO 08-06 15:09:10 [ascend_config.py:838] The number of redundant experts is 0
+INFO 08-06 15:09:10 [ascend_config.py:301] AscendConfig.enable_fused_mc2 falls back to environment variable VLLM_ASCEND_ENABLE_FUSED_MC2 with value 0. Please use additional_config.enable_fused_mc2 instead, because VLLM_ASCEND_ENABLE_FUSED_MC2 will be removed in the next release.
+INFO 08-06 15:09:10 [ascend_config.py:301] AscendConfig.weight_nz_mode falls back to environment variable VLLM_ASCEND_ENABLE_NZ with value 1. Please use additional_config.weight_nz_mode instead, because VLLM_ASCEND_ENABLE_NZ will be removed in the next release.
+[W806 15:09:10.836416408 OptionRegister.cpp:95] Warning: Current device only support allow_internal_format=False, the requested value True is invalid and has been reverted to False. (function operator())
+INFO 08-06 15:09:10 [ascend_config.py:837] Dynamic EPLB is False
+INFO 08-06 15:09:10 [ascend_config.py:838] The number of redundant experts is 0
+INFO 08-06 15:09:10 [ascend_config.py:301] AscendConfig.enable_fused_mc2 falls back to environment variable VLLM_ASCEND_ENABLE_FUSED_MC2 with value 0. Please use additional_config.enable_fused_mc2 instead, because VLLM_ASCEND_ENABLE_FUSED_MC2 will be removed in the next release.
+INFO 08-06 15:09:10 [ascend_config.py:301] AscendConfig.weight_nz_mode falls back to environment variable VLLM_ASCEND_ENABLE_NZ with value 1. Please use additional_config.weight_nz_mode instead, because VLLM_ASCEND_ENABLE_NZ will be removed in the next release.
+(Worker pid=177736) INFO 08-06 15:09:12 [parallel_state.py:1615] world_size=2 rank=1 local_rank=0 distributed_init_method=tcp://127.0.0.1:44499 backend=hccl
+(Worker pid=177735) INFO 08-06 15:09:13 [parallel_state.py:1615] world_size=2 rank=0 local_rank=0 distributed_init_method=tcp://127.0.0.1:44499 backend=hccl
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+(Worker pid=177735) INFO 08-06 15:09:13 [parallel_state.py:1946] rank 0 in world size 2 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+(Worker pid=177736) INFO 08-06 15:09:13 [parallel_state.py:1946] rank 1 in world size 2 is assigned as DP rank 1, PP rank 0, PCP rank 0, TP rank 0, EP rank 1, EPLB rank N/A
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+(Worker pid=177735) WARNING 08-06 15:09:13 [__init__.py:204] min_p and logit_bias parameters won't work with speculative decoding.
+(Worker pid=177736) WARNING 08-06 15:09:13 [__init__.py:204] min_p and logit_bias parameters won't work with speculative decoding.
+(Worker pid=177736) WARNING 08-06 15:09:13 [__init__.py:204] min_p and logit_bias parameters won't work with speculative decoding.
+(Worker pid=177735) WARNING 08-06 15:09:13 [__init__.py:204] min_p and logit_bias parameters won't work with speculative decoding.
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:13 [model_runner_v1.py:3468] Starting to load model /home/g00955623/weights/DeepSeek-V4-Flash...
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:13 [model_runner_v1.py:3468] Starting to load model /home/g00955623/weights/DeepSeek-V4-Flash...
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:14 [fp8_config.py:50] Using the vLLM Ascend fp8 Quantization now!
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:14 [fp8_config.py:50] Using the vLLM Ascend fp8 Quantization now!
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:14 [expert_map_manager.py:245] [EP Rank 0/2] Expert parallelism is enabled. Expert placement strategy: linear. Local/global number of experts: 128/256. Experts local to global index map: 0->0, 1->1, 2->2, 3->3, 4->4, 5->5, 6->6, 7->7, 8->8, 9->9, 10->10, 11->11, 12->12, 13->13, 14->14, 15->15, 16->16, 17->17, 18->18, 19->19, 20->20, 21->21, 22->22, 23->23, 24->24, 25->25, 26->26, 27->27, 28->28, 29->29, 30->30, 31->31, 32->32, 33->33, 34->34, 35->35, 36->36, 37->37, 38->38, 39->39, 40->40, 41->41, 42->42, 43->43, 44->44, 45->45, 46->46, 47->47, 48->48, 49->49, 50->50, 51->51, 52->52, 53->53, 54->54, 55->55, 56->56, 57->57, 58->58, 59->59, 60->60, 61->61, 62->62, 63->63, 64->64, 65->65, 66->66, 67->67, 68->68, 69->69, 70->70, 71->71, 72->72, 73->73, 74->74, 75->75, 76->76, 77->77, 78->78, 79->79, 80->80, 81->81, 82->82, 83->83, 84->84, 85->85, 86->86, 87->87, 88->88, 89->89, 90->90, 91->91, 92->92, 93->93, 94->94, 95->95, 96->96, 97->97, 98->98, 99->99, 100->100, 101->101, 102->102, 103->103, 104->104, 105->105, 106->106, 107->107, 108->108, 109->109, 110->110, 111->111, 112->112, 113->113, 114->114, 115->115, 116->116, 117->117, 118->118, 119->119, 120->120, 121->121, 122->122, 123->123, 124->124, 125->125, 126->126, 127->127.
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:14 [expert_map_manager.py:245] [EP Rank 1/2] Expert parallelism is enabled. Expert placement strategy: linear. Local/global number of experts: 128/256. Experts local to global index map: 0->128, 1->129, 2->130, 3->131, 4->132, 5->133, 6->134, 7->135, 8->136, 9->137, 10->138, 11->139, 12->140, 13->141, 14->142, 15->143, 16->144, 17->145, 18->146, 19->147, 20->148, 21->149, 22->150, 23->151, 24->152, 25->153, 26->154, 27->155, 28->156, 29->157, 30->158, 31->159, 32->160, 33->161, 34->162, 35->163, 36->164, 37->165, 38->166, 39->167, 40->168, 41->169, 42->170, 43->171, 44->172, 45->173, 46->174, 47->175, 48->176, 49->177, 50->178, 51->179, 52->180, 53->181, 54->182, 55->183, 56->184, 57->185, 58->186, 59->187, 60->188, 61->189, 62->190, 63->191, 64->192, 65->193, 66->194, 67->195, 68->196, 69->197, 70->198, 71->199, 72->200, 73->201, 74->202, 75->203, 76->204, 77->205, 78->206, 79->207, 80->208, 81->209, 82->210, 83->211, 84->212, 85->213, 86->214, 87->215, 88->216, 89->217, 90->218, 91->219, 92->220, 93->221, 94->222, 95->223, 96->224, 97->225, 98->226, 99->227, 100->228, 101->229, 102->230, 103->231, 104->232, 105->233, 106->234, 107->235, 108->236, 109->237, 110->238, 111->239, 112->240, 113->241, 114->242, 115->243, 116->244, 117->245, 118->246, 119->247, 120->248, 121->249, 122->250, 123->251, 124->252, 125->253, 126->254, 127->255.
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:14 [fused_moe.py:617] [multi_card_offload INIT] ep_size=2 ep_rank=0 global_num_experts=256 num_device_experts(total)=24 per_rank_slots=12 _expert_map.shape=(24,)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:14 [fused_moe.py:617] [multi_card_offload INIT] ep_size=2 ep_rank=1 global_num_experts=256 num_device_experts(total)=24 per_rank_slots=12 _expert_map.shape=(24,)
+ninja: no work to do.
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [compilation.py:1091] Using OOT custom backend for compilation.
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [weight_utils.py:869] Filesystem type for checkpoints: EXT4. Checkpoint size: 148.66 GiB. Available RAM: 1200.33 GiB.
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [weight_utils.py:831] Prefetching checkpoint files into page cache started (in background, num_threads=8, block_size=16777216 bytes)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:   0% Completed | 0/46 [00:00<?, ?it/s]
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [weight_utils.py:803] Prefetching checkpoint files: 10% (3/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [weight_utils.py:803] Prefetching checkpoint files: 20% (5/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [weight_utils.py:803] Prefetching checkpoint files: 30% (7/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [weight_utils.py:803] Prefetching checkpoint files: 40% (10/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [weight_utils.py:803] Prefetching checkpoint files: 50% (12/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [weight_utils.py:803] Prefetching checkpoint files: 60% (14/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [weight_utils.py:803] Prefetching checkpoint files: 70% (17/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [weight_utils.py:803] Prefetching checkpoint files: 80% (19/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [weight_utils.py:803] Prefetching checkpoint files: 90% (21/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:25 [compilation.py:1091] Using OOT custom backend for compilation.
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [weight_utils.py:803] Prefetching checkpoint files: 100% (23/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:25 [weight_utils.py:826] Prefetching checkpoint files into page cache finished in 0.48s
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [weight_utils.py:869] Filesystem type for checkpoints: EXT4. Checkpoint size: 148.66 GiB. Available RAM: 1186.38 GiB.
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [weight_utils.py:831] Prefetching checkpoint files into page cache started (in background, num_threads=8, block_size=16777216 bytes)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:   2% Completed | 1/46 [00:00<00:27,  1.65it/s]
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:26 [expert_offload_manager.py:889] [OFFLOAD] starting parallel weight load (workers=32)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [weight_utils.py:803] Prefetching checkpoint files: 10% (3/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [weight_utils.py:803] Prefetching checkpoint files: 20% (5/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [weight_utils.py:803] Prefetching checkpoint files: 30% (7/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [weight_utils.py:803] Prefetching checkpoint files: 40% (10/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [weight_utils.py:803] Prefetching checkpoint files: 50% (12/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [weight_utils.py:803] Prefetching checkpoint files: 60% (14/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [weight_utils.py:803] Prefetching checkpoint files: 70% (17/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [weight_utils.py:803] Prefetching checkpoint files: 80% (19/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [weight_utils.py:803] Prefetching checkpoint files: 90% (21/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [weight_utils.py:803] Prefetching checkpoint files: 100% (23/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [weight_utils.py:826] Prefetching checkpoint files into page cache finished in 0.60s
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:26 [expert_offload_manager.py:889] [OFFLOAD] starting parallel weight load (workers=32)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:   4% Completed | 2/46 [00:01<00:31,  1.38it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:   7% Completed | 3/46 [00:02<00:30,  1.40it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:   9% Completed | 4/46 [00:02<00:29,  1.42it/s]
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:28 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 4096 shards copied (1774 shards/s, 2s elapsed)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:28 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 4096 shards copied (2100 shards/s, 2s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  11% Completed | 5/46 [00:03<00:28,  1.43it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  13% Completed | 6/46 [00:04<00:27,  1.45it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  15% Completed | 7/46 [00:04<00:26,  1.49it/s]
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:30 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 8192 shards copied (1858 shards/s, 4s elapsed)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:30 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 8192 shards copied (2165 shards/s, 4s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  17% Completed | 8/46 [00:05<00:25,  1.50it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  20% Completed | 9/46 [00:06<00:24,  1.52it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  22% Completed | 10/46 [00:06<00:23,  1.52it/s]
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:32 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 12288 shards copied (2196 shards/s, 6s elapsed)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:32 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 12288 shards copied (1898 shards/s, 6s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  24% Completed | 11/46 [00:07<00:22,  1.54it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  26% Completed | 12/46 [00:07<00:21,  1.57it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  28% Completed | 13/46 [00:08<00:20,  1.59it/s]
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:34 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 16384 shards copied (2218 shards/s, 7s elapsed)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:34 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 16384 shards copied (1945 shards/s, 8s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  30% Completed | 14/46 [00:09<00:20,  1.60it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  33% Completed | 15/46 [00:09<00:19,  1.62it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  35% Completed | 16/46 [00:10<00:18,  1.63it/s]
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:36 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 20480 shards copied (2208 shards/s, 9s elapsed)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:36 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 20480 shards copied (1983 shards/s, 10s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  37% Completed | 17/46 [00:10<00:17,  1.66it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  39% Completed | 18/46 [00:11<00:17,  1.63it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  41% Completed | 19/46 [00:12<00:16,  1.61it/s]
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:38 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 24576 shards copied (2188 shards/s, 11s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  43% Completed | 20/46 [00:12<00:16,  1.60it/s]
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:38 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 24576 shards copied (1984 shards/s, 12s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  46% Completed | 21/46 [00:13<00:15,  1.63it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  48% Completed | 22/46 [00:14<00:14,  1.65it/s]
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:40 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 28672 shards copied (2162 shards/s, 13s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  50% Completed | 23/46 [00:14<00:13,  1.71it/s]
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:40 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 28672 shards copied (2020 shards/s, 14s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  52% Completed | 24/46 [00:15<00:12,  1.72it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  54% Completed | 25/46 [00:15<00:12,  1.74it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  57% Completed | 26/46 [00:16<00:11,  1.74it/s]
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:42 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 32768 shards copied (2048 shards/s, 16s elapsed)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:42 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 32768 shards copied (2121 shards/s, 15s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  59% Completed | 27/46 [00:16<00:10,  1.74it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  61% Completed | 28/46 [00:17<00:10,  1.73it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  63% Completed | 29/46 [00:18<00:09,  1.74it/s]
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:44 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 36864 shards copied (2063 shards/s, 18s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  65% Completed | 30/46 [00:18<00:09,  1.70it/s]
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:44 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 36864 shards copied (2096 shards/s, 18s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  67% Completed | 31/46 [00:19<00:08,  1.70it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  70% Completed | 32/46 [00:19<00:08,  1.68it/s]
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:45 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 40960 shards copied (2065 shards/s, 20s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  72% Completed | 33/46 [00:20<00:07,  1.64it/s]
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:46 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 40960 shards copied (2070 shards/s, 20s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  74% Completed | 34/46 [00:21<00:07,  1.51it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  76% Completed | 35/46 [00:22<00:07,  1.45it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  78% Completed | 36/46 [00:22<00:07,  1.41it/s]
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:48 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 45056 shards copied (2018 shards/s, 22s elapsed)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:48 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 45056 shards copied (2045 shards/s, 22s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  80% Completed | 37/46 [00:23<00:06,  1.39it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  83% Completed | 38/46 [00:24<00:05,  1.36it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  85% Completed | 39/46 [00:25<00:05,  1.35it/s]
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:50 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 49152 shards copied (1990 shards/s, 25s elapsed)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:51 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 49152 shards copied (2030 shards/s, 24s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  87% Completed | 40/46 [00:25<00:04,  1.35it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  89% Completed | 41/46 [00:26<00:03,  1.34it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  91% Completed | 42/46 [00:27<00:03,  1.32it/s]
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:53 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 53248 shards copied (2017 shards/s, 26s elapsed)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:53 [expert_offload_manager.py:916] [OFFLOAD] weight load progress: 53248 shards copied (1962 shards/s, 27s elapsed)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  93% Completed | 43/46 [00:28<00:02,  1.32it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  96% Completed | 44/46 [00:28<00:01,  1.33it/s]
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:54 [default_loader.py:430] Loading weights took 28.43 seconds
+(Worker_DP1_EP1 pid=177736) /home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/quantization/methods/fp8.py:61: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:340.)
+(Worker_DP1_EP1 pid=177736)   layer.weight_scale.data = layer.weight_scale.data.view(torch.int32) >> 23 & 0xFF
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:09:54 [expert_offload_manager.py:530] [OFFLOAD] weight load (safetensors→CPU buffer): 27.7s over 66048 calls
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  98% Completed | 45/46 [00:29<00:00,  1.66it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards: 100% Completed | 46/46 [00:29<00:00,  1.58it/s]
+(Worker_DP0_EP0 pid=177735) 
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:54 [default_loader.py:430] Loading weights took 29.15 seconds
+(Worker_DP0_EP0 pid=177735) /home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/quantization/methods/fp8.py:61: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:340.)
+(Worker_DP0_EP0 pid=177735)   layer.weight_scale.data = layer.weight_scale.data.view(torch.int32) >> 23 & 0xFF
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:09:54 [expert_offload_manager.py:530] [OFFLOAD] weight load (safetensors→CPU buffer): 28.6s over 66048 calls
+(Worker_DP1_EP1 pid=177736) WARNING 08-06 15:10:29 [expert_offload_manager.py:795] [OFFLOAD] npu_format_cast to format-29 (mxfp4 NZ) failed on layer slot 'w13_weight'; leaving expert slots in base format. Safe for DeepSeek-V4 (fused-swiglu GMM reads raw storage); breaks the Kimi-K3 SiTU npu_grouped_matmul path. Error: MaybeUseAclnnNpuFormatCast:../torch_npu/csrc/aten/common/FormatCastKernelNpu.cpp:49 NPU function error: device error type 0, error code is 361001
+(Worker_DP1_EP1 pid=177736) WARNING 08-06 15:10:29 [expert_offload_manager.py:795] [ERROR] 2026-08-06-15:10:29 (PID:177736, Device:1, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP1_EP1 pid=177736) WARNING 08-06 15:10:29 [expert_offload_manager.py:795] 
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [expert_offload_manager.py:549] [OFFLOAD] num_device_experts per layer (n_layers=43): 24
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [expert_offload_manager.py:1201] [PREFILL_POOL] allocated 2 layers × 128 experts, w13[0].shape=(128, 2048, 4096) w2[0].shape=(128, 1024, 4096)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [expert_offload_manager.py:1020] [PREFETCH] registered gate weights for 43 MoE layers
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [expert_offload_manager.py:462] [CPU_MEM] rank=1/2 pid=177736 cpu_mode=replicated experts_per_layer=256 global_experts=256 layers=43 expert_buffers_mib=140352.0 weights_mib=132096.0 quant_mib=8256.0 process_rss_mib=2398.4 process_hwm_mib=8780.6 host_available_mib=1211377.7 expected_full_weight_copies_across_ep=2
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [expert_offload_manager.py:624] [OFFLOAD] finalize breakdown: process_weights=34.4s cache_policy=0.0s buffers=0.0s init_device=0.0s hot_preload=0.0s prefill_pool=0.1s gate=0.0s | total=34.6s
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [model_runner_v1.py:3612] offload finalize: 34.6s
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [model_runner_v1.py:3495] Loading drafter model...
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [vllm.py:1109] Asynchronous scheduling is enabled.
+(Worker_DP1_EP1 pid=177736) WARNING 08-06 15:10:29 [vllm.py:1133] Disabling cascade attention (not yet compatible with async speculative decoding).
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [kernel.py:295] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+(Worker_DP1_EP1 pid=177736) WARNING 08-06 15:10:29 [platform.py:1047] GPU-specific parameter is not supported on Ascend. parameter=disable_cascade_attn, value=True, action: resetting to False.
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [ascend_config.py:837] Dynamic EPLB is False
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [ascend_config.py:838] The number of redundant experts is 0
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [platform.py:771] Set PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [llm_base_proposer.py:277] [spec_decode/base] Loading draft model: method=mtp, load_format=None, model=/home/g00955623/weights/DeepSeek-V4-Flash
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [fused_moe.py:445] [OFFLOAD] skipping expert offload for MTP/draft MoE layer 'mtp.0.mlp.experts' (not part of the offload target set).
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [compilation.py:1091] Using OOT custom backend for compilation.
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [weight_utils.py:869] Filesystem type for checkpoints: EXT4. Checkpoint size: 148.66 GiB. Available RAM: 1182.55 GiB.
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [weight_utils.py:831] Prefetching checkpoint files into page cache started (in background, num_threads=8, block_size=16777216 bytes)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [weight_utils.py:803] Prefetching checkpoint files: 10% (3/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [weight_utils.py:803] Prefetching checkpoint files: 20% (5/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [weight_utils.py:803] Prefetching checkpoint files: 30% (7/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [weight_utils.py:803] Prefetching checkpoint files: 40% (10/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [weight_utils.py:803] Prefetching checkpoint files: 50% (12/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [weight_utils.py:803] Prefetching checkpoint files: 60% (14/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [weight_utils.py:803] Prefetching checkpoint files: 70% (17/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [weight_utils.py:803] Prefetching checkpoint files: 80% (19/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [weight_utils.py:803] Prefetching checkpoint files: 90% (21/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [weight_utils.py:803] Prefetching checkpoint files: 100% (23/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:29 [weight_utils.py:826] Prefetching checkpoint files into page cache finished in 0.77s
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:31 [default_loader.py:430] Loading weights took 2.13 seconds
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:31 [llm_base_proposer.py:528] [spec_decode/base] Detected MTP model with topk_indices_buffer. Sharing target model topk_indices_buffer with the draft model.
+(Worker_DP0_EP0 pid=177735) WARNING 08-06 15:10:32 [expert_offload_manager.py:795] [OFFLOAD] npu_format_cast to format-29 (mxfp4 NZ) failed on layer slot 'w13_weight'; leaving expert slots in base format. Safe for DeepSeek-V4 (fused-swiglu GMM reads raw storage); breaks the Kimi-K3 SiTU npu_grouped_matmul path. Error: MaybeUseAclnnNpuFormatCast:../torch_npu/csrc/aten/common/FormatCastKernelNpu.cpp:49 NPU function error: device error type 0, error code is 361001
+(Worker_DP0_EP0 pid=177735) WARNING 08-06 15:10:32 [expert_offload_manager.py:795] [ERROR] 2026-08-06-15:10:32 (PID:177735, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP0_EP0 pid=177735) WARNING 08-06 15:10:32 [expert_offload_manager.py:795] 
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [expert_offload_manager.py:549] [OFFLOAD] num_device_experts per layer (n_layers=43): 24
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [expert_offload_manager.py:1201] [PREFILL_POOL] allocated 2 layers × 128 experts, w13[0].shape=(128, 2048, 4096) w2[0].shape=(128, 1024, 4096)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [expert_offload_manager.py:1020] [PREFETCH] registered gate weights for 43 MoE layers
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:32 [model_runner_v1.py:3561] Loading model weights took 22.4416 GB
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:32 [model_runner_v1.py:3587] Model runner load_model total time: 78.99 seconds
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [expert_offload_manager.py:462] [CPU_MEM] rank=0/2 pid=177735 cpu_mode=replicated experts_per_layer=256 global_experts=256 layers=43 expert_buffers_mib=140352.0 weights_mib=132096.0 quant_mib=8256.0 process_rss_mib=2634.4 process_hwm_mib=8742.4 host_available_mib=1210993.8 expected_full_weight_copies_across_ep=2
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [expert_offload_manager.py:624] [OFFLOAD] finalize breakdown: process_weights=37.4s cache_policy=0.0s buffers=0.0s init_device=0.0s hot_preload=0.0s prefill_pool=0.1s gate=0.0s | total=37.5s
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [model_runner_v1.py:3612] offload finalize: 38.1s
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [model_runner_v1.py:3495] Loading drafter model...
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [vllm.py:1109] Asynchronous scheduling is enabled.
+(Worker_DP0_EP0 pid=177735) WARNING 08-06 15:10:32 [vllm.py:1133] Disabling cascade attention (not yet compatible with async speculative decoding).
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [kernel.py:295] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+(Worker_DP0_EP0 pid=177735) WARNING 08-06 15:10:32 [platform.py:1047] GPU-specific parameter is not supported on Ascend. parameter=disable_cascade_attn, value=True, action: resetting to False.
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [ascend_config.py:837] Dynamic EPLB is False
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [ascend_config.py:838] The number of redundant experts is 0
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [platform.py:771] Set PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [llm_base_proposer.py:277] [spec_decode/base] Loading draft model: method=mtp, load_format=None, model=/home/g00955623/weights/DeepSeek-V4-Flash
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [fused_moe.py:445] [OFFLOAD] skipping expert offload for MTP/draft MoE layer 'mtp.0.mlp.experts' (not part of the offload target set).
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [compilation.py:1091] Using OOT custom backend for compilation.
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [weight_utils.py:869] Filesystem type for checkpoints: EXT4. Checkpoint size: 148.66 GiB. Available RAM: 1182.62 GiB.
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:32 [weight_utils.py:831] Prefetching checkpoint files into page cache started (in background, num_threads=8, block_size=16777216 bytes)
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:   0% Completed | 0/46 [00:00<?, ?it/s]
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:33 [weight_utils.py:803] Prefetching checkpoint files: 10% (3/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:33 [weight_utils.py:803] Prefetching checkpoint files: 20% (5/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:33 [weight_utils.py:803] Prefetching checkpoint files: 30% (7/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:33 [weight_utils.py:803] Prefetching checkpoint files: 40% (10/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:33 [weight_utils.py:803] Prefetching checkpoint files: 50% (12/23)
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:33 [ascend_forward_context.py:470] [MC_ADMISSION] cpu_mode=replicated num_tokens=4 topk=6 ep_size=2 global_slots=24 admission_slots=24 local_route_upper_bound=24 global_route_upper_bound=48 mc2_tokens_capacity=4 mc2_hard_limit=512 buffer_fits=False selected=ALLTOALL reason=expert_slots
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:33 [weight_utils.py:803] Prefetching checkpoint files: 60% (14/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:33 [weight_utils.py:803] Prefetching checkpoint files: 70% (17/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:33 [weight_utils.py:803] Prefetching checkpoint files: 80% (19/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:33 [weight_utils.py:803] Prefetching checkpoint files: 90% (21/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:33 [weight_utils.py:803] Prefetching checkpoint files: 100% (23/23)
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:33 [weight_utils.py:826] Prefetching checkpoint files into page cache finished in 0.72s
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:   2% Completed | 1/46 [00:00<00:35,  1.25it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  22% Completed | 10/46 [00:00<00:02, 14.53it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  41% Completed | 19/46 [00:01<00:00, 27.52it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  61% Completed | 28/46 [00:01<00:00, 39.59it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  80% Completed | 37/46 [00:01<00:00, 50.00it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards:  98% Completed | 45/46 [00:01<00:00, 34.68it/s]
+(Worker_DP0_EP0 pid=177735) Loading safetensors checkpoint shards: 100% Completed | 46/46 [00:02<00:00, 22.61it/s]
+(Worker_DP0_EP0 pid=177735) 
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:34 [default_loader.py:430] Loading weights took 2.04 seconds
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:34 [llm_base_proposer.py:528] [spec_decode/base] Detected MTP model with topk_indices_buffer. Sharing target model topk_indices_buffer with the draft model.
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:36 [model_runner_v1.py:3561] Loading model weights took 22.4416 GB
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:36 [model_runner_v1.py:3587] Model runner load_model total time: 82.35 seconds
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:36 [ascend_forward_context.py:470] [MC_ADMISSION] cpu_mode=replicated num_tokens=4 topk=6 ep_size=2 global_slots=24 admission_slots=24 local_route_upper_bound=24 global_route_upper_bound=48 mc2_tokens_capacity=4 mc2_hard_limit=512 buffer_fits=False selected=ALLTOALL reason=expert_slots
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:36 [ascend_forward_context.py:470] [MC_ADMISSION] cpu_mode=replicated num_tokens=8192 topk=6 ep_size=2 global_slots=24 admission_slots=24 local_route_upper_bound=49152 global_route_upper_bound=98304 mc2_tokens_capacity=4 mc2_hard_limit=512 buffer_fits=False selected=ALLTOALL reason=mc2_capacity
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:36 [ascend_forward_context.py:470] [MC_ADMISSION] cpu_mode=replicated num_tokens=8192 topk=6 ep_size=2 global_slots=24 admission_slots=24 local_route_upper_bound=49152 global_route_upper_bound=98304 mc2_tokens_capacity=4 mc2_hard_limit=512 buffer_fits=False selected=ALLTOALL reason=mc2_capacity
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:39 [ascend_forward_context.py:470] [MC_ADMISSION] cpu_mode=replicated num_tokens=8192 topk=6 ep_size=2 global_slots=24 admission_slots=24 local_route_upper_bound=49152 global_route_upper_bound=98304 mc2_tokens_capacity=4 mc2_hard_limit=512 buffer_fits=False selected=ALLTOALL reason=mc2_capacity
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:39 [ascend_forward_context.py:470] [MC_ADMISSION] cpu_mode=replicated num_tokens=8192 topk=6 ep_size=2 global_slots=24 admission_slots=24 local_route_upper_bound=49152 global_route_upper_bound=98304 mc2_tokens_capacity=4 mc2_hard_limit=512 buffer_fits=False selected=ALLTOALL reason=mc2_capacity
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:40 [worker.py:588] Available KV cache memory: 89.33 GiB
+(EngineCore_DP1 pid=177597) INFO 08-06 15:10:40 [kv_cache_utils.py:2177] GPU KV cache size: 1,867,725 tokens
+(EngineCore_DP1 pid=177597) INFO 08-06 15:10:40 [kv_cache_utils.py:2178] Maximum concurrency for 150,000 tokens per request: 12.45x
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:40 [worker.py:588] Available KV cache memory: 89.33 GiB
+(EngineCore_DP0 pid=177596) INFO 08-06 15:10:40 [kv_cache_utils.py:2177] GPU KV cache size: 1,867,802 tokens
+(EngineCore_DP0 pid=177596) INFO 08-06 15:10:40 [kv_cache_utils.py:2178] Maximum concurrency for 150,000 tokens per request: 12.45x
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:42 [gpu_model_runner.py:6798] Rank 0: Torch profiler disabled for CUDA graph capture
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:43 [gpu_model_runner.py:6798] Rank 0: Torch profiler disabled for CUDA graph capture
+(Worker_DP0_EP0 pid=177735) Capturing CUDA graphs (decode, FULL):   0%|          | 0/1 [00:00<?, ?it/s](Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:43 [ascend_forward_context.py:470] [MC_ADMISSION] cpu_mode=replicated num_tokens=4 topk=6 ep_size=2 global_slots=24 admission_slots=24 local_route_upper_bound=24 global_route_upper_bound=48 mc2_tokens_capacity=4 mc2_hard_limit=512 buffer_fits=False selected=ALLTOALL reason=expert_slots
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:43 [ascend_forward_context.py:470] [MC_ADMISSION] cpu_mode=replicated num_tokens=4 topk=6 ep_size=2 global_slots=24 admission_slots=24 local_route_upper_bound=24 global_route_upper_bound=48 mc2_tokens_capacity=4 mc2_hard_limit=512 buffer_fits=False selected=ALLTOALL reason=expert_slots
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:46 [ascend_forward_context.py:470] [MC_ADMISSION] cpu_mode=replicated num_tokens=4 topk=6 ep_size=2 global_slots=24 admission_slots=24 local_route_upper_bound=24 global_route_upper_bound=48 mc2_tokens_capacity=4 mc2_hard_limit=512 buffer_fits=False selected=ALLTOALL reason=expert_slots
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:46 [ascend_forward_context.py:470] [MC_ADMISSION] cpu_mode=replicated num_tokens=4 topk=6 ep_size=2 global_slots=24 admission_slots=24 local_route_upper_bound=24 global_route_upper_bound=48 mc2_tokens_capacity=4 mc2_hard_limit=512 buffer_fits=False selected=ALLTOALL reason=expert_slots
+(Worker_DP0_EP0 pid=177735) INFO 08-06 15:10:46 [ascend_forward_context.py:470] [MC_ADMISSION] cpu_mode=replicated num_tokens=4 topk=6 ep_size=2 global_slots=24 admission_slots=24 local_route_upper_bound=24 global_route_upper_bound=48 mc2_tokens_capacity=4 mc2_hard_limit=512 buffer_fits=False selected=ALLTOALL reason=expert_slots
+(Worker_DP1_EP1 pid=177736) INFO 08-06 15:10:46 [ascend_forward_context.py:470] [MC_ADMISSION] cpu_mode=replicated num_tokens=4 topk=6 ep_size=2 global_slots=24 admission_slots=24 local_route_upper_bound=24 global_route_upper_bound=48 mc2_tokens_capacity=4 mc2_hard_limit=512 buffer_fits=False selected=ALLTOALL reason=expert_slots
+[rank0]:[W806 15:10:46.456691379 NPUGraph.cpp:223] Warning: Waiting for pending NCCL work to finish before starting graph capture. (function operator())
+[rank1]:[W806 15:10:46.458180706 NPUGraph.cpp:223] Warning: Waiting for pending NCCL work to finish before starting graph capture. (function operator())
+Capturing CUDA graphs (decode, FULL):   0%|          | 0/1 [00:02<?, ?it/s]
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] WorkerProc hit an exception.
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] Traceback (most recent call last):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4951, in _replace_gpu_model_runner_function_wrapper
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     yield
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4817, in capture_model
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     cuda_graph_size = GPUModelRunner.capture_model(self)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return func(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/worker/gpu_model_runner.py", line 6811, in capture_model
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._capture_cudagraphs(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/worker/gpu_model_runner.py", line 6938, in _capture_cudagraphs
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._warmup_and_capture(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/worker/gpu_model_runner.py", line 6883, in _warmup_and_capture
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._dummy_run(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return func(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 3374, in _dummy_run
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     outputs = self._model_forward(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]               ^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 2625, in _model_forward
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states = run_model()
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/compilation/acl_graph.py", line 189, in __call__
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     output = self.runnable(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 1277, in forward
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/compilation/decorators.py", line 513, in __call__
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self.forward(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 1137, in forward
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 1000, in forward
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states = self.mlp(hidden_states)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 475, in forward
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/model_executor/layers/fused_moe/runner/moe_runner.py", line 685, in forward
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     result = self._forward_entry(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]              ^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_ops.py", line 1209, in __call__
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._op(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/model_executor/layers/fused_moe/runner/moe_runner.py", line 161, in _moe_forward_shared
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return layer._forward_impl(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py", line 1267, in _forward_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self.shared_forward_impl(hidden_states, router_logits, shared_experts_input)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py", line 1231, in shared_forward_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     fused_moe_results = self.no_shared_forward_impl(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py", line 1003, in no_shared_forward_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     fused_experts_results: FusedExpertsResult = self._quant_method.apply(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/quantization/method_adapters.py", line 274, in apply
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self.quant_method.apply(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/quantization/methods/w4a8_mxfp4.py", line 252, in apply
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     mgr.update_weights_multi_card(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/expert_offload/expert_offload_manager.py", line 1701, in update_weights_multi_card
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     if self._mc_handle_prefill_regime(layer_idx):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/expert_offload/expert_offload_manager.py", line 1647, in _mc_handle_prefill_regime
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._prefill_load_layer_shard(layer_idx)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/expert_offload/expert_offload_manager.py", line 1470, in _prefill_load_layer_shard
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._prefill_w13[pool_slot].untyped_storage()[local_i * self.w13_expert_size_bytes : (local_i + 1) * self.w13_expert_size_bytes].copy_(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] RuntimeError: copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [ERROR] 2026-08-06-15:10:46 (PID:177735, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [PID: 177735] 2026-08-06-15:10:46.565.182 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177735 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] TraceBack (most recent call last):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] During handling of the above exception, another exception occurred:
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] Traceback (most recent call last):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4913, in _torch_cuda_wrapper
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     yield
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4816, in capture_model
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/contextlib.py", line 158, in __exit__
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self.gen.throw(typ, value, traceback)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4953, in _replace_gpu_model_runner_function_wrapper
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     raise RuntimeError(f"NPUModelRunner failed, error is {e}")
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] RuntimeError: NPUModelRunner failed, error is copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [ERROR] 2026-08-06-15:10:46 (PID:177735, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [PID: 177735] 2026-08-06-15:10:46.565.182 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177735 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] TraceBack (most recent call last):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] During handling of the above exception, another exception occurred:
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] Traceback (most recent call last):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 999, in worker_busy_loop
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     output = func(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]              ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/worker.py", line 714, in compile_or_warm_up_model
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     npugraph_memory_bytes = self.model_runner.capture_model()
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4816, in capture_model
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/contextlib.py", line 158, in __exit__
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self.gen.throw(typ, value, traceback)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4923, in _torch_cuda_wrapper
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     raise RuntimeError(f"NPUModelRunner init failed, error is {e}")
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] RuntimeError: NPUModelRunner init failed, error is NPUModelRunner failed, error is copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [ERROR] 2026-08-06-15:10:46 (PID:177735, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [PID: 177735] 2026-08-06-15:10:46.565.182 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177735 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] TraceBack (most recent call last):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] Traceback (most recent call last):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4951, in _replace_gpu_model_runner_function_wrapper
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     yield
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4817, in capture_model
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     cuda_graph_size = GPUModelRunner.capture_model(self)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return func(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/worker/gpu_model_runner.py", line 6811, in capture_model
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._capture_cudagraphs(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/worker/gpu_model_runner.py", line 6938, in _capture_cudagraphs
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._warmup_and_capture(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/worker/gpu_model_runner.py", line 6883, in _warmup_and_capture
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._dummy_run(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return func(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 3374, in _dummy_run
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     outputs = self._model_forward(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]               ^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 2625, in _model_forward
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states = run_model()
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/compilation/acl_graph.py", line 189, in __call__
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     output = self.runnable(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 1277, in forward
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/compilation/decorators.py", line 513, in __call__
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self.forward(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 1137, in forward
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 1000, in forward
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states = self.mlp(hidden_states)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 475, in forward
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/model_executor/layers/fused_moe/runner/moe_runner.py", line 685, in forward
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     result = self._forward_entry(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]              ^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_ops.py", line 1209, in __call__
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._op(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/model_executor/layers/fused_moe/runner/moe_runner.py", line 161, in _moe_forward_shared
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return layer._forward_impl(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py", line 1267, in _forward_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self.shared_forward_impl(hidden_states, router_logits, shared_experts_input)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py", line 1231, in shared_forward_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     fused_moe_results = self.no_shared_forward_impl(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py", line 1003, in no_shared_forward_impl
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     fused_experts_results: FusedExpertsResult = self._quant_method.apply(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/quantization/method_adapters.py", line 274, in apply
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self.quant_method.apply(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/quantization/methods/w4a8_mxfp4.py", line 252, in apply
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     mgr.update_weights_multi_card(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/expert_offload/expert_offload_manager.py", line 1701, in update_weights_multi_card
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     if self._mc_handle_prefill_regime(layer_idx):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/expert_offload/expert_offload_manager.py", line 1647, in _mc_handle_prefill_regime
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._prefill_load_layer_shard(layer_idx)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/expert_offload/expert_offload_manager.py", line 1470, in _prefill_load_layer_shard
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._prefill_w13[pool_slot].untyped_storage()[local_i * self.w13_expert_size_bytes : (local_i + 1) * self.w13_expert_size_bytes].copy_(
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] RuntimeError: copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [ERROR] 2026-08-06-15:10:46 (PID:177735, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [PID: 177735] 2026-08-06-15:10:46.565.182 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177735 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] TraceBack (most recent call last):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] During handling of the above exception, another exception occurred:
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] Traceback (most recent call last):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4913, in _torch_cuda_wrapper
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     yield
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4816, in capture_model
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/contextlib.py", line 158, in __exit__
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self.gen.throw(typ, value, traceback)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4953, in _replace_gpu_model_runner_function_wrapper
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     raise RuntimeError(f"NPUModelRunner failed, error is {e}")
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] RuntimeError: NPUModelRunner failed, error is copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [ERROR] 2026-08-06-15:10:46 (PID:177735, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [PID: 177735] 2026-08-06-15:10:46.565.182 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177735 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] TraceBack (most recent call last):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] During handling of the above exception, another exception occurred:
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] Traceback (most recent call last):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 999, in worker_busy_loop
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     output = func(*args, **kwargs)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]              ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/worker.py", line 714, in compile_or_warm_up_model
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     npugraph_memory_bytes = self.model_runner.capture_model()
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4816, in capture_model
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/contextlib.py", line 158, in __exit__
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self.gen.throw(typ, value, traceback)
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4923, in _torch_cuda_wrapper
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     raise RuntimeError(f"NPUModelRunner init failed, error is {e}")
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] RuntimeError: NPUModelRunner init failed, error is NPUModelRunner failed, error is copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [ERROR] 2026-08-06-15:10:46 (PID:177735, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [PID: 177735] 2026-08-06-15:10:46.565.182 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177735 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] TraceBack (most recent call last):
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP0_EP0 pid=177735) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330] EngineCore failed to start.
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330] Traceback (most recent call last):
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1291, in run_engine_core
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     engine_core = DPEngineCoreProc(*args, **kwargs)
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1885, in __init__
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     super().__init__(
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     return func(*args, **kwargs)
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1065, in __init__
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     super().__init__(
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 136, in __init__
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     kv_cache_config = self._initialize_kv_caches(vllm_config)
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     return func(*args, **kwargs)
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 324, in _initialize_kv_caches
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     self.model_executor.initialize_from_config(kv_cache_configs)
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/abstract.py", line 124, in initialize_from_config
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     compilation_times: list[CompilationTimes] = self.collective_rpc(
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]                                                 ^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 405, in collective_rpc
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     return future if non_block else future.result()
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]                                     ^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 91, in result
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     return super().result()
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]            ^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/usr/local/python3.11.10/lib/python3.11/concurrent/futures/_base.py", line 449, in result
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     return self.__get_result()
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]            ^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/usr/local/python3.11.10/lib/python3.11/concurrent/futures/_base.py", line 401, in __get_result
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     raise self._exception
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 95, in _wait_for_response
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     response = self.aggregate(self.get_response())
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]                               ^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 394, in get_response
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]     raise RuntimeError(
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330] RuntimeError: Worker failed with error 'NPUModelRunner init failed, error is NPUModelRunner failed, error is copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330] [ERROR] 2026-08-06-15:10:46 (PID:177735, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330] [PID: 177735] 2026-08-06-15:10:46.565.182 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177735 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330] TraceBack (most recent call last):
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:10:47 [core.py:1330] ', please check the stack trace above for the root cause
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] WorkerProc hit an exception.
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] Traceback (most recent call last):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4951, in _replace_gpu_model_runner_function_wrapper
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     yield
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4817, in capture_model
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     cuda_graph_size = GPUModelRunner.capture_model(self)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return func(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/worker/gpu_model_runner.py", line 6811, in capture_model
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._capture_cudagraphs(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/worker/gpu_model_runner.py", line 6938, in _capture_cudagraphs
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._warmup_and_capture(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/worker/gpu_model_runner.py", line 6883, in _warmup_and_capture
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._dummy_run(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return func(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 3374, in _dummy_run
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     outputs = self._model_forward(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]               ^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 2625, in _model_forward
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states = run_model()
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/compilation/acl_graph.py", line 189, in __call__
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     output = self.runnable(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 1277, in forward
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/compilation/decorators.py", line 513, in __call__
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self.forward(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 1137, in forward
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 1000, in forward
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states = self.mlp(hidden_states)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 475, in forward
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/model_executor/layers/fused_moe/runner/moe_runner.py", line 685, in forward
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     result = self._forward_entry(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]              ^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_ops.py", line 1209, in __call__
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._op(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/model_executor/layers/fused_moe/runner/moe_runner.py", line 161, in _moe_forward_shared
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return layer._forward_impl(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py", line 1267, in _forward_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self.shared_forward_impl(hidden_states, router_logits, shared_experts_input)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py", line 1231, in shared_forward_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     fused_moe_results = self.no_shared_forward_impl(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py", line 1003, in no_shared_forward_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     fused_experts_results: FusedExpertsResult = self._quant_method.apply(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/quantization/method_adapters.py", line 274, in apply
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self.quant_method.apply(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/quantization/methods/w4a8_mxfp4.py", line 252, in apply
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     mgr.update_weights_multi_card(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/expert_offload/expert_offload_manager.py", line 1701, in update_weights_multi_card
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     if self._mc_handle_prefill_regime(layer_idx):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/expert_offload/expert_offload_manager.py", line 1647, in _mc_handle_prefill_regime
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._prefill_load_layer_shard(layer_idx)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/expert_offload/expert_offload_manager.py", line 1470, in _prefill_load_layer_shard
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._prefill_w13[pool_slot].untyped_storage()[local_i * self.w13_expert_size_bytes : (local_i + 1) * self.w13_expert_size_bytes].copy_(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] RuntimeError: copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [ERROR] 2026-08-06-15:10:46 (PID:177736, Device:1, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [PID: 177736] 2026-08-06-15:10:46.568.698 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177736 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] TraceBack (most recent call last):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] During handling of the above exception, another exception occurred:
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] Traceback (most recent call last):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4913, in _torch_cuda_wrapper
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     yield
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4816, in capture_model
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/contextlib.py", line 158, in __exit__
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self.gen.throw(typ, value, traceback)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4953, in _replace_gpu_model_runner_function_wrapper
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     raise RuntimeError(f"NPUModelRunner failed, error is {e}")
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] RuntimeError: NPUModelRunner failed, error is copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [ERROR] 2026-08-06-15:10:46 (PID:177736, Device:1, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [PID: 177736] 2026-08-06-15:10:46.568.698 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177736 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] TraceBack (most recent call last):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] During handling of the above exception, another exception occurred:
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] Traceback (most recent call last):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 999, in worker_busy_loop
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     output = func(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]              ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/worker.py", line 714, in compile_or_warm_up_model
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     npugraph_memory_bytes = self.model_runner.capture_model()
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4816, in capture_model
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/contextlib.py", line 158, in __exit__
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self.gen.throw(typ, value, traceback)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4923, in _torch_cuda_wrapper
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     raise RuntimeError(f"NPUModelRunner init failed, error is {e}")
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] RuntimeError: NPUModelRunner init failed, error is NPUModelRunner failed, error is copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [ERROR] 2026-08-06-15:10:46 (PID:177736, Device:1, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [PID: 177736] 2026-08-06-15:10:46.568.698 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177736 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] TraceBack (most recent call last):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] Traceback (most recent call last):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4951, in _replace_gpu_model_runner_function_wrapper
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     yield
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4817, in capture_model
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     cuda_graph_size = GPUModelRunner.capture_model(self)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return func(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/worker/gpu_model_runner.py", line 6811, in capture_model
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._capture_cudagraphs(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/worker/gpu_model_runner.py", line 6938, in _capture_cudagraphs
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._warmup_and_capture(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/worker/gpu_model_runner.py", line 6883, in _warmup_and_capture
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._dummy_run(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return func(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 3374, in _dummy_run
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     outputs = self._model_forward(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]               ^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 2625, in _model_forward
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states = run_model()
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/compilation/acl_graph.py", line 189, in __call__
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     output = self.runnable(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 1277, in forward
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/compilation/decorators.py", line 513, in __call__
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self.forward(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 1137, in forward
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 1000, in forward
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     hidden_states = self.mlp(hidden_states)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/models/deepseek_v4.py", line 475, in forward
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._call_impl(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return forward_call(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/model_executor/layers/fused_moe/runner/moe_runner.py", line 685, in forward
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     result = self._forward_entry(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]              ^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_ops.py", line 1209, in __call__
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self._op(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/model_executor/layers/fused_moe/runner/moe_runner.py", line 161, in _moe_forward_shared
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return layer._forward_impl(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py", line 1267, in _forward_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self.shared_forward_impl(hidden_states, router_logits, shared_experts_input)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py", line 1231, in shared_forward_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     fused_moe_results = self.no_shared_forward_impl(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/ops/fused_moe/fused_moe.py", line 1003, in no_shared_forward_impl
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     fused_experts_results: FusedExpertsResult = self._quant_method.apply(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/quantization/method_adapters.py", line 274, in apply
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     return self.quant_method.apply(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]            ^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/quantization/methods/w4a8_mxfp4.py", line 252, in apply
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     mgr.update_weights_multi_card(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/expert_offload/expert_offload_manager.py", line 1701, in update_weights_multi_card
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     if self._mc_handle_prefill_regime(layer_idx):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/expert_offload/expert_offload_manager.py", line 1647, in _mc_handle_prefill_regime
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._prefill_load_layer_shard(layer_idx)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/expert_offload/expert_offload_manager.py", line 1470, in _prefill_load_layer_shard
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self._prefill_w13[pool_slot].untyped_storage()[local_i * self.w13_expert_size_bytes : (local_i + 1) * self.w13_expert_size_bytes].copy_(
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] RuntimeError: copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [ERROR] 2026-08-06-15:10:46 (PID:177736, Device:1, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [PID: 177736] 2026-08-06-15:10:46.568.698 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177736 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] TraceBack (most recent call last):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] During handling of the above exception, another exception occurred:
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] Traceback (most recent call last):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4913, in _torch_cuda_wrapper
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     yield
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4816, in capture_model
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/contextlib.py", line 158, in __exit__
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self.gen.throw(typ, value, traceback)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4953, in _replace_gpu_model_runner_function_wrapper
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     raise RuntimeError(f"NPUModelRunner failed, error is {e}")
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] RuntimeError: NPUModelRunner failed, error is copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [ERROR] 2026-08-06-15:10:46 (PID:177736, Device:1, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [PID: 177736] 2026-08-06-15:10:46.568.698 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177736 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] TraceBack (most recent call last):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] During handling of the above exception, another exception occurred:
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] Traceback (most recent call last):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 999, in worker_busy_loop
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     output = func(*args, **kwargs)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]              ^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/worker.py", line 714, in compile_or_warm_up_model
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     npugraph_memory_bytes = self.model_runner.capture_model()
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4816, in capture_model
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/usr/local/python3.11.10/lib/python3.11/contextlib.py", line 158, in __exit__
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     self.gen.throw(typ, value, traceback)
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 4923, in _torch_cuda_wrapper
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]     raise RuntimeError(f"NPUModelRunner init failed, error is {e}")
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] RuntimeError: NPUModelRunner init failed, error is NPUModelRunner failed, error is copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [ERROR] 2026-08-06-15:10:46 (PID:177736, Device:1, RankID:-1) ERR00100 PTA call acl api failed.
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] [PID: 177736] 2026-08-06-15:10:46.568.698 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177736 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] TraceBack (most recent call last):
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(Worker_DP1_EP1 pid=177736) ERROR 08-06 15:10:47 [multiproc_executor.py:1007] 
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330] EngineCore failed to start.
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330] Traceback (most recent call last):
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1291, in run_engine_core
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     engine_core = DPEngineCoreProc(*args, **kwargs)
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1885, in __init__
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     super().__init__(
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     return func(*args, **kwargs)
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1065, in __init__
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     super().__init__(
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 136, in __init__
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     kv_cache_config = self._initialize_kv_caches(vllm_config)
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     return func(*args, **kwargs)
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 324, in _initialize_kv_caches
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     self.model_executor.initialize_from_config(kv_cache_configs)
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/abstract.py", line 124, in initialize_from_config
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     compilation_times: list[CompilationTimes] = self.collective_rpc(
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]                                                 ^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 405, in collective_rpc
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     return future if non_block else future.result()
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]                                     ^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 91, in result
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     return super().result()
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]            ^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/usr/local/python3.11.10/lib/python3.11/concurrent/futures/_base.py", line 449, in result
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     return self.__get_result()
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]            ^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/usr/local/python3.11.10/lib/python3.11/concurrent/futures/_base.py", line 401, in __get_result
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     raise self._exception
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 95, in _wait_for_response
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     response = self.aggregate(self.get_response())
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]                               ^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 394, in get_response
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]     raise RuntimeError(
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330] RuntimeError: Worker failed with error 'NPUModelRunner init failed, error is NPUModelRunner failed, error is copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330] [ERROR] 2026-08-06-15:10:46 (PID:177736, Device:1, RankID:-1) ERR00100 PTA call acl api failed.
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330] [PID: 177736] 2026-08-06-15:10:46.568.698 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177736 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330] TraceBack (most recent call last):
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330]         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:10:47 [core.py:1330] ', please check the stack trace above for the root cause
+(EngineCore_DP1 pid=177597) ERROR 08-06 15:11:23 [multiproc_executor.py:284] Worker proc VllmWorker-0 died unexpectedly (exit code: None), shutting down executor.
+(EngineCore_DP1 pid=177597) INFO 08-06 15:11:23 [multiproc_executor.py:429] [shutdown] Executor: waiting for worker exit count=1
+(EngineCore_DP1 pid=177597) Process EngineCore_DP1:
+(EngineCore_DP1 pid=177597) Traceback (most recent call last):
+(EngineCore_DP1 pid=177597)   File "/usr/local/python3.11.10/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+(EngineCore_DP1 pid=177597)     self.run()
+(EngineCore_DP1 pid=177597)   File "/usr/local/python3.11.10/lib/python3.11/multiprocessing/process.py", line 108, in run
+(EngineCore_DP1 pid=177597)     self._target(*self._args, **self._kwargs)
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/patch/platform/patch_balance_schedule.py", line 907, in _balance_run_engine_core
+(EngineCore_DP1 pid=177597)     return _OriginalRunEngineCore(*args, dp_rank=dp_rank, local_dp_rank=local_dp_rank, **kwargs)
+(EngineCore_DP1 pid=177597)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1334, in run_engine_core
+(EngineCore_DP1 pid=177597)     raise e
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1291, in run_engine_core
+(EngineCore_DP1 pid=177597)     engine_core = DPEngineCoreProc(*args, **kwargs)
+(EngineCore_DP1 pid=177597)                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1885, in __init__
+(EngineCore_DP1 pid=177597)     super().__init__(
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP1 pid=177597)     return func(*args, **kwargs)
+(EngineCore_DP1 pid=177597)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1065, in __init__
+(EngineCore_DP1 pid=177597)     super().__init__(
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 136, in __init__
+(EngineCore_DP1 pid=177597)     kv_cache_config = self._initialize_kv_caches(vllm_config)
+(EngineCore_DP1 pid=177597)                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP1 pid=177597)     return func(*args, **kwargs)
+(EngineCore_DP1 pid=177597)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 324, in _initialize_kv_caches
+(EngineCore_DP1 pid=177597)     self.model_executor.initialize_from_config(kv_cache_configs)
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/abstract.py", line 124, in initialize_from_config
+(EngineCore_DP1 pid=177597)     compilation_times: list[CompilationTimes] = self.collective_rpc(
+(EngineCore_DP1 pid=177597)                                                 ^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 405, in collective_rpc
+(EngineCore_DP1 pid=177597)     return future if non_block else future.result()
+(EngineCore_DP1 pid=177597)                                     ^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 91, in result
+(EngineCore_DP1 pid=177597)     return super().result()
+(EngineCore_DP1 pid=177597)            ^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597)   File "/usr/local/python3.11.10/lib/python3.11/concurrent/futures/_base.py", line 449, in result
+(EngineCore_DP1 pid=177597)     return self.__get_result()
+(EngineCore_DP1 pid=177597)            ^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597)   File "/usr/local/python3.11.10/lib/python3.11/concurrent/futures/_base.py", line 401, in __get_result
+(EngineCore_DP1 pid=177597)     raise self._exception
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 95, in _wait_for_response
+(EngineCore_DP1 pid=177597)     response = self.aggregate(self.get_response())
+(EngineCore_DP1 pid=177597)                               ^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP1 pid=177597)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 394, in get_response
+(EngineCore_DP1 pid=177597)     raise RuntimeError(
+(EngineCore_DP1 pid=177597) RuntimeError: Worker failed with error 'NPUModelRunner init failed, error is NPUModelRunner failed, error is copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(EngineCore_DP1 pid=177597) [ERROR] 2026-08-06-15:10:46 (PID:177736, Device:1, RankID:-1) ERR00100 PTA call acl api failed.
+(EngineCore_DP1 pid=177597) [PID: 177736] 2026-08-06-15:10:46.568.698 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177736 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(EngineCore_DP1 pid=177597) TraceBack (most recent call last):
+(EngineCore_DP1 pid=177597)         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(EngineCore_DP1 pid=177597) ', please check the stack trace above for the root cause
+(EngineCore_DP0 pid=177596) ERROR 08-06 15:11:23 [multiproc_executor.py:284] Worker proc VllmWorker-0 died unexpectedly (exit code: None), shutting down executor.
+(EngineCore_DP0 pid=177596) INFO 08-06 15:11:23 [multiproc_executor.py:429] [shutdown] Executor: waiting for worker exit count=1
+(EngineCore_DP0 pid=177596) Process EngineCore_DP0:
+(EngineCore_DP0 pid=177596) Traceback (most recent call last):
+(EngineCore_DP0 pid=177596)   File "/usr/local/python3.11.10/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+(EngineCore_DP0 pid=177596)     self.run()
+(EngineCore_DP0 pid=177596)   File "/usr/local/python3.11.10/lib/python3.11/multiprocessing/process.py", line 108, in run
+(EngineCore_DP0 pid=177596)     self._target(*self._args, **self._kwargs)
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm-ascend/vllm_ascend/patch/platform/patch_balance_schedule.py", line 907, in _balance_run_engine_core
+(EngineCore_DP0 pid=177596)     return _OriginalRunEngineCore(*args, dp_rank=dp_rank, local_dp_rank=local_dp_rank, **kwargs)
+(EngineCore_DP0 pid=177596)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1334, in run_engine_core
+(EngineCore_DP0 pid=177596)     raise e
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1291, in run_engine_core
+(EngineCore_DP0 pid=177596)     engine_core = DPEngineCoreProc(*args, **kwargs)
+(EngineCore_DP0 pid=177596)                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1885, in __init__
+(EngineCore_DP0 pid=177596)     super().__init__(
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=177596)     return func(*args, **kwargs)
+(EngineCore_DP0 pid=177596)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 1065, in __init__
+(EngineCore_DP0 pid=177596)     super().__init__(
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 136, in __init__
+(EngineCore_DP0 pid=177596)     kv_cache_config = self._initialize_kv_caches(vllm_config)
+(EngineCore_DP0 pid=177596)                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=177596)     return func(*args, **kwargs)
+(EngineCore_DP0 pid=177596)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core.py", line 324, in _initialize_kv_caches
+(EngineCore_DP0 pid=177596)     self.model_executor.initialize_from_config(kv_cache_configs)
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/abstract.py", line 124, in initialize_from_config
+(EngineCore_DP0 pid=177596)     compilation_times: list[CompilationTimes] = self.collective_rpc(
+(EngineCore_DP0 pid=177596)                                                 ^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 405, in collective_rpc
+(EngineCore_DP0 pid=177596)     return future if non_block else future.result()
+(EngineCore_DP0 pid=177596)                                     ^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 91, in result
+(EngineCore_DP0 pid=177596)     return super().result()
+(EngineCore_DP0 pid=177596)            ^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596)   File "/usr/local/python3.11.10/lib/python3.11/concurrent/futures/_base.py", line 449, in result
+(EngineCore_DP0 pid=177596)     return self.__get_result()
+(EngineCore_DP0 pid=177596)            ^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596)   File "/usr/local/python3.11.10/lib/python3.11/concurrent/futures/_base.py", line 401, in __get_result
+(EngineCore_DP0 pid=177596)     raise self._exception
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 95, in _wait_for_response
+(EngineCore_DP0 pid=177596)     response = self.aggregate(self.get_response())
+(EngineCore_DP0 pid=177596)                               ^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=177596)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/executor/multiproc_executor.py", line 394, in get_response
+(EngineCore_DP0 pid=177596)     raise RuntimeError(
+(EngineCore_DP0 pid=177596) RuntimeError: Worker failed with error 'NPUModelRunner init failed, error is NPUModelRunner failed, error is copy_between_host_and_device_opapi:../torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp:55 NPU function error: device error type 0, error code is 107030
+(EngineCore_DP0 pid=177596) [ERROR] 2026-08-06-15:10:46 (PID:177735, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
+(EngineCore_DP0 pid=177596) [PID: 177735] 2026-08-06-15:10:46.565.182 Not_Supported(EE1016): Synchronous memory copy failed. Reason: The current thread 177735 is in the capture state and the current operation cannot be performed. Check whether the mode set by the aclmdlRICaptureBegin API supports the current operation. This operation is supported only in the RELAXED mode. The mode set using the aclmdlRICaptureBegin API is GLOBAL(0), and the capture mode of the current thread is GLOBAL(0).
+(EngineCore_DP0 pid=177596) TraceBack (most recent call last):
+(EngineCore_DP0 pid=177596)         rtMemcpy execution failed, reason=operation not permitted when a stream is capturing and the specified capture mode is not relaxed[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:69]
+(EngineCore_DP0 pid=177596) ', please check the stack trace above for the root cause
+(APIServer pid=177212) Traceback (most recent call last):
+(APIServer pid=177212)   File "/usr/local/python3.11.10/bin/vllm", line 6, in <module>
+(APIServer pid=177212)     sys.exit(main())
+(APIServer pid=177212)              ^^^^^^
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/entrypoints/cli/main.py", line 95, in main
+(APIServer pid=177212)     args.dispatch_function(args)
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/entrypoints/cli/serve.py", line 148, in cmd
+(APIServer pid=177212)     uvloop.run(run_server(args))
+(APIServer pid=177212)   File "/usr/local/python3.11.10/lib/python3.11/site-packages/uvloop/__init__.py", line 92, in run
+(APIServer pid=177212)     return runner.run(wrapper())
+(APIServer pid=177212)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=177212)   File "/usr/local/python3.11.10/lib/python3.11/asyncio/runners.py", line 118, in run
+(APIServer pid=177212)     return self._loop.run_until_complete(task)
+(APIServer pid=177212)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=177212)   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+(APIServer pid=177212)   File "/usr/local/python3.11.10/lib/python3.11/site-packages/uvloop/__init__.py", line 48, in wrapper
+(APIServer pid=177212)     return await main
+(APIServer pid=177212)            ^^^^^^^^^^
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/entrypoints/openai/api_server.py", line 759, in run_server
+(APIServer pid=177212)     await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/entrypoints/openai/api_server.py", line 773, in run_server_worker
+(APIServer pid=177212)     async with build_async_engine_client(
+(APIServer pid=177212)   File "/usr/local/python3.11.10/lib/python3.11/contextlib.py", line 210, in __aenter__
+(APIServer pid=177212)     return await anext(self.gen)
+(APIServer pid=177212)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/entrypoints/openai/api_server.py", line 139, in build_async_engine_client
+(APIServer pid=177212)     async with build_async_engine_client_from_engine_args(
+(APIServer pid=177212)   File "/usr/local/python3.11.10/lib/python3.11/contextlib.py", line 210, in __aenter__
+(APIServer pid=177212)     return await anext(self.gen)
+(APIServer pid=177212)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/entrypoints/openai/api_server.py", line 175, in build_async_engine_client_from_engine_args
+(APIServer pid=177212)     async_llm = AsyncLLM.from_vllm_config(
+(APIServer pid=177212)                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/async_llm.py", line 217, in from_vllm_config
+(APIServer pid=177212)     return cls(
+(APIServer pid=177212)            ^^^^
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/async_llm.py", line 146, in __init__
+(APIServer pid=177212)     self.engine_core = EngineCoreClient.make_async_mp_client(
+(APIServer pid=177212)                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(APIServer pid=177212)     return func(*args, **kwargs)
+(APIServer pid=177212)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core_client.py", line 131, in make_async_mp_client
+(APIServer pid=177212)     return DPLBAsyncMPClient(*client_args)
+(APIServer pid=177212)            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core_client.py", line 1398, in __init__
+(APIServer pid=177212)     super().__init__(
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core_client.py", line 1215, in __init__
+(APIServer pid=177212)     super().__init__(
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(APIServer pid=177212)     return func(*args, **kwargs)
+(APIServer pid=177212)            ^^^^^^^^^^^^^^^^^^^^^
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core_client.py", line 963, in __init__
+(APIServer pid=177212)     super().__init__(
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/core_client.py", line 573, in __init__
+(APIServer pid=177212)     with launch_core_engines(
+(APIServer pid=177212)   File "/usr/local/python3.11.10/lib/python3.11/contextlib.py", line 144, in __exit__
+(APIServer pid=177212)     next(self.gen)
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/utils.py", line 1213, in launch_core_engines
+(APIServer pid=177212)     wait_for_engine_startup(
+(APIServer pid=177212)   File "/home/g00619970/moeoffload_multi/vllm/vllm/v1/engine/utils.py", line 1272, in wait_for_engine_startup
+(APIServer pid=177212)     raise RuntimeError(
+(APIServer pid=177212) RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+(APIServer pid=177212) [ERROR] 2026-08-06-15:11:25 (PID:177212, Device:-1, RankID:-1) ERR99999 UNKNOWN applicaiton exception
+/usr/local/python3.11.10/lib/python3.11/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 2 leaked shared_memory objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

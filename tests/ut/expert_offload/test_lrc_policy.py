@@ -190,6 +190,11 @@ def test_hotness_returns_python_float():
     policy = LRCExpertCachePolicy(
         num_layers=1, num_experts=8, cache_size=4, topk=2)
     policy.observe(0, [[1, 2]])
+    # THIS TEST FAILS against the current lrc_policy. `ema` is a float32
+    # array, so `ema_weight * state.ema[expert_id]` returns np.float32,
+    # which -- unlike np.float64 -- does not subclass float. It needs a
+    # one-line source change (wrap hotness()'s return in float()); it cannot
+    # be fixed from the test without weakening the assertion it exists to make.
     assert isinstance(policy.hotness(0, 1), float)
 
 
