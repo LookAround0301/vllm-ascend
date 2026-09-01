@@ -27,8 +27,8 @@ from vllm.logger import logger
 # names at use sites.
 #   key      : series name
 #   label    : printed label
-#   source   : the per-layer value it reduces
-#   reduce   : 'mean' across contributing layers, or 'sum' over them
+#   source   : per-layer value it reduces; None for a run-level series
+#   reduce   : 'mean' or 'sum' across layers; None for a run-level series
 #   in_csv   : whether it is a per-layer quantity worth a CSV column
 _METRICS = (
     ("gsize",        "routed experts    |G| /layer",   "gsize",     "mean", True),
@@ -50,14 +50,25 @@ _METRICS = (
     ("pf_useful",    "prefetch useful    |N&G|/|N|",   "pf_useful", "mean", True),
     ("pf_wait",      "prefetch stall  ms /layer",      "pf_wait",   "mean", True),
     ("pf_wait_step", "prefetch stall  ms /step",       "pf_wait",   "sum",  False),
+    ("draft_e2e",    "draft ms",                       None,        None,   False),
+    ("verify",       "verify ms",                      None,        None,   False),
+    ("e2e_forward",  "e2e forward ms",                 None,        None,   False),
 )
 
 # The per-layer slots a single record_layer() call may fill.
 _LAYER_KEYS = tuple(
-    dict.fromkeys(source for _k, _l, source, _r, _c in _METRICS))
+    dict.fromkeys(
+        source
+        for _key, _label, source, _reduce, _in_csv in _METRICS
+        if source is not None
+    )
+)
 
 _CSV_COLUMNS = tuple(
-    source for _k, _l, source, _r, in_csv in _METRICS if in_csv)
+    source
+    for _key, _label, source, _reduce, in_csv in _METRICS
+    if in_csv and source is not None
+)
 
 _LEGEND = (
     "|G| routed      — the router's own selection for this layer, pre-subst",
@@ -355,20 +366,52 @@ class DecodeStatsCollector:
         acceptance rate = accepted / proposed, acceptance length = 1 + accepted per
         draft, bonus token included by convention.
         """
-        if not self.collecting or n_drafts <= 0 or proposed <= 0:
+        if not self.collecting or n_drafts <= 0:
             return
         with self._lock:
             self._spec_len.append(1.0 + accepted / n_drafts)
-            self._spec_rate.append(accepted / proposed)
+            # Structured-output filtering can leave a real draft event with
+            # zero valid proposals. It contributes to acceptance length and
+            # the raw totals, but has no defined acceptance-rate sample.
+            if proposed > 0:
+                self._spec_rate.append(accepted / proposed)
             self._spec_accepted += accepted
             self._spec_proposed += proposed
             self._spec_drafts += n_drafts
+
+    def record_spec_profile(
+        self,
+        *,
+        draft_e2e: list[float] | None = None,
+        verify: list[float] | None = None,
+        e2e_forward: list[float] | None = None,
+    ) -> None:
+        """Add speculative-decoding timing samples, in milliseconds.
+
+        The model runner resolves a window of NPU events with one device
+        synchronization, then adds the window under one collector lock.
+        """
+        if not self.collecting:
+            return
+        samples = {
+            "draft_e2e": draft_e2e,
+            "verify": verify,
+            "e2e_forward": e2e_forward,
+        }
+        with self._lock:
+            if not self.collecting:
+                return
+            for key, values in samples.items():
+                if values:
+                    self._series[key].extend(values)
 
     def _close_step_locked(self) -> None:
         """Reduce the open step across layers. Caller holds _lock."""
         if not self._step_open:
             return
         for key, _label, source, reduce_kind, _in_csv in _METRICS:
+            if source is None:
+                continue
             layer_values = self._step_vals[source]
             if not layer_values:
                 continue  # no contributing layer this step: no sample, not 0.0
@@ -516,7 +559,9 @@ class DecodeStatsCollector:
         lines.append(f"{'metric':<32}{'mean':>10}{'median':>10}"
                      f"{'min':>10}{'max':>10}{'steps':>8}")
         lines.append("-" * width)
-        for key, label, _source, _reduce, _in_csv in _METRICS:
+        for key, label, source, _reduce, _in_csv in _METRICS:
+            if source is None:
+                continue
             stats = _summarize_series(self._series[key])
             if stats is None:
                 continue  # a section with no samples prints nothing
@@ -528,6 +573,15 @@ class DecodeStatsCollector:
         spec_rate = _summarize_series(self._spec_rate)
         if spec_len is not None and spec_rate is not None:
             lines.append("-" * width)
+            for key, label, source, _reduce, _in_csv in _METRICS:
+                if source is not None:
+                    continue
+                stats = _summarize_series(self._series[key])
+                if stats is None:
+                    continue
+                mean, med, lo, hi, n = stats
+                lines.append(f"{label:<32}{mean:>10.4f}{med:>10.4f}"
+                             f"{lo:>10.4f}{hi:>10.4f}{n:>8d}")
             for label, stats in (("acceptance length (1+acc)", spec_len),
                                  ("acceptance rate  acc/prop", spec_rate)):
                 mean, med, lo, hi, n = stats
