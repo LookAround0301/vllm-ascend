@@ -214,6 +214,8 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+_SPEC_PROFILE_WARMUP_STEPS = 5
+_SPEC_PROFILE_FLUSH_SECONDS = 2.0
 
 
 @dataclass
@@ -415,10 +417,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.num_rejected_tokens_event = torch.npu.Event()
             self.num_rejected_tokens_copy_stream = torch.npu.Stream()
-            
-        # pending record for deferred speculative-decoding statistics
-        self._spec_stats_pending: tuple[list[int], int] | None = None
-        
+
         try:
             self.dcp_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
@@ -583,6 +582,102 @@ class NPUModelRunner(GPUModelRunner):
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: Any | None = None
         self._mamba_copy_bufs: Any | None = None
+
+        # Decode-statistics speculative timing. NPU event windows are resolved
+        # periodically so they stay bounded during long-running services.
+        self._spec_profile_last_flush = time.monotonic()
+        self._spec_profile_draft_e2e_seen = 0
+        self._spec_profile_verify_seen = 0
+        self._spec_profile_e2e_seen = 0
+        self._spec_profile_e2e_start_time: float | None = None
+        self._spec_profile_draft_e2e_events: list[
+            tuple[torch.npu.Event, torch.npu.Event]
+        ] = []
+        self._spec_profile_verify_events: list[
+            tuple[torch.npu.Event, torch.npu.Event]
+        ] = []
+        self._spec_profile_e2e_ms: list[float] = []
+
+    @staticmethod
+    def _new_spec_profile_event_pair() -> tuple[
+        torch.npu.Event, torch.npu.Event
+    ]:
+        return (
+            torch.npu.Event(enable_timing=True),
+            torch.npu.Event(enable_timing=True),
+        )
+
+    @staticmethod
+    def _spec_profile_collecting() -> bool:
+        stats = get_decode_stats()
+        return stats is not None and stats.collecting
+
+    def _flush_spec_profile(self) -> None:
+        """Resolve pending NPU timings into the decode-statistics collector."""
+        if not (
+            self._spec_profile_draft_e2e_events
+            or self._spec_profile_verify_events
+            or self._spec_profile_e2e_ms
+        ):
+            return
+
+        try:
+            stats = get_decode_stats()
+            if stats is None:
+                return
+
+            # Resolve all event windows with one device synchronization.
+            torch.npu.synchronize()
+
+            def _window_samples(
+                events: list[tuple[torch.npu.Event, torch.npu.Event]],
+            ) -> list[float] | None:
+                if not events:
+                    return None
+                return [
+                    start.elapsed_time(end) for start, end in events
+                ]
+
+            stats.record_spec_profile(
+                draft_e2e=_window_samples(
+                    self._spec_profile_draft_e2e_events
+                ),
+                verify=_window_samples(self._spec_profile_verify_events),
+                e2e_forward=self._spec_profile_e2e_ms or None,
+            )
+        except Exception:
+            logger.exception(
+                "[SPEC_PROFILE] failed to collect speculative timing"
+            )
+        finally:
+            self._spec_profile_draft_e2e_events.clear()
+            self._spec_profile_verify_events.clear()
+            self._spec_profile_e2e_ms.clear()
+
+    def _maybe_flush_spec_profile(self) -> None:
+        now = time.monotonic()
+        if (
+            now - self._spec_profile_last_flush
+            < _SPEC_PROFILE_FLUSH_SECONDS
+        ):
+            return
+        self._spec_profile_last_flush = now
+        self._flush_spec_profile()
+
+    def _finish_spec_profile_e2e(self) -> None:
+        """Finish a synchronized wall-clock speculative forward sample."""
+        start_time = self._spec_profile_e2e_start_time
+        if start_time is None:
+            return
+
+        # Include draft/verify kernels, side-stream copies, and waits in the
+        # complete model-runner step, matching the dspark-profile definition.
+        torch.npu.synchronize()
+        self._spec_profile_e2e_ms.append(
+            (time.perf_counter() - start_time) * 1000.0
+        )
+        self._spec_profile_e2e_start_time = None
+
     @property
     def use_dcp(self) -> bool:
         return self.dcp_size > 1
@@ -1591,6 +1686,20 @@ class NPUModelRunner(GPUModelRunner):
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
 
+            # Time the complete draft path: input/setup plus _propose().
+            profile_draft_e2e = False
+            if self._spec_profile_collecting():
+                self._spec_profile_draft_e2e_seen += 1
+                profile_draft_e2e = (
+                    self._spec_profile_draft_e2e_seen
+                    > _SPEC_PROFILE_WARMUP_STEPS
+                )
+            if profile_draft_e2e:
+                draft_e2e_start_event, draft_e2e_end_event = (
+                    self._new_spec_profile_event_pair()
+                )
+                draft_e2e_start_event.record()
+
             if self.vllm_config.speculative_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
                 # the cpu-side list[list[int]] of valid sampled tokens for each
@@ -1695,6 +1804,11 @@ class NPUModelRunner(GPUModelRunner):
                     else None
                 ),
             )
+            if profile_draft_e2e:
+                draft_e2e_end_event.record()
+                self._spec_profile_draft_e2e_events.append(
+                    (draft_e2e_start_event, draft_e2e_end_event)
+                )
             if get_pp_group().world_size > 1 and hasattr(
                 self.drafter, "take_last_draft_probs"
             ):
@@ -1781,6 +1895,27 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        self._maybe_flush_spec_profile()
+
+        # Measure only steady-state speculative verification steps. The first
+        # draft-only bootstrap step has no scheduled speculative tokens.
+        # This diagnostic deliberately synchronizes the NPU at both boundaries
+        # and is reachable only when decode statistics are explicitly enabled.
+        self._spec_profile_e2e_start_time = None
+        if (
+            self._spec_profile_collecting()
+            and self.speculative_config is not None
+            and scheduler_output.scheduled_spec_decode_tokens
+            and (
+                get_pp_group().is_last_rank
+                or self.broadcast_pp_output
+            )
+        ):
+            self._spec_profile_e2e_seen += 1
+            if self._spec_profile_e2e_seen > _SPEC_PROFILE_WARMUP_STEPS:
+                torch.npu.synchronize()
+                self._spec_profile_e2e_start_time = time.perf_counter()
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
@@ -2136,9 +2271,28 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+
+            profile_verify = False
+            if use_spec_decode and self._spec_profile_collecting():
+                self._spec_profile_verify_seen += 1
+                profile_verify = (
+                    self._spec_profile_verify_seen
+                    > _SPEC_PROFILE_WARMUP_STEPS
+                )
+                if profile_verify:
+                    verify_start_event, verify_end_event = (
+                        self._new_spec_profile_event_pair()
+                    )
+                    verify_start_event.record()
+
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if profile_verify:
+                verify_end_event.record()
+                self._spec_profile_verify_events.append(
+                    (verify_start_event, verify_end_event)
+                )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2323,9 +2477,6 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
-        
-        # Capture speculative-decoding acceptance for the end-of-run summary
-        self._record_spec_decode_stats(spec_decode_metadata, valid_sampled_token_ids, invalid_req_indices)
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -2406,6 +2557,7 @@ class NPUModelRunner(GPUModelRunner):
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
+            self._finish_spec_profile_e2e()
             return model_runner_output
         
         # Async path: produce a device-side snapshot that the async
@@ -2443,6 +2595,7 @@ class NPUModelRunner(GPUModelRunner):
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
         )
+        self._finish_spec_profile_e2e()
         return async_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
@@ -2618,122 +2771,7 @@ class NPUModelRunner(GPUModelRunner):
             req_id_to_index_output_copy,
             invalid_req_indices,
         )
-        
-    def _spec_stats_eligible(self, spec_decode_metadata, invalid_req_indices):
-        """Rows that count toward this step's speculative-decoding sample.
 
-        Eligible = the request actually drafted (proposed > 0) and its sampled
-        tokens were not discarded. A step where nothing drafted — the first decode
-        step after a prefill, for instance — yields None and contributes no sample,
-        matching vLLM's convention of counting only real drafting events
-        (https://docs.vllm.ai/en/stable/api/vllm/v1/spec_decode/metrics/).
-
-        Returns (row_indices, proposed_total) or None.
-        """
-        if spec_decode_metadata is None:
-            return None
-        num_draft_tokens = spec_decode_metadata.num_draft_tokens
-        discarded = {int(i) for i in invalid_req_indices}
-        indices = [
-            i for i in range(len(num_draft_tokens))
-            if int(num_draft_tokens[i]) > 0 and i not in discarded
-        ]
-        if not indices:
-            return None
-        return indices, sum(int(num_draft_tokens[i]) for i in indices)
-
-    def _harvest_async_spec_stats(self, stats, blocking: bool = True) -> None:
-        """Record the PREVIOUS step's acceptance from the engine's pinned buffer.
-
-        `valid_sampled_token_count_cpu[i]` is the number of valid sampled tokens
-        for request i, i.e. 1 + accepted drafts. The copy that fills it was
-        launched a full step ago on a side stream, so waiting on its event is a
-        no-op in steady state — this is the same reasoning, and the same event,
-        that `_correct_optimistic_seq_lens_cpu` relies on (see its docstring).
-        That is why the statistics need no device accumulator and add no sync.
-
-        """
-        pending = self._spec_stats_pending
-        self._spec_stats_pending = None
-        if pending is None:
-            return
-        counts_cpu = self.valid_sampled_token_count_cpu
-        event = self.valid_sampled_token_count_event
-        if counts_cpu is None or event is None:
-            return
-        if blocking:
-            event.synchronize()
-        else:
-            query = getattr(event, "query", None)
-            if not callable(query) or not query():
-                # Not signalled, or no query() on this torch_npu: drop one sample.
-                return
-        counts = counts_cpu.numpy()
-        indices, proposed_total = pending
-        accepted_total = 0
-        for i in indices:
-            if i >= counts.shape[0]:
-                # The batch shrank between the two steps. Drop the whole sample
-                # rather than attribute a count to the wrong request.
-                return
-            accepted_total += max(0, int(counts[i]) - 1)
-        stats.record_spec_step_totals(
-            accepted=accepted_total,
-            proposed=proposed_total,
-            n_drafts=len(indices),
-        )
-
-    def _record_spec_decode_stats(self, spec_decode_metadata,
-                                  valid_sampled_token_ids,
-                                  invalid_req_indices) -> None:
-        """Record one step's speculative-decoding acceptance.
-
-        Two paths, neither of which adds synchronisation:
-
-        * async scheduling — `_bookkeeping_sync` sets `valid_sampled_token_ids = []`
-          and the per-request accepted counts never reach the host through it, so
-          the sample is taken from the engine's own pinned count buffer, deferred
-          by one step (harvest N-1 here, stash N for the next call).
-        * sync scheduling — `valid_sampled_token_ids` is already a host list whose
-          D2H has happened, so the sample is taken immediately.
-        """
-        stats = get_decode_stats()
-        if stats is None or not stats.collecting:
-            self._spec_stats_pending = None
-            return
-
-        if self.use_async_scheduling:
-            self._harvest_async_spec_stats(stats)
-            self._spec_stats_pending = self._spec_stats_eligible(
-                spec_decode_metadata, invalid_req_indices)
-            return
-
-        # Sync path. Discarded requests already have their entry cleared here, so
-        # an empty list is the discard test and `invalid_req_indices` is empty.
-        eligible = self._spec_stats_eligible(spec_decode_metadata,
-                                             invalid_req_indices)
-        if eligible is None or not valid_sampled_token_ids:
-            return
-        indices, _proposed_total = eligible
-        num_draft_tokens = spec_decode_metadata.num_draft_tokens
-        accepted_total = 0
-        proposed_total = 0
-        n_drafts = 0
-        for i in indices:
-            if i >= len(valid_sampled_token_ids):
-                break
-            sampled = valid_sampled_token_ids[i]
-            if not sampled:
-                continue
-            accepted_total += max(0, len(sampled) - 1)  # minus the bonus token
-            proposed_total += int(num_draft_tokens[i])
-            n_drafts += 1
-        stats.record_spec_step_totals(
-            accepted=accepted_total,
-            proposed=proposed_total,
-            n_drafts=n_drafts,
-        )
-        
     def _build_decode_stats_header(self) -> dict:
         """Run-configuration header for the statistics summary.
 
@@ -2816,16 +2854,9 @@ class NPUModelRunner(GPUModelRunner):
         which is what actually guarantees an artifact exists.
         """
         logger.info("[DECODE-STATS] model runner shutdown: flushing statistics")
+        self._flush_spec_profile()
         stats = get_decode_stats()
         if stats is not None:
-            try:
-                if self.use_async_scheduling:
-                    # CHANGE: non-blocking. Losing the final step's acceptance
-                    # sample costs one sample out of hundreds; blocking here could
-                    # cost the entire summary.
-                    self._harvest_async_spec_stats(stats, blocking=False)
-            except Exception:
-                logger.exception("[DECODE-STATS] final spec-decode harvest failed")
             try:
                 stats.summarize(self._build_decode_stats_header())
             except Exception:
