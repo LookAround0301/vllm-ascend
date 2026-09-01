@@ -326,6 +326,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
+        self.is_decode_step: bool = False
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -1320,6 +1321,11 @@ class NPUModelRunner(GPUModelRunner):
         else:
             attn_state = AscendAttentionState.PrefillCacheHit
 
+        # latch the scheduling regime from the LOCAL attn_state, before the
+        # rewrite below can turn a SpecDecoding step into ChunkedPrefill
+        self.is_decode_step = attn_state in (AscendAttentionState.DecodeOnly,
+                                             AscendAttentionState.SpecDecoding)
+
         if attn_state == AscendAttentionState.SpecDecoding and self.speculative_config.method != "mtp":
             self.attn_state = AscendAttentionState.ChunkedPrefill  # type: ignore
         else:
@@ -2100,9 +2106,11 @@ class NPUModelRunner(GPUModelRunner):
         # tell the statistics collector whether this forward is a decode step.
         _stats = get_decode_stats()
         if _stats is not None:
-            _stats.set_step_kind(
-                self.attn_state in (AscendAttentionState.DecodeOnly,
-                                    AscendAttentionState.SpecDecoding))
+            # was `self.attn_state in (DecodeOnly, SpecDecoding)`. That
+            # attribute is rewritten to ChunkedPrefill for every speculative
+            # method except "mtp" (_build_attn_state, end of function), so under
+            # DSpark this evaluated False on EVERY verify forward
+            _stats.set_step_kind(self.is_decode_step)
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2745,7 +2753,7 @@ class NPUModelRunner(GPUModelRunner):
                 f"tp={self.parallel_config.tensor_parallel_size} "
                 f"max_num_seqs={self.max_num_reqs} "
                 f"max_model_len={self.max_model_len} "
-                f"mtp={'on(k=%d)' % self.num_spec_tokens if spec else 'off'}")
+                f"spec={'%s(k=%d)' % (getattr(spec, 'method', 'spec'), self.num_spec_tokens) if spec else 'off'}")
         except Exception:
             pass
         manager = getattr(self, "offload_manager", None)

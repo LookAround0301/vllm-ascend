@@ -59,6 +59,14 @@ _LAYER_KEYS = tuple(
 _CSV_COLUMNS = tuple(
     source for _k, _l, source, _r, in_csv in _METRICS if in_csv)
 
+_LEGEND = (
+    "|G| routed      — the router's own selection for this layer, pre-subst",
+    "|P| predicted   — experts the predictor named for this layer",
+    "|A| resident    — the subset of |P| already cached, so not transferred",
+    "|N| transferred — the subset of |P| actually copied H2D this step",
+    "combined forms are set ops: |N&G| intersection, |N-G| difference",
+)
+
 # watchdog cadence. Not a snapshot interval
 _WATCHDOG_TICK_SECONDS = 1.0
 _QUIET_SECONDS = 3.0
@@ -499,6 +507,10 @@ class DecodeStatsCollector:
             lines.append(
                 "note     : no decode steps were measured (offload inactive, "
                 "prefill-only run, or statistics never armed).")
+
+        # Emit the symbol legend as part of the header block
+        for _index, _entry in enumerate(_LEGEND):
+            lines.append(f"{'legend   : ' if _index == 0 else ' ' * 11}{_entry}")
 
         lines.append("-" * width)
         lines.append(f"{'metric':<32}{'mean':>10}{'median':>10}"
