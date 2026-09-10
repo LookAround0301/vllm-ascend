@@ -969,6 +969,28 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
+        # Resolve this layer's AI-predictor capture site here. Must come
+        # after self.mlp is built — DeepseekV4MoE -> FusedMoE ->
+        # AscendMoERunner.__init__ registers the MoE layer with the offload
+        # manager, so its gate is only findable afterwards.
+        # depends on the method's layer_delta. 
+        # delta=0 (mode2_har) captures the PRE-attention residual and targets this layer; 
+        # delta=1 (mode2_prevhfr) captures the POST-attention residual
+        # and targets the next one.
+        self._predict_target_idx = None
+        self._predict_at_ffn = False
+        self._predict_driver = None
+        if not is_draft_layer and not getattr(self.mlp, "is_sequence_parallel", False):
+            from vllm_ascend.expert_offload.expert_predictor import get_driver
+
+            driver = get_driver()
+            if driver is not None:
+                moe_idx = driver.register_site(self.mlp.gate)
+                if moe_idx is not None:
+                    self._predict_target_idx = moe_idx + driver.layer_delta
+                    self._predict_at_ffn = driver.layer_delta > 0
+                    self._predict_driver = driver
+
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         y = torch.ops._C_ascend.npu_hc_pre_v2(
             x, hc_fn, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.norm_eps, self.hc_eps
@@ -988,13 +1010,23 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        residual = hidden_states.clone()
+        # AI predictor — the `har` atom: the raw block input
+        if self._predict_driver is not None and not self._predict_at_ffn:
+            residual = torch.ops.vllm_ascend.expert_predictor_launch(
+                self._predict_target_idx, hidden_states)
+        else:
+            residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hidden_states = self.input_layernorm(hidden_states)
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
         hidden_states = self.self_attn(**attn_kwargs)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        residual = hidden_states.clone()
+        # AI predictor — the `hfr` atom: the post-attention block input
+        if self._predict_driver is not None and self._predict_at_ffn:
+            residual = torch.ops.vllm_ascend.expert_predictor_launch(
+                self._predict_target_idx, hidden_states)
+        else:
+            residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -1525,5 +1557,18 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                         weight_loader(param, loaded_weight)
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
+
+        # ReMoE router-gate override, at the tail of load_weights and
+        # nowhere else. Everything that derives a copy of the gate runs strictly
+        # later — vLLM's process_weights_after_loading (which creates
+        # gate.weight_fp32, the tensor shared_forward_impl actually routes with, and
+        # may re-lay-out gate.weight as FRACTAL_NZ) and then
+        # ExpertOffloadManager.register_gate_weights during _finalize_offload — so
+        # both pick up the new weights with no extra work.
+        gate_override_path = getattr(get_ascend_config(), "moe_gate_override_path", None)
+        if gate_override_path:
+            from vllm_ascend.models.moe_gate_override import apply_moe_gate_override
+
+            apply_moe_gate_override(self, params_dict, loaded_params, gate_override_path)
 
         return loaded_params

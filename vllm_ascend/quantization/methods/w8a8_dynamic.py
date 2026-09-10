@@ -412,6 +412,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 swiglu_limit=layer.swiglu_limit,
                 swiglu_alpha=getattr(layer, "swiglu_alpha", 1.0),
                 swiglu_beta=getattr(layer, "swiglu_beta", 0.0),
+                # Mirrors w4a8.py.
+                num_local_experts=layer.moe_config.num_local_experts,
             )
         )
         if zero_expert_num > 0 and zero_expert_type is not None:

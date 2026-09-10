@@ -17,12 +17,15 @@ from vllm_ascend.expert_offload.h2d_transfer import H2DCopyTask
 
 
 def _manager_for_prediction(next_layer, gate_weight, *, topk=2,
-                            prefetch_topk=2):
+                            prefetch_topk=2, prefetch_tokens=1):
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager.moe_layers = [SimpleNamespace(), next_layer]
     manager._gate_weights_npu = [None, gate_weight]
     manager.topk = topk
     manager.prefetch_topk = prefetch_topk
+    # predict_next_layer_experts_npu reads prefetch_tokens on both the
+    # hash (tid2eid) branch and the learned-gate branch
+    manager.prefetch_tokens = prefetch_tokens
     return manager
 
 
@@ -570,6 +573,7 @@ def test_single_card_substitution_changes_ids_but_preserves_weights():
     manager.topk = 2
     manager._debug = False
     manager.cache_policy = None
+    manager._stats = None      # _update_weights reads it before any guard
     manager.load_stream = MagicMock()
     topk_ids_h = torch.tensor([[0, 1]], dtype=torch.int32)
     topk_weights_h = torch.tensor([[0.40, 0.25]])
@@ -831,6 +835,7 @@ def test_single_card_update_submits_misses_as_one_batch():
     manager.topk = 1
     manager._debug = False
     manager.cache_policy = None
+    manager._stats = None      # _update_weights reads it before any guard
     manager.load_stream = MagicMock()
     manager._load_expert_weights_into_slots = MagicMock()
     topk_ids_h = torch.tensor([[1]], dtype=torch.int32)
@@ -864,6 +869,7 @@ def test_single_card_update_ranks_all_lrc_victims_once():
     manager.cache_policy = MagicMock()
     manager.cache_policy.observe.return_value = {4, 5}
     manager.cache_policy.choose_victims.return_value = [0, 1]
+    manager._stats = None      # _update_weights reads it before any guard
     manager.load_stream = MagicMock()
     manager._record_cache_stats = MagicMock()
     manager._load_expert_weights_into_slots = MagicMock()

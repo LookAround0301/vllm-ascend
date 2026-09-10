@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -132,6 +133,7 @@ from vllm_ascend.expert_offload.expert_offload_manager import (
     has_expert_offload_manager,
     get_expert_offload_manager,
 )
+from vllm_ascend.expert_offload.decode_stats import get_decode_stats
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
@@ -412,7 +414,10 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.num_rejected_tokens_event = torch.npu.Event()
             self.num_rejected_tokens_copy_stream = torch.npu.Stream()
-
+            
+        # pending record for deferred speculative-decoding statistics
+        self._spec_stats_pending: tuple[list[int], int] | None = None
+        
         try:
             self.dcp_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
@@ -2092,6 +2097,12 @@ class NPUModelRunner(GPUModelRunner):
         defer_kv_connector_finalize = self.speculative_config is not None and (
             get_pp_group().is_last_rank or self.broadcast_pp_output
         )
+        # tell the statistics collector whether this forward is a decode step.
+        _stats = get_decode_stats()
+        if _stats is not None:
+            _stats.set_step_kind(
+                self.attn_state in (AscendAttentionState.DecodeOnly,
+                                    AscendAttentionState.SpecDecoding))
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2304,6 +2315,9 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        
+        # Capture speculative-decoding acceptance for the end-of-run summary
+        self._record_spec_decode_stats(spec_decode_metadata, valid_sampled_token_ids, invalid_req_indices)
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -2596,6 +2610,223 @@ class NPUModelRunner(GPUModelRunner):
             req_id_to_index_output_copy,
             invalid_req_indices,
         )
+        
+    def _spec_stats_eligible(self, spec_decode_metadata, invalid_req_indices):
+        """Rows that count toward this step's speculative-decoding sample.
+
+        Eligible = the request actually drafted (proposed > 0) and its sampled
+        tokens were not discarded. A step where nothing drafted — the first decode
+        step after a prefill, for instance — yields None and contributes no sample,
+        matching vLLM's convention of counting only real drafting events
+        (https://docs.vllm.ai/en/stable/api/vllm/v1/spec_decode/metrics/).
+
+        Returns (row_indices, proposed_total) or None.
+        """
+        if spec_decode_metadata is None:
+            return None
+        num_draft_tokens = spec_decode_metadata.num_draft_tokens
+        discarded = {int(i) for i in invalid_req_indices}
+        indices = [
+            i for i in range(len(num_draft_tokens))
+            if int(num_draft_tokens[i]) > 0 and i not in discarded
+        ]
+        if not indices:
+            return None
+        return indices, sum(int(num_draft_tokens[i]) for i in indices)
+
+    def _harvest_async_spec_stats(self, stats, blocking: bool = True) -> None:
+        """Record the PREVIOUS step's acceptance from the engine's pinned buffer.
+
+        `valid_sampled_token_count_cpu[i]` is the number of valid sampled tokens
+        for request i, i.e. 1 + accepted drafts. The copy that fills it was
+        launched a full step ago on a side stream, so waiting on its event is a
+        no-op in steady state — this is the same reasoning, and the same event,
+        that `_correct_optimistic_seq_lens_cpu` relies on (see its docstring).
+        That is why the statistics need no device accumulator and add no sync.
+
+        """
+        pending = self._spec_stats_pending
+        self._spec_stats_pending = None
+        if pending is None:
+            return
+        counts_cpu = self.valid_sampled_token_count_cpu
+        event = self.valid_sampled_token_count_event
+        if counts_cpu is None or event is None:
+            return
+        if blocking:
+            event.synchronize()
+        else:
+            query = getattr(event, "query", None)
+            if not callable(query) or not query():
+                # Not signalled, or no query() on this torch_npu: drop one sample.
+                return
+        counts = counts_cpu.numpy()
+        indices, proposed_total = pending
+        accepted_total = 0
+        for i in indices:
+            if i >= counts.shape[0]:
+                # The batch shrank between the two steps. Drop the whole sample
+                # rather than attribute a count to the wrong request.
+                return
+            accepted_total += max(0, int(counts[i]) - 1)
+        stats.record_spec_step_totals(
+            accepted=accepted_total,
+            proposed=proposed_total,
+            n_drafts=len(indices),
+        )
+
+    def _record_spec_decode_stats(self, spec_decode_metadata,
+                                  valid_sampled_token_ids,
+                                  invalid_req_indices) -> None:
+        """Record one step's speculative-decoding acceptance.
+
+        Two paths, neither of which adds synchronisation:
+
+        * async scheduling — `_bookkeeping_sync` sets `valid_sampled_token_ids = []`
+          and the per-request accepted counts never reach the host through it, so
+          the sample is taken from the engine's own pinned count buffer, deferred
+          by one step (harvest N-1 here, stash N for the next call).
+        * sync scheduling — `valid_sampled_token_ids` is already a host list whose
+          D2H has happened, so the sample is taken immediately.
+        """
+        stats = get_decode_stats()
+        if stats is None or not stats.collecting:
+            self._spec_stats_pending = None
+            return
+
+        if self.use_async_scheduling:
+            self._harvest_async_spec_stats(stats)
+            self._spec_stats_pending = self._spec_stats_eligible(
+                spec_decode_metadata, invalid_req_indices)
+            return
+
+        # Sync path. Discarded requests already have their entry cleared here, so
+        # an empty list is the discard test and `invalid_req_indices` is empty.
+        eligible = self._spec_stats_eligible(spec_decode_metadata,
+                                             invalid_req_indices)
+        if eligible is None or not valid_sampled_token_ids:
+            return
+        indices, _proposed_total = eligible
+        num_draft_tokens = spec_decode_metadata.num_draft_tokens
+        accepted_total = 0
+        proposed_total = 0
+        n_drafts = 0
+        for i in indices:
+            if i >= len(valid_sampled_token_ids):
+                break
+            sampled = valid_sampled_token_ids[i]
+            if not sampled:
+                continue
+            accepted_total += max(0, len(sampled) - 1)  # minus the bonus token
+            proposed_total += int(num_draft_tokens[i])
+            n_drafts += 1
+        stats.record_spec_step_totals(
+            accepted=accepted_total,
+            proposed=proposed_total,
+            n_drafts=n_drafts,
+        )
+        
+    def _build_decode_stats_header(self) -> dict:
+        """Run-configuration header for the statistics summary.
+
+        Every lookup is defensive: this runs at shutdown, possibly during a
+        partially torn-down process, and a missing attribute must not cost the
+        whole summary. The header is what makes an archived summary
+        self-describing, so it is worth carrying.
+        """
+        lines = []
+        try:
+            regime = "eager" if self.model_config.enforce_eager else (
+                "graph" if getattr(self, "use_aclgraph", False) else "eager")
+            spec = self.speculative_config
+            lines.append(
+                f"run      : model={os.path.basename(str(self.model_config.model))} "
+                f"quant={self.model_config.quantization} regime={regime} "
+                f"tp={self.parallel_config.tensor_parallel_size} "
+                f"max_num_seqs={self.max_num_reqs} "
+                f"max_model_len={self.max_model_len} "
+                f"mtp={'on(k=%d)' % self.num_spec_tokens if spec else 'off'}")
+        except Exception:
+            pass
+        manager = getattr(self, "offload_manager", None)
+        if manager is not None:
+            try:
+                config = manager.offload_config
+                lines.append(
+                    f"offload  : device_experts={manager.num_device_experts}"
+                    f"/{manager.num_total_experts} topk={manager.topk} "
+                    f"threshold={manager.offload_threshold} "
+                    f"policy={'lrc' if config.cache_policy_enabled else 'off'} "
+                    f"prefetch={'on(num=%d)' % config.expert_prefetch_num if config.expert_prefetch_enabled else 'off'} "
+                    f"subst={'on(%.3f)' % config.expert_substitution_threshold if config.expert_substitution_enabled else 'off'} "
+                    f"multi_card={config.enable_multi_card} "
+                    f"debug={config.moe_offload_debug}")
+                # the decode/prefill split is decided on MoE token ROWS, and
+                # AllGatherCommImpl concatenates every DP rank's rows before the
+                # MoE — so the count compared against offload_threshold is
+                # seqs x (1 + spec) x dp, not the batch size.
+                dp_size = self.parallel_config.data_parallel_size
+                per_req = 1 + (self.num_spec_tokens if self.speculative_config
+                               else 0)
+                moe_tokens = self.max_num_reqs * per_req * dp_size
+                paging = moe_tokens <= manager.offload_threshold
+                lines.append(
+                    f"decode   : moe_rows/step={moe_tokens} "
+                    f"(seqs={self.max_num_reqs} x {per_req} x dp={dp_size}) "
+                    f"threshold={manager.offload_threshold} -> "
+                    f"{'paging' if paging else 'PREFILL-POOL (no statistics)'}")
+                if not paging:
+                    logger.warning_once(
+                        "[DECODE-STATS] moe token rows/step=%d exceeds "
+                        "offload_threshold=%d: every decode step takes the "
+                        "prefill-pool path, so there is no paging, no prefetch "
+                        "and no cache statistics. Raise num_device_experts to "
+                        ">= %d, or lower max_num_seqs / num_speculative_tokens / "
+                        "data_parallel_size.",
+                        moe_tokens, manager.offload_threshold,
+                        moe_tokens * manager.topk)
+            except Exception:
+                pass
+        else:
+            lines.append("offload  : disabled (spec-decode statistics only)")
+        return {"lines": lines}
+    
+    def shutdown(self) -> None:
+        """Emit the decode-statistics summary, then hand off to the parent.
+
+        ORDER IS THE WHOLE POINT HERE. vLLM's APIServer process manager SIGKILLs
+        the EngineCore in the same second it sends SIGTERM (`timeout=0s`,
+        `utils.py:626 force killing remaining processes`), so this method gets a
+        sub-second budget and only the first thing in it is guaranteed to run.
+        The statistics are the only work here that cannot be redone, so they go
+        first; the parent's teardown — KV connector, graph pools, threads, any of
+        which can take longer than the budget — goes last. The previous version
+        had `parent_shutdown()` ahead of `summarize()` and lost the summary of
+        every run because of it.
+
+        Still best effort: the collector also flushes periodically during the run,
+        which is what actually guarantees an artifact exists.
+        """
+        logger.info("[DECODE-STATS] model runner shutdown: flushing statistics")
+        stats = get_decode_stats()
+        if stats is not None:
+            try:
+                if self.use_async_scheduling:
+                    # CHANGE: non-blocking. Losing the final step's acceptance
+                    # sample costs one sample out of hundreds; blocking here could
+                    # cost the entire summary.
+                    self._harvest_async_spec_stats(stats, blocking=False)
+            except Exception:
+                logger.exception("[DECODE-STATS] final spec-decode harvest failed")
+            try:
+                stats.summarize(self._build_decode_stats_header())
+            except Exception:
+                logger.exception(
+                    "[EXPERT-OFFLOAD-FINAL] failed to emit decode statistics")
+
+        parent_shutdown = getattr(super(), "shutdown", None)
+        if callable(parent_shutdown):
+            parent_shutdown()
 
     # all-gather one hidden-states in sp scene
     @staticmethod
@@ -3438,6 +3669,9 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
+            _stats = get_decode_stats()
+            if _stats is not None:
+                _stats.set_step_kind(False)
             with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -3570,6 +3804,14 @@ class NPUModelRunner(GPUModelRunner):
                 if "sink" in name:
                     self._has_sinks = True
                     break
+                
+            # ReMoE Check: get_model() has now run load_weights (which applied the
+            # gate override) AND process_weights_after_loading (which derived
+            # gate.weight_fp32 from it). Assert the two agree here — a no-op unless
+            # moe_gate_override_path is set
+            from vllm_ascend.models.moe_gate_override import verify_moe_gate_override
+            verify_moe_gate_override(self.model)
+                
             if hasattr(self, 'offload_manager'):
                 self._finalize_offload_setup()
             if self.drafter:
