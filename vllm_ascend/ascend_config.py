@@ -1016,6 +1016,10 @@ class ExpertOffloadConfig:
         "hot_experts_file": "",
         "expert_substitution_enabled": False,
         "expert_substitution_threshold": 0.02,
+        "experts_pruning_enabled": False,
+        "experts_pruning_debug": False,
+        # DSV4 top_k=6；thresholds[0]=0 保证最强专家永不剪
+        "experts_pruning_threshold": [0, 0, 0, 0, 0, 0],
         # Expert weight H2D backend. MemFabric selects LOCAL for single-card
         # and SHARED DRAM for multi-card expert offload.
         "h2d_backend": "torch",  # Options: "torch", "memfabric"
@@ -1262,6 +1266,17 @@ class ExpertOffloadConfig:
                 "expert_prefetch_wait_timing=true requires "
                 "expert_prefetch_enabled=true: with no prefetch there is no "
                 "join to measure")
+        if not isinstance(self.config["experts_pruning_enabled"], bool):
+            raise TypeError("experts_pruning_enabled must be a boolean")
+        thr = self.config["experts_pruning_threshold"]
+        if not isinstance(thr, (list, tuple)):
+            raise TypeError("experts_pruning_threshold must be a list")
+        if len(thr) < 1:
+            raise ValueError("experts_pruning_threshold must be non-empty")
+        if any(not isinstance(x, (int, float)) or x < 0 for x in thr):
+            raise ValueError("experts_pruning_threshold values must be >= 0")
+        if not isinstance(self.config["experts_pruning_debug"], bool):
+            raise TypeError("experts_pruning_debug must be a boolean")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None
