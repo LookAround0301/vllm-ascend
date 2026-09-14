@@ -26,10 +26,12 @@ from vllm_ascend.expert_offload.h2d_transfer import (
 )
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
 from vllm_ascend.ops.fused_moe.experts_selector import (
+    _expert_routing_scores,  # score staging for the host substitution path
     commit_expert_substitutions,
     plan_expert_substitutions,
     substitute_experts,
     substitute_experts_device,
+    substitute_experts_host_,  # substitution fused into the reactive callback
 )
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
@@ -98,6 +100,7 @@ class ExpertOffloadManager:
     # _finalize_offload, so small models do not need intermediate progress.
     _LOAD_PROGRESS_LOG_EVERY = 4096
     _DEBUG_EXPERT_SAMPLE_LIMIT = 16
+    SUBSTITUTION_ON_HOST = True
 
     @classmethod
     def get_instance(cls) -> "ExpertOffloadManager":
@@ -1887,7 +1890,23 @@ class ExpertOffloadManager:
         # [n, 256] fp32 D2H per layer per step) and the whole
         # plan_expert_substitutions Python block
         topk_ids_gt_h = None
-        if do_substitution:
+        # staged scores for the host path; None selects the NPU path in
+        # the callback (and when substitution is off).
+        subst_scores_h = None
+        if (do_substitution and self.SUBSTITUTION_ON_HOST
+                and self.topk_ids_gt_h is not None
+                and self.router_logits_h is not None):
+            # Host path
+            scores = _expert_routing_scores(router_logits.to(torch.float32),
+                                            scoring_func)
+            if e_score_correction_bias is not None:
+                scores = scores + e_score_correction_bias.to(
+                    torch.float32).unsqueeze(0)
+            subst_scores_h = self.router_logits_h[:num_tokens]
+            subst_scores_h.copy_(scores, non_blocking=_EXTRA_CTX.capturing)
+            topk_ids_gt_h = self.topk_ids_gt_h[:num_tokens]
+        elif do_substitution:
+            # NPU path
             if self.topk_ids_gt_h is not None:
                 # Ground truth G for hit_pre / pred_acc / subst (§3.6), staged
                 # BEFORE the mutation below. Deliberately NOT gated on
@@ -1935,6 +1954,7 @@ class ExpertOffloadManager:
             self._is_prefetch,
             do_substitution,
             topk_ids_gt_h,
+            subst_scores_h,
         )
         # launch the guarded wrapper — see _note_cb_failure.
         if _EXTRA_CTX.capturing:
@@ -1949,6 +1969,9 @@ class ExpertOffloadManager:
         # The substituted ids were written into topk_ids on the device above,
         # so this H2D write-back has nothing left to publish.
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
+        if subst_scores_h is not None:
+            # (host path): publish the callback's substituted ids
+            topk_ids.copy_(topk_ids_h, non_blocking=_EXTRA_CTX.capturing)
 
         # dispatch a layer-shifted predictor's prediction for the NEXT
         # layer here, behind an event recorded after this layer's on-demand
@@ -3016,9 +3039,10 @@ class ExpertOffloadManager:
              is_prefetch) = args
             do_substitution = False
             topk_ids_gt_h = None
+            subst_scores_h = None
         else:
             (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
-             is_prefetch, do_substitution, topk_ids_gt_h) = args
+             is_prefetch, do_substitution, topk_ids_gt_h, subst_scores_h) = args
         # resolve the collector once per call. `collecting` is False during
         # profile_run, warmups and graph capture, and is re-read on every graph
         # replay because this is a plain attribute read inside the callback body
@@ -3027,10 +3051,27 @@ class ExpertOffloadManager:
                                 and self._stats.collecting) else None
         gt_ids = None      # pre-substitution routed set, the ground truth
         subst_count = 0.0
+        if (do_substitution and topk_ids_gt_h is not None
+                and subst_scores_h is not None):
+            # (host path): decide the substitution
+            n_subst = substitute_experts_host_(
+                subst_scores_h.numpy(),
+                topk_ids_h.numpy(),
+                log2phy_np,
+                self.offload_config.expert_substitution_threshold,
+                topk_ids_gt_h.numpy(),
+            )
+            if self._debug:
+                self._log_expert_substitution(
+                    layer_idx, topk_ids_gt_h, topk_ids_h)
+            if stats is not None:
+                gt_ids = set(topk_ids_gt_h.reshape(-1).tolist())
+                subst_count = float(n_subst)
         # substitution already happened on the NPU before this callback
         # was launched, so all that remains is reading two [n, topk] int32
         # pinned buffers
-        if do_substitution and topk_ids_gt_h is not None:
+        elif do_substitution and topk_ids_gt_h is not None:
+            # NPU path, unchanged.
             if self._debug:
                 self._log_expert_substitution(
                     layer_idx, topk_ids_gt_h, topk_ids_h)

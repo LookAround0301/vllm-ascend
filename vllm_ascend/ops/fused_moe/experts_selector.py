@@ -16,7 +16,7 @@
 #
 from collections.abc import Callable
 from dataclasses import dataclass
-
+import numpy as np
 import torch
 import torch.nn.functional as F
 from vllm.distributed import get_tp_group
@@ -402,7 +402,83 @@ def substitute_experts_device(
     blocked = _any_per_source(miss & ~ok)
     return torch.where(ok & ~blocked,
                        substitute_id.to(topk_ids.dtype), topk_ids)
-    
+
+
+# Host mirror of substitute_experts_device, run INSIDE the reactive
+# offload callback (ExpertOffloadManager._update_weights), where the layer's
+# residency (log2phy) and routed ids are already on the host and the compute
+# stream is already blocked. Selected with ExpertOffloadManager.SUBSTITUTION_ON_HOST.
+def substitute_experts_host_(scores, topk_ids, log2phy, threshold, gt_out):
+    """In-place host mirror of substitute_experts_device.
+
+    All arguments are host numpy arrays: ``scores`` [n, E] float32 biased
+    routing scores (sqrtsoftplus(logits) + correction bias, computed on the
+    NPU), ``topk_ids`` [n, k] routed ids (MUTATED in place), ``log2phy`` [E]
+    int (>= 0 means resident), ``gt_out`` [n, k] receives the pre-substitution
+    ids. Returns the number of substituted positions. Routing weights are not
+    touched, matching the device version.
+    """
+    n, top_k = topk_ids.shape
+    num_experts = scores.shape[1]
+    np.copyto(gt_out, topk_ids)
+    if n == 0 or top_k == 0 or top_k >= num_experts:
+        return 0
+    miss = log2phy[topk_ids] < 0
+    if not miss.any():
+        return 0
+    # boundary = (k+1)-th largest biased score per row, clamped at 0. Selection
+    # is exact, and the products below are single fp32 multiplies by the
+    # fp32-rounded scalar, as on the device.
+    boundary = -np.partition(-scores, top_k, axis=1)[:, top_k]
+    boundary = np.maximum(boundary, np.float32(0.0))
+    upper = boundary * np.float32(1.0 + threshold)
+    lower = boundary * np.float32(1.0 - threshold)
+    selected = np.take_along_axis(scores, topk_ids, axis=1)
+    low_confidence = selected < upper[:, None]
+    if n == 1:
+        # one row: every source expert has exactly one reference (top-k ids
+        # are distinct), so the per-source "any" is the identity
+        eligible = miss & low_confidence
+    else:
+        ids_flat = topk_ids.reshape(-1)
+        same_source = ids_flat[:, None] == ids_flat[None, :]
+
+        def _any_per_source(flag):
+            return (same_source & flag.reshape(1, -1)).any(axis=1).reshape(
+                n, top_k)
+
+        eligible = miss & low_confidence & ~_any_per_source(
+            miss & ~low_confidence)
+    if not eligible.any():
+        return 0
+    resident = log2phy >= 0
+    ok = np.zeros((n, top_k), dtype=bool)
+    substitute_id = np.zeros((n, top_k), dtype=np.int64)
+    for r in range(n):
+        elig_pos = np.flatnonzero(eligible[r])
+        if elig_pos.size == 0:
+            continue
+        row = scores[r]
+        # candidates: resident, inside [lower, boundary], not already chosen
+        cand = (row >= lower[r]) & (row <= boundary[r]) & resident
+        cand[topk_ids[r]] = False
+        cand_ids = np.flatnonzero(cand)
+        if cand_ids.size == 0:
+            continue
+        # best candidates first; equal scores -> lower expert id first
+        cand_ids = cand_ids[np.argsort(-row[cand_ids], kind="stable")][:top_k]
+        # r-th least important eligible reference takes the r-th best
+        # candidate; equal scores -> lower position first (device tie_break)
+        order = elig_pos[np.argsort(selected[r, elig_pos], kind="stable")]
+        m = min(order.size, cand_ids.size)
+        ok[r, order[:m]] = True
+        substitute_id[r, order[:m]] = cand_ids[:m]
+    if n > 1:
+        # atomicity: a source expert is substituted everywhere or nowhere
+        ok &= ~_any_per_source(miss & ~ok)
+    np.copyto(topk_ids, substitute_id.astype(topk_ids.dtype), where=ok)
+    return int(np.count_nonzero(ok))
+  
 
 def check_npu_moe_gating_top_k(
     hidden_states: torch.Tensor,
