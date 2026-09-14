@@ -551,6 +551,41 @@ class TestExpertOffloadConfig(TestBase):
                 "shard_per_rank": False,
             })
 
+    def test_expert_pruning_defaults_and_override(self):
+        default = ExpertOffloadConfig({})
+        enabled = ExpertOffloadConfig({
+            "experts_pruning_enabled": True,
+            "experts_pruning_debug": True,
+            "experts_pruning_threshold": [0.0, 0.1, 0.02, 0.05, 0.09, 0.14],
+        })
+
+        self.assertFalse(default.experts_pruning_enabled)
+        self.assertFalse(default.experts_pruning_debug)
+        self.assertTrue(enabled.experts_pruning_enabled)
+        self.assertTrue(enabled.experts_pruning_debug)
+        self.assertEqual(
+            enabled.experts_pruning_threshold,
+            [0.0, 0.1, 0.02, 0.05, 0.09, 0.14],
+        )
+
+    def test_expert_pruning_config_validation(self):
+        with self.assertRaisesRegex(TypeError, "must be a boolean"):
+            ExpertOffloadConfig({"experts_pruning_enabled": 1})
+
+        with self.assertRaisesRegex(TypeError, "must be a boolean"):
+            ExpertOffloadConfig({"experts_pruning_debug": 1})
+
+        with self.assertRaisesRegex(TypeError, "must be a list"):
+            ExpertOffloadConfig({"experts_pruning_threshold": 0.1})
+
+        with self.assertRaisesRegex(ValueError, "must be non-empty"):
+            ExpertOffloadConfig({"experts_pruning_threshold": []})
+
+        with self.assertRaisesRegex(ValueError, "values must be >= 0"):
+            ExpertOffloadConfig({
+                "experts_pruning_threshold": [0.0, -0.1],
+            })
+
     def test_expert_substitution_defaults_and_override(self):
         default = ExpertOffloadConfig({})
         enabled = ExpertOffloadConfig({

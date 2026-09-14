@@ -104,7 +104,18 @@ class LRCExpertCachePolicy:
         unique: set[int] = set()
 
         for row_index, row in enumerate(topk_ids):
-            experts = tuple(row)
+            raw_experts = tuple(int(eid) for eid in row)
+
+            # 保存有效专家在原始top-k中的位置。
+            valid_routes = [
+                (position, eid)
+                for position, eid in enumerate(raw_experts)
+                if 0 <= eid < self.num_experts
+            ]
+
+            experts = tuple(
+                eid for _, eid in valid_routes
+            )
             unique.update(experts)
             state.step += 1
 
@@ -123,9 +134,18 @@ class LRCExpertCachePolicy:
             state.recent_queue.append(tuple(counts.items()))
 
             if router_scores is not None:
-                score_row = score_rows[row_index]
-                for eid, score in zip(experts, score_row, strict=False):
-                    state.router_score[eid] = float(score)
+                score_row = tuple(score_rows[row_index])
+
+                if len(score_row) != len(raw_experts):
+                    raise ValueError(
+                        "router score width does not match "
+                        "topk ID width: "
+                        f"{len(score_row)} != {len(raw_experts)}"
+                    )
+
+                # 使用原始position取分数，避免过滤ID后错位。
+                for position, eid in valid_routes:
+                    state.router_score[eid] = float(score_row[position])
 
             while len(state.recent_queue) > self.recent_window:
                 old_counts = state.recent_queue.popleft()
