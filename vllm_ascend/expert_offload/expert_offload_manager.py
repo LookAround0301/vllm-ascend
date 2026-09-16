@@ -7,6 +7,7 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import torch
 import torch_npu
 import torch.nn.functional as F
@@ -3016,6 +3017,15 @@ class ExpertOffloadManager:
             self._update_weights(args)
         except Exception:
             self._note_cb_failure("update_weights")
+            # Split join: the prefetch pass no longer synchronizes, so
+            # this reactive callback is the only thing guaranteeing the
+            # layer's copies (its own and the prefetch's) landed before GMM.
+            # If the body raised before its final sync, drain here so a
+            # failure cannot let GMM read half-written expert weights.
+            try:
+                self._synchronize_h2d()
+            except Exception:
+                self._note_cb_failure("update_weights drain")
 
     def _update_weights_multi_card_guarded(self, args):
         """_update_weights_multi_card, same guard.
@@ -3060,6 +3070,7 @@ class ExpertOffloadManager:
                 log2phy_np,
                 self.offload_config.expert_substitution_threshold,
                 topk_ids_gt_h.numpy(),
+                np.flatnonzero(log2phy_np >= 0),
             )
             if self._debug:
                 self._log_expert_substitution(
@@ -3284,10 +3295,10 @@ class ExpertOffloadManager:
                         pf_wait=pf_wait,
                     )
 
-            # (merge): _synchronize_h2d() replaces load_stream.synchronize(). On the torch backend they are the same
-            # call; on MemFabric it also retires the in-flight sparse-copy
-            # descriptors. Still load-bearing under replay.
-            self._synchronize_h2d()
+            # Only the REACTIVE pass waits for the copies.
+            # The prefetch pass returns once its copies are QUEUED
+            if not is_prefetch:
+                self._synchronize_h2d()
 
     def _preload_hot_experts(self):
         """Preload each layer's top-N hot experts into device resident slots
