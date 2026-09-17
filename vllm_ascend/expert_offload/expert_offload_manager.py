@@ -1979,6 +1979,11 @@ class ExpertOffloadManager:
         # load. No-op for fate and mode2_har.
         self._finish_next_layer_predict(layer_idx, current_compute_stream)
 
+        # dispatch a layer-shifted predictor's prediction for the NEXT
+        # layer here, behind an event recorded after this layer's on-demand
+        # load. No-op for fate and mode2_har.
+        self._finish_next_layer_predict(layer_idx, current_compute_stream)
+
     def _mc_handle_prefill_regime(self, layer_idx) -> bool:
         """Multi-card PREFILL (non-MC2 comm): load this rank's EP shard into the
         prefill pool. Returns True when handled so the caller returns early.
@@ -3297,6 +3302,9 @@ class ExpertOffloadManager:
 
             # Only the REACTIVE pass waits for the copies.
             # The prefetch pass returns once its copies are QUEUED
+            # _synchronize_h2d() replaces load_stream.synchronize(). On the torch backend they are the same
+            # call; on MemFabric it also retires the in-flight sparse-copy
+            # descriptors. Still load-bearing under replay.
             if not is_prefetch:
                 self._synchronize_h2d()
 
