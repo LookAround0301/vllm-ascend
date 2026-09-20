@@ -54,6 +54,9 @@ class AscendConfig:
         expert_offload_config = additional_config.get("expert_offload_config", {})
         self.expert_offload_config = ExpertOffloadConfig(expert_offload_config)
 
+        activation_routing_config = additional_config.get("activation_routing", {})
+        self.activation_routing_config = ActivationRoutingConfig(activation_routing_config)
+
         # ReMoE router-gate override
         self.moe_gate_override_path = additional_config.get("moe_gate_override_path", None)
         if self.moe_gate_override_path is not None and not isinstance(self.moe_gate_override_path, str):
@@ -1277,6 +1280,110 @@ class ExpertOffloadConfig:
             raise ValueError("experts_pruning_threshold values must be >= 0")
         if not isinstance(self.config["experts_pruning_debug"], bool):
             raise TypeError("experts_pruning_debug must be a boolean")
+
+
+class ActivationRoutingConfig:
+    """
+    Configuration Object for activation_routing from additional_config.
+
+    Fields map 1:1 to the activation-routing config schema.
+    num_experts / route_top_k / scoring_func are intentionally absent: they
+    are derived from the model's hf config when the routing state is built.
+    A missing section (or ``enabled: false``) keeps the feature fully off.
+    """
+
+    _defaults = {
+        "enabled": False,
+        "backend": "baseline",  # baseline | anchor_union_reference | anchor_union_fused_native
+        "verify_block_size": 16,
+        "protected_rows": 3,
+        "suffix_pool_top_k": 2,
+        "fused_rows": [16, 32, 48, 64],
+        "expected_router_layers": None,
+        "trace_dir": None,
+        "trace_steps_per_bs": 32,
+        "msprof": False,
+    }
+
+    def __init__(self, user_config: dict | None = None):
+        if user_config is None:
+            user_config = {}
+        if not isinstance(user_config, dict):
+            raise TypeError(
+                "activation_routing must be a dict of config options, got "
+                f"{type(user_config).__name__}; to enable it write "
+                '"activation_routing": {"enabled": true} (or omit the section '
+                "to keep the feature disabled)")
+        self.config = self._defaults.copy()
+        if user_config and isinstance(user_config, dict):
+            for key, value in user_config.items():
+                if key in self.config:
+                    self.config[key] = value
+                else:
+                    raise ValueError(f"Config has no attribute '{key}'")
+
+        # Keys the user explicitly wrote. resolve_activation_routing_config
+        # fills the dspark-family defaults only for fields NOT in this set, so
+        # an explicitly written value (even one equal to a default) always
+        # wins over a derived one.
+        self.user_keys = frozenset(user_config)
+
+        self._validate_config()
+
+    def __getattr__(self, key):
+        config = self.__dict__.get("config")
+        if config is not None and key in config:
+            return config[key]
+        raise AttributeError(f"Config has no attribute '{key}'")
+
+    def _validate_config(self):
+        def _is_int(value):
+            return isinstance(value, int) and not isinstance(value, bool)
+
+        if not isinstance(self.config["enabled"], bool):
+            raise TypeError("activation_routing.enabled must be a boolean")
+        if self.config["backend"] not in {
+            "baseline",
+            "anchor_union_reference",
+            "anchor_union_topm",
+            "anchor_union_fused_native",
+        }:
+            raise ValueError(f"Unknown activation_routing backend: {self.config['backend']}")
+        if not _is_int(self.config["verify_block_size"]) or self.config["verify_block_size"] < 2:
+            raise ValueError("activation_routing.verify_block_size must be an int >= 2")
+        if not _is_int(self.config["protected_rows"]) or not (
+            1 <= self.config["protected_rows"] <= self.config["verify_block_size"]
+        ):
+            raise ValueError(
+                "activation_routing.protected_rows must be an int in "
+                "[1, verify_block_size]")
+        if not _is_int(self.config["suffix_pool_top_k"]) or self.config["suffix_pool_top_k"] < 1:
+            raise ValueError("activation_routing.suffix_pool_top_k must be an int >= 1")
+        rows = self.config["fused_rows"]
+        if (
+            not isinstance(rows, list)
+            or not rows
+            or any(not _is_int(v) or v <= 0 for v in rows)
+        ):
+            raise ValueError(
+                "activation_routing.fused_rows must be a non-empty list of positive ints")
+        limit = self.config["trace_steps_per_bs"]
+        if not _is_int(limit) or limit < 1:
+            raise ValueError("activation_routing.trace_steps_per_bs must be an int >= 1")
+
+    def to_routing_config(self) -> dict:
+        """Return the fields consumed by DFlashTopMState.from_dict."""
+        return {
+            "backend": self.config["backend"],
+            "verify_block_size": self.config["verify_block_size"],
+            "protected_rows": self.config["protected_rows"],
+            "suffix_pool_top_k": self.config["suffix_pool_top_k"],
+            "fused_rows": list(self.config["fused_rows"]),
+            "expected_router_layers": self.config["expected_router_layers"],
+            "trace_dir": self.config["trace_dir"],
+            "trace_steps_per_bs": self.config["trace_steps_per_bs"],
+            "msprof": self.config["msprof"],
+        }
 
 
 _ASCEND_CONFIG: AscendConfig | None = None
