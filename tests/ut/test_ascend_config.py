@@ -22,6 +22,7 @@ from vllm.config import KVTransferConfig, VllmConfig
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import (
+    ActivationRoutingConfig,
     AscendConfig,
     ExpertOffloadConfig,
     SchedulerConfig,
@@ -29,6 +30,10 @@ from vllm_ascend.ascend_config import (
     clear_ascend_config,
     get_ascend_config,
     init_ascend_config,
+)
+from vllm_ascend.dflash_topm_state import (
+    DFlashTopMState,
+    resolve_activation_routing_config,
 )
 from vllm_ascend.utils import clear_enable_sp, enable_sp, shared_expert_dp_enabled
 
@@ -774,3 +779,245 @@ class TestSchedulerConfig(TestBase):
 
         self.assertTrue(config.enable_balance_scheduling)
         mock_info_once.assert_called_once()
+
+
+class TestActivationRoutingConfig(TestBase):
+    """Config-section tests for activation_routing (additional_config path)."""
+
+    _HF_TEXT_CONFIG = SimpleNamespace(
+        n_routed_experts=256,
+        num_experts_per_tok=6,
+        scoring_func="sqrtsoftplus",
+        num_hash_layers=3,
+        num_hidden_layers=43,
+    )
+
+    @staticmethod
+    def _make_section(**overrides):
+        values = {
+            "enabled": True,
+            "backend": "anchor_union_reference",
+            "verify_block_size": 8,
+            "protected_rows": 3,
+            "suffix_pool_top_k": 2,
+            "fused_rows": [8, 512],
+            "expected_router_layers": 40,
+        }
+        values.update(overrides)
+        return ActivationRoutingConfig(values)
+
+    @staticmethod
+    def _make_minimal_section(**overrides):
+        # The headline DSpark usage: only the switch and the backend are written.
+        values = {"enabled": True, "backend": "anchor_union_fused_native"}
+        values.update(overrides)
+        return ActivationRoutingConfig(values)
+
+    def test_default_section_is_fully_disabled(self):
+        section = ActivationRoutingConfig()
+        self.assertFalse(section.enabled)
+        # A missing/disabled section must resolve to no state at all: the MoE
+        # routing path stays byte-identical to the baseline.
+        self.assertIsNone(resolve_activation_routing_config(section, self._HF_TEXT_CONFIG))
+        self.assertIsNone(resolve_activation_routing_config(None))
+
+    def test_disabled_section_ignores_other_fields(self):
+        section = self._make_section(enabled=False, backend="anchor_union_fused_native")
+        self.assertIsNone(resolve_activation_routing_config(section, self._HF_TEXT_CONFIG))
+
+    def test_fields_map_one_to_one_to_routing_json(self):
+        section = self._make_section(trace_dir="/tmp/trace", trace_steps_per_bs=4, msprof=True)
+        routed = section.to_routing_config()
+        self.assertEqual(routed, {
+            "backend": "anchor_union_reference",
+            "verify_block_size": 8,
+            "protected_rows": 3,
+            "suffix_pool_top_k": 2,
+            "fused_rows": [8, 512],
+            "expected_router_layers": 40,
+            "trace_dir": "/tmp/trace",
+            "trace_steps_per_bs": 4,
+            "msprof": True,
+        })
+        state = DFlashTopMState.from_dict(routed, text_config=self._HF_TEXT_CONFIG)
+        self.assertEqual(state.backend, "anchor_union_reference")
+        self.assertEqual(state.verify_block_size, 8)
+        self.assertEqual(state.protected_rows, 3)
+        self.assertEqual(state.suffix_pool_top_k, 2)
+        self.assertEqual(state.fused_rows, (8, 512))
+        self.assertEqual(state.expected_router_layers, 40)
+
+    def test_derived_fields_come_from_hf_config(self):
+        # num_experts / route_top_k / scoring_func are not config keys; they are
+        # derived from the model's hf text config.
+        section = self._make_section()
+        state = DFlashTopMState.from_dict(
+            section.to_routing_config(), text_config=self._HF_TEXT_CONFIG
+        )
+        self.assertEqual(state.num_experts, 256)
+        self.assertEqual(state.route_top_k, 6)
+        self.assertEqual(state.scoring_func, "sqrtsoftplus")
+
+    def test_unknown_key_rejected(self):
+        with self.assertRaisesRegex(ValueError, "num_experts"):
+            ActivationRoutingConfig({"enabled": True, "num_experts": 256})
+
+    def test_backend_validation_rejects_unknown_name(self):
+        with self.assertRaises(ValueError):
+            self._make_section(backend="anchor_union_nope")
+
+    def test_verify_block_size_validation_rejects_value_below_minimum(self):
+        with self.assertRaises(ValueError):
+            self._make_section(verify_block_size=1)
+
+    def test_verify_block_size_validation_rejects_non_int_value(self):
+        with self.assertRaises(ValueError):
+            self._make_section(verify_block_size="8")
+
+    def test_protected_rows_validation_rejects_zero(self):
+        with self.assertRaises(ValueError):
+            self._make_section(protected_rows=0)
+
+    def test_suffix_pool_top_k_validation_rejects_zero(self):
+        with self.assertRaises(ValueError):
+            self._make_section(suffix_pool_top_k=0)
+
+    def test_fused_rows_validation_rejects_empty_list(self):
+        with self.assertRaises(ValueError):
+            self._make_section(fused_rows=[])
+
+    def test_fused_rows_validation_rejects_negative_entry(self):
+        with self.assertRaises(ValueError):
+            self._make_section(fused_rows=[8, -1])
+
+    def test_trace_steps_per_bs_validation_rejects_zero(self):
+        with self.assertRaises(ValueError):
+            self._make_section(trace_steps_per_bs=0)
+
+    def test_non_dict_section_bool_true_rejected(self):
+        # Truthy non-dict values (true / "yes" / 1) used to pass the truthiness
+        # check but silently skip the dict merge, leaving the feature disabled.
+        with self.assertRaisesRegex(TypeError, "must be a dict"):
+            ActivationRoutingConfig(True)
+
+    def test_non_dict_section_bool_false_rejected(self):
+        with self.assertRaisesRegex(TypeError, "must be a dict"):
+            ActivationRoutingConfig(False)
+
+    def test_non_dict_section_string_rejected(self):
+        with self.assertRaisesRegex(TypeError, "must be a dict"):
+            ActivationRoutingConfig("yes")
+
+    def test_non_dict_section_int_rejected(self):
+        with self.assertRaisesRegex(TypeError, "must be a dict"):
+            ActivationRoutingConfig(1)
+
+    def test_non_dict_section_list_rejected(self):
+        with self.assertRaisesRegex(TypeError, "must be a dict"):
+            ActivationRoutingConfig(["enabled"])
+
+    def test_non_dict_section_float_rejected(self):
+        with self.assertRaisesRegex(TypeError, "must be a dict"):
+            ActivationRoutingConfig(2.5)
+
+    def test_none_and_empty_dict_sections_stay_disabled(self):
+        # None (section absent) and an explicit empty dict are the legal ways to
+        # keep the feature off; neither should raise.
+        self.assertFalse(ActivationRoutingConfig(None).enabled)
+        self.assertFalse(ActivationRoutingConfig({}).enabled)
+
+    def test_getattr_without_config_does_not_recurse(self):
+        obj = ActivationRoutingConfig.__new__(ActivationRoutingConfig)
+        with self.assertRaises(AttributeError):
+            _ = obj.backend
+
+    def test_unvalidated_backend_rejected_by_state(self):
+        section = self._make_section(backend="anchor_union_topm")
+        with self.assertRaisesRegex(ValueError, "unvalidated"):
+            DFlashTopMState.from_dict(
+                section.to_routing_config(), text_config=self._HF_TEXT_CONFIG
+            )
+
+    def test_config_section_builds_state(self):
+        section = self._make_section()
+        state = resolve_activation_routing_config(section, self._HF_TEXT_CONFIG)
+        self.assertIsInstance(state, DFlashTopMState)
+        self.assertEqual(state.backend, "anchor_union_reference")
+        self.assertEqual(state.num_experts, 256)
+
+    def test_minimal_dflash_config_derives_family_defaults(self):
+        section = self._make_minimal_section()
+        state = resolve_activation_routing_config(
+            section,
+            self._HF_TEXT_CONFIG,
+            speculative_method="dflash",
+            uniform_decode_query_len=8,
+        )
+        self.assertEqual(state.verify_block_size, 8)
+        self.assertEqual(state.fused_rows, (8, 512))
+        # 43 hidden layers - 3 hash layers = 40 routed layers.
+        self.assertEqual(state.expected_router_layers, 40)
+
+    def test_minimal_dspark_config_derives_family_defaults(self):
+        section = self._make_minimal_section()
+        state = resolve_activation_routing_config(
+            section,
+            self._HF_TEXT_CONFIG,
+            speculative_method="dspark",
+            uniform_decode_query_len=8,
+        )
+        self.assertEqual(state.verify_block_size, 8)
+        self.assertEqual(state.fused_rows, (8, 512))
+        # 43 hidden layers - 3 hash layers = 40 routed layers.
+        self.assertEqual(state.expected_router_layers, 40)
+
+    def test_dspark_defaults_without_engine_query_len_stay_conservative(self):
+        # Without the engine truth for the verify block, the row buckets keep the
+        # generic defaults; only the model-derived field is filled.
+        section = self._make_minimal_section()
+        state = resolve_activation_routing_config(
+            section, self._HF_TEXT_CONFIG, speculative_method="dspark"
+        )
+        self.assertEqual(state.verify_block_size, 16)
+        self.assertEqual(state.fused_rows, (16, 32, 48, 64))
+        self.assertEqual(state.expected_router_layers, 40)
+
+    def test_dspark_explicit_fields_are_never_overridden(self):
+        section = self._make_minimal_section(
+            verify_block_size=8,
+            fused_rows=[8, 64],
+            expected_router_layers=None,
+        )
+        state = resolve_activation_routing_config(
+            section,
+            self._HF_TEXT_CONFIG,
+            speculative_method="dspark",
+            uniform_decode_query_len=16,
+        )
+        # Explicit values (even the None) win over every derivation.
+        self.assertEqual(state.verify_block_size, 8)
+        self.assertEqual(state.fused_rows, (8, 64))
+        self.assertIsNone(state.expected_router_layers)
+
+    def test_non_dspark_method_keeps_generic_defaults(self):
+        section = self._make_minimal_section()
+        state = resolve_activation_routing_config(
+            section,
+            self._HF_TEXT_CONFIG,
+            speculative_method="eagle",
+            uniform_decode_query_len=8,
+        )
+        self.assertEqual(state.verify_block_size, 16)
+        self.assertEqual(state.fused_rows, (16, 32, 48, 64))
+        self.assertIsNone(state.expected_router_layers)
+
+    def test_disabled_section_stays_none_under_dspark(self):
+        section = self._make_minimal_section(enabled=False)
+        self.assertIsNone(
+            resolve_activation_routing_config(
+                section,
+                self._HF_TEXT_CONFIG,
+                speculative_method="dspark",
+                uniform_decode_query_len=8,
+            )
+        )
