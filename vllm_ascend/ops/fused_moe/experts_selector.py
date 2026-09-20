@@ -25,6 +25,7 @@ from vllm.forward_context import get_forward_context
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.dflash_topm_state import try_activation_route
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 
 
@@ -171,6 +172,14 @@ def select_experts(
         topk_weights: router weights of shape (num_tokens, top_k).
         topk_ids: selected expert IDs of shape (num_tokens, top_k).
     """
+    context = get_forward_context()
+    topm_pair = try_activation_route(
+        context, router_logits, hidden_states, top_k, renormalize,
+        scoring_func, e_score_correction_bias, routed_scaling_factor,
+        custom_routing_function, tid2eid, mix_placement, topk_group,
+        num_expert_group,
+    )
+
     is_support_npu_moe_gating_top_k = check_npu_moe_gating_top_k(
         hidden_states=hidden_states,
         top_k=top_k,
@@ -181,7 +190,9 @@ def select_experts(
         custom_routing_function=custom_routing_function,
     )
 
-    if is_support_npu_moe_gating_top_k:
+    if topm_pair is not None:
+        topk_weights, topk_ids = topm_pair
+    elif is_support_npu_moe_gating_top_k:
         topk_weights, topk_ids = _select_experts_with_fusion_ops(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -232,6 +243,8 @@ def select_experts(
         topk_ids = torch.cat([topk_ids, pad_shared_expert_ids], dim=1)
         topk_weights = torch.cat([topk_weights, pad_shared_expert_weights], dim=1)
 
+    if topm_pair is not None:
+        context.dflash_topm_state.record_selection(context, topk_weights, topk_ids)
     return topk_weights, topk_ids
 
 
