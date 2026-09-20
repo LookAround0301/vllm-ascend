@@ -1407,8 +1407,14 @@ class ExpertOffloadManager:
                 continue
             src_t = getattr(pool_layer, src)
             dtype = dtype_override if dtype_override is not None else src_t.dtype
-            getattr(self, tgt).append(torch.empty(
-                (ntotal,) + tuple(src_t.shape[1:]), dtype=dtype, device=dev))
+            # MXFP scales have a transposed kernel layout after weight loading.
+            # A contiguous allocation with the same shape and logical values
+            # changes the physical scale order consumed by the A5 GMM. Preserve
+            # the source strides when enlarging the expert dimension, just as
+            # the resident decode slots do.
+            getattr(self, tgt).append(torch.empty_strided(
+                (ntotal,) + tuple(src_t.shape[1:]), src_t.stride(),
+                dtype=dtype, device=dev))
 
     def _cast_prefill_pool_format(self, dev, dt):
         """Cast prefill-pool weight tensors to the on-device (kernel) format.
