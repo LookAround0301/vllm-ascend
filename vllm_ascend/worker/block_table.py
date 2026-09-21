@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from vllm.distributed import get_dcp_group
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
@@ -394,6 +395,24 @@ class MultiGroupBlockTable:
                 )
             ]
 
+        # Several cache groups may have separate physical block tables but
+        # identical slot geometry. Keep their stable pointers and launch the
+        # token mapping for all groups in one device invocation.
+        self._slot_mapping_ptrs = None
+        first = self.block_tables[0] if self.block_tables else None
+        if len(self.block_tables) > 1 and all(
+            not table.is_mamba_group and table.dcp_world_size == 1
+            and table.physical_block_size == first.physical_block_size
+            and table.block_size == first.block_size
+            and table.blocks_per_phys_block == first.blocks_per_phys_block
+            for table in self.block_tables
+        ):
+            self._slot_mapping_ptrs = torch.tensor(
+                [(table.block_table.gpu.data_ptr(), table.slot_mapping.gpu.data_ptr(),
+                  table.block_table.gpu.stride(0)) for table in self.block_tables],
+                dtype=torch.int64, device=device,
+            )
+
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
             block_table.append_row(block_ids[i], row_idx)
@@ -421,7 +440,20 @@ class MultiGroupBlockTable:
         positions: torch.Tensor,
         positions_compressed_list: list[np.ndarray] | None = None,
         req_indices_compressed_list: list[np.ndarray] | None = None,
+        req_indices: torch.Tensor | None = None,
     ) -> None:
+        if self._slot_mapping_ptrs is not None and req_indices is not None and not (
+            positions_compressed_list and req_indices_compressed_list
+        ):
+            table = self.block_tables[0]
+            _compute_group_slot_mapping_kernel[(cdiv(table.max_num_batched_tokens, 128), len(self.block_tables))](
+                positions.shape[0], table.max_num_batched_tokens,
+                req_indices, positions, self._slot_mapping_ptrs, table.block_size,
+                KV_CACHE_BLOCK_SIZE=table.physical_block_size,
+                BLOCKS_PER_KV_BLOCK=table.blocks_per_phys_block,
+                PAD_ID=PAD_SLOT_ID, BLOCK_SIZE=128,
+            )
+            return
         for i, block_table in enumerate(self.block_tables):
             if block_table.is_mamba_group:
                 continue
@@ -456,3 +488,35 @@ class MultiGroupBlockTable:
     def __getitem__(self, idx: int) -> "BlockTable":
         """Returns the BlockTable for the i-th KV cache group."""
         return self.block_tables[idx]
+
+
+@triton.jit(do_not_specialize=["num_tokens", "max_num_tokens"])
+def _compute_group_slot_mapping_kernel(
+    num_tokens,
+    max_num_tokens,
+    req_indices,
+    positions,
+    table_ptrs,
+    block_size,
+    KV_CACHE_BLOCK_SIZE: tl.constexpr,
+    BLOCKS_PER_KV_BLOCK: tl.constexpr,
+    PAD_ID: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    group = tl.program_id(1)
+    block_table = tl.load(table_ptrs + group * 3).to(tl.pointer_type(tl.int32))
+    slot_mapping = tl.load(table_ptrs + group * 3 + 1).to(tl.pointer_type(tl.int32))
+    stride = tl.load(table_ptrs + group * 3 + 2)
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = offsets < num_tokens
+
+    # The runner already provides the packed-token request indices.
+    req_idx = tl.load(req_indices + offsets, mask=valid, other=0)
+
+    pos = tl.load(positions + offsets, mask=valid, other=0)
+    physical_block = pos // KV_CACHE_BLOCK_SIZE
+    local_offset = pos % KV_CACHE_BLOCK_SIZE
+    block_index = physical_block * BLOCKS_PER_KV_BLOCK + local_offset // block_size
+    block_number = tl.load(block_table + req_idx * stride + block_index, mask=valid, other=0).to(tl.int64)
+    slot_id = block_number * block_size + local_offset % block_size
+    tl.store(slot_mapping + offsets, tl.where(valid, slot_id, PAD_ID), mask=offsets < max_num_tokens)

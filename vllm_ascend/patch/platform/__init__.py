@@ -23,6 +23,7 @@ import vllm_ascend.patch.platform.patch_glm_reasoning_usage_accounting  # noqa
 import vllm_ascend.patch.platform.patch_kimi_k3_parsers  # noqa
 import vllm_ascend.patch.platform.patch_kimi_k3_renderer  # noqa
 import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
+import vllm_ascend.patch.platform.patch_shared_expert_pool  # noqa
 import vllm_ascend.patch.platform.patch_media_connector  # noqa
 import vllm_ascend.patch.platform.patch_mla_prefill_backend  # noqa
 import vllm_ascend.patch.platform.patch_pp_mtp  # noqa
@@ -50,3 +51,9 @@ import vllm_ascend.patch.platform.patch_speculative_config  # noqa
 
 import vllm_ascend.patch.platform.patch_fused_moe  # noqa
 import vllm_ascend.patch.platform.patch_dp_device_ids  # noqa
+
+# Install after the original planners/EngineCore imports. The wrapper selects
+# only enabled Qwen3.5 hierarchical engines; all other configs delegate.
+from vllm_ascend.patch.platform.patch_hierarchical_cache import install as _install_hierarchical_cache
+
+_install_hierarchical_cache()

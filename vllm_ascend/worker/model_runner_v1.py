@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import gc
 import logging
 import math
 import os
@@ -67,6 +68,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -116,6 +118,7 @@ from vllm_ascend.attention.utils import (
 
 # yapf conflicts with isort for this block
 # yapf: disable
+from vllm_ascend.compilation import acl_graph
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphWrapper,
     set_draft_graph_params,
@@ -199,6 +202,7 @@ from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm_ascend.core.hierarchical_cache_manager import ByteSpan, CacheMapUpdate
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
@@ -1249,6 +1253,7 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs,
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
+            req_indices=req_indices_gpu,
         )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
@@ -2151,6 +2156,8 @@ class NPUModelRunner(GPUModelRunner):
                 skip_compiled=has_encoder_input,
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
+                # Keep real request boundaries; padded requests must not be sampled.
+                query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
                 dflash_verify_rows=dflash_verify_rows,
                 dflash_topm_state=self.dflash_topm_state,
@@ -3250,6 +3257,8 @@ class NPUModelRunner(GPUModelRunner):
             cm_base.num_logits_indices = logits_indices.size(0)
             cm_base.logits_indices_padded = self._prepare_kv_sharing_fast_prefill(logits_indices)
 
+        dsv4_metadata_errors: list[torch.Tensor] = []
+
         def _build_attn_group_metadata(
             kv_cache_gid: int,
             attn_gid: int,
@@ -3343,8 +3352,37 @@ class NPUModelRunner(GPUModelRunner):
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
 
+            dsv4_maps = getattr(self, "_omoe_dsv4_cache_maps", None)
+            if dsv4_maps is not None:
+                from vllm_ascend.attention.dsv4_hierarchical_metadata import remap_dsv4_metadata_group
+
+                # One batch per attention group shares masks and validation,
+                # while each cache keeps its own authorized physical addresses.
+                layer_metadata = remap_dsv4_metadata_group(
+                    attn_metadata_i,
+                    dsv4_maps.index_map_group(attn_group.layer_names),
+                    [dsv4_maps.schemas_by_name[name] for name in attn_group.layer_names],
+                    validation_errors=dsv4_metadata_errors,
+                )
+                attn_metadata_dict.update(zip(attn_group.layer_names, layer_metadata))
+                return
+
             for layer_name in attn_group.layer_names:
-                attn_metadata_dict[layer_name] = attn_metadata_i
+                layer_metadata = attn_metadata_i
+                if getattr(self, "_omoe_hierarchical_layout", None) is not None:
+                    if isinstance(builder, GDNAttentionMetadataBuilder):
+                        from vllm_ascend.core.gdn_state_pages import remap_gdn_state_metadata
+
+                        layer_metadata = remap_gdn_state_metadata(
+                            layer_metadata, self._omoe_conv_index_map, self._omoe_ssm_index_map
+                        )
+                    else:
+                        from vllm_ascend.core.attention_page_views import remap_paired_kv_metadata
+
+                        layer_metadata = remap_paired_kv_metadata(
+                            layer_metadata, attn_group.kv_cache_spec.block_size
+                        )
+                attn_metadata_dict[layer_name] = layer_metadata
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -3399,6 +3437,12 @@ class NPUModelRunner(GPUModelRunner):
                     decode_ratio_to_sas_metadata,
                     common_ratio_to_sas_metadata,
                 )
+        if dsv4_metadata_errors:
+            from vllm_ascend.attention.dsv4_hierarchical_metadata import validate_dsv4_metadata
+
+            # All groups use the current stream. Check them together before
+            # returning metadata to forward; invalid addresses never reach it.
+            validate_dsv4_metadata(dsv4_metadata_errors)
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
             for req_id in self.input_batch.req_ids:
@@ -3788,6 +3832,16 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def profile_run(self) -> None:
+        if getattr(getattr(self.ascend_config, "omoe_config", None), "enabled", False) is True:
+            self.offload_manager.begin_omoe_profile(self.device)
+            try:
+                # Real routed expert execution profiles the dedicated kernel
+                # and its bounded temporary pool, never legacy decode weights.
+                self.eplb_warmup()
+                super().profile_run()
+            finally:
+                self.offload_manager.end_omoe_profile()
+            return
         self.eplb_warmup()
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
@@ -4235,6 +4289,36 @@ class NPUModelRunner(GPUModelRunner):
             to their corresponding memory buffer for K cache and V cache.
         """
         # init kv cache tensors
+        if getattr(getattr(self.ascend_config, "omoe_config", None), "enabled", False) is True:
+            from vllm_ascend.core.hierarchical_memory import HierarchicalMemoryLayout
+
+            layout = HierarchicalMemoryLayout.from_config(self.vllm_config, kv_cache_config)
+            if layout.cache_schemas and get_ascend_device_type() != AscendDeviceType.A2:
+                raise ValueError("Hierarchical DS V4 address views currently require the validated 910B backend")
+            arena = torch.zeros(layout.nbytes, dtype=torch.int8, device=self.device)
+            self._omoe_hierarchical_layout = layout
+            self._omoe_conv_index_map = None
+            self._omoe_ssm_index_map = None
+            self._omoe_dsv4_cache_maps = None
+            if layout.cache_schemas:
+                from vllm_ascend.worker.dsv4_cache_maps import DSV4CacheMaps
+
+                self._omoe_dsv4_cache_maps = DSV4CacheMaps(layout, self.device)
+                geometries = layout.allocator_kwargs()["local_page_geometries"]
+                logger.info(
+                    "[O-MOE] DS cache_names=%d logical_blocks=%d index_map_bytes=%d "
+                    "L2_local_pages=(payload_bytes,pages_per_L2,tail_bytes) %s",
+                    len(layout.cache_schemas), layout.num_blocks, layout.index_map_nbytes,
+                    {kind: (page.allocation_nbytes, layout.expert_page_bytes // page.allocation_nbytes,
+                            layout.expert_page_bytes % page.allocation_nbytes)
+                     for kind, page in geometries.items()},
+                )
+            if layout.ssm_page_bytes is not None:
+                self._omoe_conv_index_map = torch.zeros(layout.num_blocks, dtype=torch.int64, device=self.device)
+                self._omoe_ssm_index_map = torch.zeros_like(self._omoe_conv_index_map)
+            self.hybrid_with_attn_and_mamba = False
+            self.offload_manager.attach_omoe_hierarchical_pool(arena, layout)
+            return {name: arena for name in layout.layer_names}
         kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, ...]] = {}
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
@@ -4436,6 +4520,29 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_caches: dict[str, torch.Tensor] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        if getattr(self, "_omoe_hierarchical_layout", None) is not None:
+            if self._omoe_hierarchical_layout.cache_schemas:
+                from vllm_ascend.core.dsv4_cache_pages import make_dsv4_cache_views
+
+                return {
+                    page.name: make_dsv4_cache_views(kv_cache_raw_tensors[page.name], page)
+                    for page in self._omoe_hierarchical_layout.cache_schemas
+                }
+            from vllm_ascend.core.attention_page_views import make_paired_kv_views
+            from vllm_ascend.core.gdn_state_pages import make_gdn_state_views
+
+            for name, spec in layer_kv_cache_spec.items():
+                arena = kv_cache_raw_tensors[name]
+                if isinstance(spec, MambaSpec):
+                    kv_caches[name] = make_gdn_state_views(
+                        arena, spec.shapes, spec.dtypes,
+                        conv_stride_bytes=self._omoe_hierarchical_layout.conv_address_bytes,
+                    )
+                else:
+                    kv_caches[name] = make_paired_kv_views(
+                        arena, spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+                    )
+            return kv_caches
         for group in self._kv_cache_spec_attn_group_iterator():
             attn_backend = group.backend
             current_kv_cache_spec = group.kv_cache_spec
@@ -5085,6 +5192,16 @@ class NPUModelRunner(GPUModelRunner):
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
 
+        if getattr(getattr(self.ascend_config, "omoe_config", None), "enabled", False) is True:
+            # Hierarchical pages use native blocks, independently of hybrid padding.
+            # Resolve support here, where each layer owns its actual backend.
+            for layer_name, spec in kv_cache_spec.items():
+                if type(spec) is FullAttentionSpec:
+                    block_size = select_common_block_size(
+                        spec.block_size, [attn_layers[layer_name].get_attn_backend()]
+                    )
+                    kv_cache_spec[layer_name] = replace(spec, block_size=block_size)
+
         return kv_cache_spec
 
     def _check_and_update_cudagraph_mode(
@@ -5150,6 +5267,10 @@ class NPUModelRunner(GPUModelRunner):
                 set_draft_graph_params(capture_sizes)
 
     def profile_cudagraph_memory(self) -> int:
+        if getattr(getattr(self.ascend_config, "omoe_config", None), "enabled", False) is True:
+            raise NotImplementedError(
+                "O-MoE currently requires eager execution; graph memory profiling is unsupported."
+            )
         parent_module_name = _get_gpu_model_runner_module_name(self)
         # This runs a throwaway eager forward (npugraph_ex fx_run_eagerly) on
         # dummy inputs to estimate graph memory. Expert weights aren't
@@ -5167,7 +5288,9 @@ class NPUModelRunner(GPUModelRunner):
             if hasattr(self, 'offload_manager'):
                 self.offload_manager._skip_prefill = False
 
-        reset_graph_params()
+        # Discard profiling parameters before the real KV-cache initialization.
+        acl_graph._graph_params = None
+        acl_graph._draft_graph_params = None
 
         # NOTE: This is a serious problem that we maintain two extra copies of the KV cache as the instance
         # variable of the attention layers, when they are local variables in the upstream vLLM code.
@@ -5228,6 +5351,10 @@ class NPUModelRunner(GPUModelRunner):
         Called from gpu_worker.py outside the CuMem pool context.
         """
         self._kv_block_zeroer = AscendKVBlockZeroer(self.device, self.pin_memory)
+        if getattr(self, "_omoe_hierarchical_layout", None) is not None:
+            # State IDs are logical block IDs and KV IDs denote paired pages. These are
+            # not original tensor-major block IDs;
+            return
         self._kv_block_zeroer.init_meta(
             attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
             kernel_block_sizes=self.kernel_block_sizes,
@@ -5235,6 +5362,61 @@ class NPUModelRunner(GPUModelRunner):
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=(self.compilation_config.static_forward_context),
         )
+
+    def install_omoe_cache_pages(
+        self, updates: "list[CacheMapUpdate]", zero_spans: "list[ByteSpan]",
+    ) -> None:
+        layout = getattr(self, "_omoe_hierarchical_layout", None)
+        manager = self.offload_manager
+        if layout is None:
+            raise RuntimeError("Cache-map publication requires the hierarchical arena")
+        dsv4_maps = getattr(self, "_omoe_dsv4_cache_maps", None)
+        if dsv4_maps is not None:
+            dsv4_maps.install(manager.omoe_arena, updates, zero_spans)
+            return
+        if not updates and not zero_spans:
+            return
+        if updates and (layout.conv_page_bytes is None or layout.ssm_page_bytes is None):
+            raise ValueError("A full-attention-only arena cannot install recurrent-state mappings")
+        # The shared allocator owns these grants. Expert pages become free
+        # only after every worker retires them; do not rescan retained experts
+        # for every new cache page.
+        for offset, nbytes in zero_spans:
+            if (type(offset) is not int or type(nbytes) is not int
+                    or offset < layout.huge_page_bytes or nbytes <= 0 or offset + nbytes > layout.nbytes):
+                raise ValueError("Invalid hierarchical cache byte grant")
+        seen = set()
+        zero_grants = set(map(tuple, zero_spans))
+        state_intervals = []
+        for logical, conv, ssm in updates:
+            if (any(type(value) is not int for value in (logical, conv, ssm))
+                    or not 0 < logical < layout.num_blocks or logical in seen
+                    or not 0 <= conv * layout.conv_address_bytes <= layout.nbytes - layout.conv_page_bytes
+                    or not 0 <= ssm < layout.nbytes // layout.ssm_page_bytes
+                    or bool(conv) != bool(ssm)):
+                raise ValueError("Invalid hierarchical Conv/SSM index-map update")
+            seen.add(logical)
+            if conv:
+                for offset, size in (
+                    (conv * layout.conv_address_bytes, layout.conv_page_bytes),
+                    (ssm * layout.ssm_page_bytes, layout.ssm_page_bytes),
+                ):
+                    if offset < layout.huge_page_bytes or (offset, size) not in zero_grants:
+                        raise ValueError("State-map update must own a zeroed grant outside null pages")
+                    state_intervals.append((offset, offset + size))
+        state_intervals.sort()
+        if any(left[1] > right[0] for left, right in zip(state_intervals, state_intervals[1:])):
+            raise ValueError("Hierarchical state-map updates overlap each other")
+        # execute_model applied the expert delta before reaching this point.
+        # Reinitialize each new byte grant before publishing its cache mapping;
+        # retained expert slots may still have unrelated work in flight.
+        for offset, nbytes in zero_spans:
+            manager.omoe_arena.narrow(0, offset, nbytes).zero_()
+        if updates:
+            values = torch.tensor(updates, dtype=torch.int64, device=self.device)
+            self._omoe_conv_index_map.index_copy_(0, values[:, 0], values[:, 1])
+            self._omoe_ssm_index_map.index_copy_(0, values[:, 0], values[:, 2])
+        torch.npu.current_stream().synchronize()
 
 
 def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:

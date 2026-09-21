@@ -28,6 +28,10 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Enable DeepSeek V4 expert/KV shared memory. Default: 0 (disabled).
+    # Valid values: 0 or 1. Non-sensitive. Read during engine configuration,
+    # not in the token loop; the resolved value is propagated to workers.
+    "VLLM_ASCEND_ENABLE_O_MOE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_O_MOE", "0"))),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

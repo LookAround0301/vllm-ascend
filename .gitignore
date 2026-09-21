@@ -35,6 +35,8 @@ __pycache__/
 .Python
 build/
 build_out/
+# Temporary out-of-tree builds of the discrete expert kernels.
+/.discrete-build.*/
 !csrc/cmake/third_party/build/
 !csrc/cmake/third_party/build/modules/
 !csrc/cmake/third_party/build/modules/patch/

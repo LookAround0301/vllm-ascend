@@ -434,13 +434,27 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # below, and enable_expert_offload gates every later offload hook. ---
         from vllm_ascend.ascend_config import get_ascend_config
         from vllm_ascend.expert_offload.utils import init_expert_offload_config
-        _offload_cfg = get_ascend_config().expert_offload_config
+        _ascend_cfg = get_ascend_config()
+        _offload_cfg = _ascend_cfg.expert_offload_config
+        self.enable_omoe = getattr(
+            getattr(_ascend_cfg, "omoe_config", None), "enabled", False
+        ) is True and "mtp" not in layer_name.split(".")
         # Expert offload targets the main model's MoE layers. MTP / draft-model
         # MoE layers live under the "mtp" prefix namespace (e.g. "mtp.0.mlp.
         # experts"); the single MTP layer is tiny and must not offload. Skipping
         # it also avoids an IndexError when num_device_experts is a per-layer
         # list sized only for the main model's MoE layers.
-        if "mtp" in layer_name.split("."):
+        if self.enable_omoe:
+            from vllm_ascend.quantization.method_adapters import validate_omoe_cpu_weights
+
+            # The first factory create_weights call must already have selected
+            # CPU storage. A late runner flag cannot undo a full NPU allocation.
+            schema = validate_omoe_cpu_weights(routed_experts)
+            if schema.local_experts != moe_config.num_local_experts:
+                raise RuntimeError("O-MoE CPU schema must preserve the standard EP checkpoint expert count")
+            self.enable_expert_offload = False
+            routed_experts.enable_expert_offload = False
+        elif "mtp" in layer_name.split("."):
             self.enable_expert_offload = False
             logger.info(
                 "[OFFLOAD] skipping expert offload for MTP/draft MoE layer "
@@ -697,7 +711,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # re-create its device weights at the offload slot size
         # (num_device_experts//ep_size) so the freshly-wrapped loader takes
         # effect on the new params, and register per-layer CPU buffers. ---
-        if self.enable_expert_offload:
+        if self.enable_omoe:
+            self._register_omoe_cpu_expert_layer(
+                swiglu_limit=getattr(vllm_config.model_config.hf_text_config, "swiglu_limit", None)
+            )
+        elif self.enable_expert_offload:
             self.routed_experts.global_num_experts = self.global_num_experts
             self.routed_experts.enable_expert_offload = self.enable_expert_offload
             self.routed_experts.enable_multi_card = self.enable_multi_card
@@ -740,6 +758,28 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         if self._ascend_runtime_activation is not None:
             return self._ascend_runtime_activation
         return super().activation
+
+    def _register_omoe_cpu_expert_layer(self, *, swiglu_limit=None):
+        """Register the original CPU checkpoint owner without creating weights."""
+        from vllm_ascend.expert_offload import ExpertOffloadManager
+
+        if self.quant_type != QuantType.W8A8:
+            raise NotImplementedError("O-MoE CPU expert loading currently supports only W8A8")
+        # The older Ascend model factory omits the checkpoint clamp for routed
+        # experts. Repair missing values only on O-MoE ON; OFF stays unchanged,
+        # and an explicit zero or other caller-provided limit takes precedence.
+        if getattr(self.routed_experts, "swiglu_limit", None) is None:
+            self.routed_experts.swiglu_limit = swiglu_limit
+        self.global_num_experts = self.moe_config.num_experts
+        self.routed_experts.global_num_experts = self.global_num_experts
+        self.routed_experts.enable_omoe = True
+        self.routed_experts.enable_expert_offload = False
+        self.routed_experts.enable_multi_card = False
+        self.routed_experts.gate = self._gate
+        self.routed_experts.log2phy = self.log2phy
+        # Register only the owner/schema now. CPU postprocessing may replace
+        # Parameter.data; the manager adopts final ND views after loading.
+        ExpertOffloadManager.get_instance().register_omoe_layer(self.routed_experts, self.moe_instance_id)
 
     def _wrap_weight_loader_for_offload(self):
         """Wrap weight_loader to intercept w13/w2 weights and store them on CPU.

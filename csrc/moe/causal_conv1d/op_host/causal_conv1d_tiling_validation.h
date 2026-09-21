@@ -375,6 +375,9 @@
      tiling.inputMode = inputMode;
      tiling.width = width;
      tiling.stateLen = stateLen;
+     const int64_t *stateStride = context->GetAttrs()->GetAttrPointer<int64_t>(ATTR_STATE_STRIDE_INDEX);
+     tiling.stateStride = (stateStride == nullptr || *stateStride == 0) ? stateLen * dim : *stateStride;
+     OP_CHECK_IF(tiling.stateStride <= 0, OP_LOGE(context, "stateStride must be positive"), return ge::GRAPH_FAILED);
      tiling.numCacheLines = numCacheLines;
      tiling.batch = batch;
      return ge::GRAPH_SUCCESS;

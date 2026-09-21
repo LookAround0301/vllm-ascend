@@ -29,6 +29,7 @@ from vllm_ascend.ops.activation import SituActivationConfig
 from vllm_ascend.ops.fused_moe import comm_utils
 from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
+    MoEAllGatherCombineMetadata,
     MoEFusedExpertsInput,
     MoEMlpComputeInput,
     MoEPrepareOutput,
@@ -147,6 +148,9 @@ class MoECommMethod(ABC):
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         assert moe_comm_method is not None, "Missing communication context"
+        provider = fused_experts_input.expert_provider
+        if provider is not None and fused_experts_input.routing.log2phy is not None:
+            raise ValueError("Expert provider dispatch cannot use resident-slot log2phy")
 
         before_dispatch_evt = torch.npu.current_stream().record_event()
         routed_topk_ids = _map_logical_ids_to_phy(
@@ -167,7 +171,35 @@ class MoECommMethod(ABC):
             use_fusion_ops=self.use_fusion_ops,
         )
 
-        mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
+        if provider is None:
+            mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
+        else:
+            # The provider receives real dispatch order/counts, not predicted
+            # experts. Empty groups may be removed but row order is invariant.
+            prepared_input, lease_group = provider.prepare_mlp(mlp_compute_input)
+            try:
+                mlp_output, before_gmm2_evt = self._apply_mlp(prepared_input)
+                if mlp_output.shape != prepared_input.hidden_states.shape:
+                    raise ValueError("Expert provider MLP output must preserve its prepared row shape")
+                if mlp_output.shape != mlp_compute_input.hidden_states.shape:
+                    if (
+                        not isinstance(token_dispatch_output.combine_metadata, MoEAllGatherCombineMetadata)
+                        or mlp_output.dim() != 2
+                        or mlp_output.shape[1:] != mlp_compute_input.hidden_states.shape[1:]
+                        or mlp_output.shape[0] > mlp_compute_input.hidden_states.shape[0]
+                    ):
+                        raise ValueError("Only AllGather's valid dispatch prefix may be shorter for expert compute")
+                    # MoeInitRoutingV2 allocates NUM_ROWS*topk rows, but only
+                    # the sum(local counts) prefix is valid. Restore capacity
+                    # for unpermute without reading/quantizing garbage rows.
+                    padded_output = mlp_output.new_zeros(mlp_compute_input.hidden_states.shape)
+                    padded_output[: mlp_output.shape[0]].copy_(mlp_output)
+                    mlp_output = padded_output
+            finally:
+                # Cover partial submissions on exceptions as well. If event
+                # recording fails, do NOT release the pins: fail closed.
+                compute_done = torch.npu.current_stream().record_event()
+                provider.release_compute(lease_group, compute_done)
 
         before_combine_evt = torch.npu.current_stream().record_event()
         routed_out = self.token_dispatcher.token_combine(
@@ -461,6 +493,8 @@ class FusedMC2CommImpl(MoECommMethod):
         self,
         fused_experts_input: MoEFusedExpertsInput,
     ):
+        if fused_experts_input.expert_provider is not None:
+            raise NotImplementedError("O-MoE requires separated dispatch/MLP/combine; FusedMC2/MegaMoE is unsupported")
         # SiTU is implemented by the generic MoE path. Keep other activations
         # on the upstream MegaMoE path, including unquantized shared experts.
         if isinstance(fused_experts_input.activation, SituActivationConfig):

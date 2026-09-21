@@ -41,6 +41,7 @@ struct CausalConv1dTilingData {
     int64_t width;
 
     int64_t stateLen;
+    int64_t stateStride;  // Elements per address index, not necessarily stateLen * dim.
     int64_t numCacheLines;
     int64_t batch;
     int64_t activationMode;

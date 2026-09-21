@@ -62,6 +62,7 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -375,13 +376,13 @@ class NPUWorker(WorkerBase):
         self._is_checkpoint_format = True
 
     def shutdown(self) -> None:
-        # model_runner.shutdown() moved to the top. It emits the
-        # decode-statistics summary, and vLLM's process manager SIGKILLs this
-        # process in the same second it sends SIGTERM — so only the first thing
-        # here is guaranteed to run.
+        # Flush ordinary-path decode statistics before other cleanup. O-MoE
+        # must first drain prefetch and close its manager, since asynchronous
+        # weight transfers can still reference the runner's tensors.
         if model_runner := getattr(self, "model_runner", None):
+            offload_manager = getattr(model_runner, "offload_manager", None)
             shutdown_fn = getattr(model_runner, "shutdown", None)
-            if callable(shutdown_fn):
+            if not getattr(offload_manager, "enable_omoe", False) and callable(shutdown_fn):
                 shutdown_fn()
 
         if ensure_kv_transfer_shutdown is not None:
@@ -395,6 +396,32 @@ class NPUWorker(WorkerBase):
 
         if model_runner := getattr(self, "model_runner", None):
             offload_manager = getattr(model_runner, "offload_manager", None)
+            shutdown_fn = getattr(model_runner, "shutdown", None)
+            if offload_manager is not None and getattr(offload_manager, "enable_omoe", False):
+                # Manager.close drops its layer list. Retain identities only,
+                # then retire this runner's global registrations after BOTH
+                # cleanup stages succeed; failed owners must stay reachable.
+                if not hasattr(self, "_omoe_shutdown_layer_ids"):
+                    self._omoe_shutdown_layer_ids = {id(layer) for layer in getattr(offload_manager, "moe_layers", ())}
+                try:
+                    offload_manager.close()
+                except BaseException:
+                    # Do not let a sticky prefetch error skip the runner's
+                    # shutdown, or let a secondary cleanup error hide it.
+                    if callable(shutdown_fn):
+                        try:
+                            shutdown_fn()
+                        except BaseException:
+                            logger.exception("Model runner cleanup also failed after O-MoE shutdown failure")
+                    raise
+                if callable(shutdown_fn):
+                    shutdown_fn()
+                VllmEplbAdaptor.unregister_routed_layers(self._omoe_shutdown_layer_ids)
+                # Runner.shutdown collects before dropping model/static
+                # context; collect now that the last registry root is gone.
+                gc.collect()
+                del self._omoe_shutdown_layer_ids
+                return
             if offload_manager is not None:
                 offload_manager.close()
 
@@ -573,6 +600,14 @@ class NPUWorker(WorkerBase):
         # Override torch_peak_increase with the pre-graph-capture value to
         # avoid double-counting graph pool memory as activation memory.
         profile_result.torch_peak_increase = profile_torch_peak - profile_result.before_profile.torch_peak
+        manager = getattr(self.model_runner, "offload_manager", None)
+        if manager is not None and manager.enable_omoe:
+            # The temporary expert pool spans the entire profile forward and
+            # is released before arena allocation. Its inference counterpart
+            # lives inside that arena, so only activation/workspace is extra.
+            profile_expert_bytes = manager.omoe_local_experts_per_layer * manager.omoe_expert_layout.extent_nbytes
+            profile_result.torch_peak_increase -= profile_expert_bytes
+            logger.info("[O-MOE] excluded temporary expert pool from activation budget: %d bytes", profile_expert_bytes)
         profile_result.non_kv_cache_memory = (
             profile_result.non_torch_increase + profile_result.torch_peak_increase + profile_result.weights_memory
         )
@@ -615,7 +650,7 @@ class NPUWorker(WorkerBase):
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
-    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | tuple[ModelRunnerOutput | None, dict] | None:
         self.log_memory_stats()
         # enable msMonitor to monitor the performance of vllm-ascend
         if get_ascend_config().msmonitor_use_daemon:
@@ -648,7 +683,22 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
+        expert_delta = getattr(scheduler_output, "expert_cache_delta", None)
+        if expert_delta is not None:
+            manager = self.model_runner.offload_manager
+            manager.apply_cache_delta(expert_delta)
+            self.model_runner.install_omoe_cache_pages(
+                expert_delta.cache_updates, expert_delta.zero_spans
+            )
+            manager.activate_omoe_policy(expert_delta.delta_id)
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        if expert_delta is not None:
+            # Each rank seals background submissions before its normal result
+            # returns. Scheduler-side retirement waits for all these results.
+            snapshot = manager.omoe_expert_snapshot(expert_delta.delta_id, expert_delta.released_slots)
+            if isinstance(output, AsyncModelRunnerOutput):
+                output = output.get_output()
+            return output, snapshot
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -824,6 +874,70 @@ class NPUWorker(WorkerBase):
         weight = torch.rand((2, 4), dtype=torch.float16).npu()
         c = torch.rand((4, 4), dtype=torch.float32).npu()
         torch_npu._npu_matmul_add_fp32(x, weight, c)
+
+    def get_omoe_pool_info(self):
+        return self.model_runner.offload_manager.get_omoe_pool_info()
+
+    def release_omoe_window(self, delta_id):
+        return self.model_runner.offload_manager.release_omoe_window(delta_id)
+
+    def prepare_omoe_expert_sources(self, target_rank, delta_id):
+        """Initialize cold sources on one rank in an all-worker RPC round.
+
+        Engine initialization waits for every rank before selecting the next
+        rank. No device collective belongs here or in cache initialization:
+        non-target workers must only validate and acknowledge this round.
+        Partial handoff failures are terminal until engine teardown, even if
+        the manager retained completed layers for safe resource retirement.
+        """
+        if getattr(self, "_omoe_source_preparation_failed", False):
+            raise RuntimeError("O-MoE source preparation failed; restart the engine")
+        try:
+            world_size = self.parallel_config.world_size
+            if (
+                type(world_size) is not int
+                or world_size <= 0
+                or type(self.rank) is not int
+                or not 0 <= self.rank < world_size
+                or type(target_rank) is not int
+                or not 0 <= target_rank < world_size
+                or type(delta_id) is not int
+                or delta_id != 0
+            ):
+                raise RuntimeError("O-MoE source preparation requires valid global ranks and delta ID zero")
+            manager = getattr(getattr(self, "model_runner", None), "offload_manager", None)
+            if manager is None or getattr(manager, "enable_omoe", False) is not True:
+                raise RuntimeError("O-MoE source preparation requires an initialized ON manager")
+            manager.ensure_omoe_open()
+            if (
+                getattr(manager, "omoe_arena_layout", None) is None
+                or getattr(manager, "omoe_arena", None) is None
+                or getattr(manager, "omoe_profile_active", None) is not False
+                or type(getattr(manager, "omoe_cache_delta_id", None)) is not int
+                or manager.omoe_cache_delta_id != 0
+                or manager.omoe_warmup_slots
+                or manager.omoe_warmup_experts
+                or getattr(manager, "omoe_cpu_weights_phase", None) not in ("fused", "split")
+            ):
+                raise RuntimeError("Retire all warmup ownership before O-MoE source preparation")
+            selected = self.rank == target_rank
+            if selected:
+                cache = manager.initialize_omoe_page_cache()
+                if (
+                    cache is None
+                    or getattr(manager, "omoe_page_cache", None) is not cache
+                    or manager.omoe_cpu_weights_phase != "split"
+                ):
+                    raise RuntimeError("O-MoE source preparation did not publish a ready initial cache")
+            return {
+                "rank": self.rank,
+                "target_rank": target_rank,
+                "delta_id": delta_id,
+                "status": "ready" if selected else "skipped",
+            }
+        except BaseException:
+            self._omoe_source_preparation_failed = True
+            raise
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
@@ -1043,6 +1157,12 @@ class NPUWorker(WorkerBase):
         self.model_runner.update_config(overrides)
 
     def reload_weights(self, *args, **kwargs) -> None:
+        # Final O-MoE projections own the checkpoint after warmup. A reload
+        # cannot mutate only the model Parameters while leaving those sources
+        # and resident pages stale; reject before any loader side effect.
+        manager = getattr(self.model_runner, "offload_manager", None)
+        if manager is not None and getattr(manager, "enable_omoe", False):
+            raise NotImplementedError("O-MoE checkpoint reload requires a new engine instance")
         self.model_runner.reload_weights(*args, **kwargs)
 
     def check_health(self) -> None:

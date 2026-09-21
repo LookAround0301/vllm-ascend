@@ -156,7 +156,15 @@ inline void ScatterNdUpdateV2Tiling::Tiling4Scatter(uint64_t totalLength, uint64
     frontRow_ = tailRow_ + 1;
     frontNum_ = totalLength % coreNum_;
     tailNum_ = tailRow_ == 0 ? 0 : coreNum_ - frontNum_;
-    ubLengthForUpdates_ = ((ubSize_ - SORT_BLOCK_LENGTH * SORT_USE_GM_NUM * sizeof(int)) / ALIGNED_SIZE * ALIGNED_SIZE) / dataTypeSize_;
+    // The large-index kernel keeps every coordinate as INT64 in UB. Its
+    // index buffer can exceed the legacy two INT32 buffers (e.g. 64 KiB for
+    // 4096 two-coordinate rows), so reserve its actual size before updates.
+    uint64_t indexBufferBytes = SORT_BLOCK_LENGTH * SORT_USE_GM_NUM * sizeof(int);
+    if (needLargeIndexKernel_) {
+        indexBufferBytes = blockLength_ * indexDim_ * sizeof(int64_t);
+        indexBufferBytes = (indexBufferBytes + ALIGNED_SIZE - 1) / ALIGNED_SIZE * ALIGNED_SIZE;
+    }
+    ubLengthForUpdates_ = ((ubSize_ - indexBufferBytes) / ALIGNED_SIZE * ALIGNED_SIZE) / dataTypeSize_;
     scatterAlignLength_ = (scatterLength_ + scatterAlignNum - 1) & ~(scatterAlignNum - 1);
     formDim_ = scatterAlignLength_ / ubLengthForUpdates_;
 
@@ -318,10 +326,6 @@ ge::graphStatus ScatterNdUpdateV2Tiling::Init()
         totalLength *= varRefShape.GetDim(i);
     }
 
-    if (isInt64Indices_) {
-        needLargeIndexKernel_ = !IsLinearIndex(totalLength);
-    }
-
     if (varDimNum > indexDim_) {
         for (uint64_t i = indexDim_; i < varDimNum; i++) {
             scatterLength_ *= varRefShape.GetDim(i);
@@ -332,13 +336,6 @@ ge::graphStatus ScatterNdUpdateV2Tiling::Init()
         indexRow *= indicesShape.GetDim(i);
     }
 
-    if (needLargeIndexKernel_) {
-        isSort_ = false;
-        isLinearIndex_ = false;
-    } else {
-        isSort_ = false;
-        isLinearIndex_ = IsLinearIndex(totalLength);
-    }
     coreNum_ = std::min(compileInfo->totalCoreNum,
                     std::min(static_cast<uint64_t>(totalLength), static_cast<uint64_t>(indexRow)));
     coreNum_ = coreNum_ == 0 ? 1 : coreNum_;
@@ -350,9 +347,14 @@ ge::graphStatus ScatterNdUpdateV2Tiling::Init()
         maxPhysicalOffset += (varRefShape.GetDim(i) - 1) * indicesMask_[i];
     }
     uint64_t totalPhysicalRange = maxPhysicalOffset + scatterLength_;
-    if (!needLargeIndexKernel_) {
-        isSort_ = IsSort(totalPhysicalRange, indexRow);
-    }
+    // LinearIndexKernel computes element offsets, not indexed row numbers.
+    // Include physical strides and the full update row before selecting its
+    // INT32 arithmetic; a small [page, token] shape can still span many GiB.
+    bool fitsInt32Offsets = IsLinearIndex(totalPhysicalRange);
+    needLargeIndexKernel_ = isInt64Indices_ && !fitsInt32Offsets;
+    // Preserve the existing INT32-input path; DS V4 physical slots are INT64.
+    isLinearIndex_ = isInt64Indices_ ? !needLargeIndexKernel_ : IsLinearIndex(totalLength);
+    isSort_ = !needLargeIndexKernel_ && IsSort(totalPhysicalRange, indexRow);
     SetTilingKeyMode();
     tilingContext_->SetScheduleMode(1);
     Tiling4Scatter(totalPhysicalRange, indexRow);

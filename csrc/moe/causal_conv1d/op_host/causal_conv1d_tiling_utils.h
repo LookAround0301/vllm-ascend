@@ -29,6 +29,9 @@ constexpr uint32_t NUM_ACCEPTED_TOKENS_INDEX = 7;
 constexpr int32_t ATTR_ACTIVATION_MODE_INDEX = 0;
 constexpr int32_t ATTR_PAD_SLOT_ID_INDEX = 1;
 constexpr int32_t ATTR_RUN_MODE_INDEX = 2;
+// Position in CausalConv1d's Attr declaration order, not the stride value.
+// The binding supplies conv_state.stride(0) as this attribute.
+constexpr int32_t ATTR_STATE_STRIDE_INDEX = 3;
 constexpr int64_t ASCENDC_RESERVED_WORKSPACE_SIZE = 16 * 1024 * 1024;
 
 struct CausalConv1dCompileInfo {

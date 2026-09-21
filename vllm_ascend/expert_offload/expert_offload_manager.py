@@ -5,8 +5,12 @@ import logging
 import os
 import threading
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from itertools import accumulate
+from math import isfinite
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +37,22 @@ from vllm_ascend.ops.fused_moe.experts_selector import (
     substitute_experts_device,
 )
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+
+
+if TYPE_CHECKING:
+    from vllm_ascend.expert_offload.expert_manager import ExpertCacheDelta
+    from vllm_ascend.expert_offload.expert_prefetch import ExpertCacheSnapshot, ExpertPageCache, ExpertPrefetchTicket
+
+
+class ExpertWorkerInfo(TypedDict):
+    """Startup geometry; allocator and cache schemas come from the memory layout."""
+
+    kind: str
+    num_blocks: int
+    allocator: dict[str, object]
+    expert_nbytes: int
+    local_experts: int
+    cache_schemas: NotRequired[list[dict[str, object]]]
 
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
@@ -76,6 +96,19 @@ def _expert_weight(layer, name: str):
     return getattr(layer, name)
 
 
+@dataclass(frozen=True)
+class OMoEWeightsProvider:
+    manager: object
+    layer: object
+    prefetch_ticket: object | None = None
+
+    def prepare_mlp(self, mlp_input):
+        return self.manager.prepare_omoe_mlp(self.layer, mlp_input, prefetch_ticket=self.prefetch_ticket)
+
+    def release_compute(self, compute_state, event):
+        self.manager.release_omoe_compute(compute_state, event)
+
+
 class ExpertOffloadManager:
     """Singleton manager for expert weight offloading.
 
@@ -111,6 +144,7 @@ class ExpertOffloadManager:
         from vllm_ascend.ascend_config import get_ascend_config
 
         self.offload_config = get_ascend_config().expert_offload_config
+        self.enable_omoe = getattr(getattr(get_ascend_config(), "omoe_config", None), "enabled", False) is True
         # The minimum capacity is the conservative global dispatch threshold;
         # actual weight and placement sizes are resolved per MoE layer.
         self.num_device_experts = min(
@@ -262,6 +296,32 @@ class ExpertOffloadManager:
         self._is_prefetch: bool = False
         self._init_prefetch_state()
 
+        if self.enable_omoe:
+            # Fixed compute buffers are model memory; shared expert pages arrive later.
+            self.omoe_fused_cpu_weights = {}
+            self.omoe_weights_providers = {}
+            self.omoe_warmup_experts = OrderedDict()
+            self.omoe_warmup_free_slots = []
+            self.omoe_warmup_slots = []
+            self.omoe_prepared_weights = {}
+            self.omoe_pending_compute_refs = []
+            self.omoe_arena = None
+            self.omoe_arena_layout = None
+            self.omoe_expert_layout = None
+            self.omoe_profile_active = False
+            self.omoe_num_loads = 0
+            self.omoe_num_cache_hits = 0
+            self.omoe_page_cache = None
+            self.omoe_compute_buffers = ()
+            self.omoe_device_tables = None
+            self.omoe_projection_cpu_weights = None
+            self.omoe_cpu_weights_phase = "fused"
+            self.omoe_prefetch_queue = None
+            self.omoe_prediction_cpu_buffers: tuple[torch.Tensor, torch.Tensor] | None = None
+            self.omoe_prefetch_paused = True
+            self.omoe_pending_load_plan = None
+            self.omoe_prefetch_handoffs = None
+
     def _init_prefill_pool_state(self) -> None:
         """Prefill-pool attribute init (ndl layers × all experts on NPU)."""
         # Prefill pool: ndl layers × all experts on NPU, shared round-robin
@@ -379,6 +439,870 @@ class ExpertOffloadManager:
         indexes by MoE-layer registration order.
         """
         return self.offload_config.num_device_experts_for_layer(layer_idx)
+
+    def register_omoe_layer(self, layer, layer_moe_idx: int):
+        """Register schema only; checkpoint postprocessing may replace storage."""
+        if not self.enable_omoe or not getattr(layer, "enable_omoe", False):
+            raise RuntimeError("O-MoE registration requires a CPU routed-expert layer")
+        self.require_omoe_fused_sources()
+        if layer_moe_idx != len(self.moe_layers):
+            raise ValueError("O-MoE routed layers must register in model order")
+        self.moe_layers.append(layer)
+        layer._omoe_layer_idx = layer_moe_idx
+        self.omoe_weights_providers[id(layer)] = OMoEWeightsProvider(self, layer)
+
+    def get_omoe_provider(self, layer, *, prefetch_ticket=None):
+        self.ensure_omoe_open()
+        provider = self.omoe_weights_providers[id(layer)]
+        if prefetch_ticket is None:
+            return provider
+        handoffs = getattr(self, "omoe_prefetch_handoffs", None)
+        if (
+            prefetch_ticket.delta_id != self.omoe_cache_delta_id
+            or prefetch_ticket.layer_idx != layer._omoe_layer_idx
+        ):
+            raise RuntimeError("Prefetch admission must bind the exact source-layer invocation")
+        # A predictor returning None may retire its ticket before dispatch.
+        # Optional cancellation must never prevent real expert computation.
+        if handoffs is None or not handoffs.is_current(prefetch_ticket):
+            return provider
+        return replace(provider, prefetch_ticket=prefetch_ticket)
+
+    def finalize_omoe_weights(self):
+        from vllm.utils.math_utils import round_up
+
+        from vllm_ascend.expert_offload.config import expert_residency_limits
+        from vllm_ascend.expert_offload.expert_memory import EXPERT_ALIGNMENT, ExpertMemoryLayout
+
+        # Profiling still reads fused CPU weights; the later per-rank handoff
+        # replaces those sources with independently stored projections.
+        self.require_omoe_fused_sources()
+        if not self.moe_layers:
+            raise RuntimeError("O-MoE did not register any routed expert layers")
+        scale_nbytes = 0
+        for layer in self.moe_layers:
+            if not getattr(layer, "_omoe_cpu_weights_ready", False):
+                raise RuntimeError("O-MoE CPU checkpoint postprocessing did not complete")
+            w13, w2 = layer.w13_weight, layer.w2_weight
+            w13_scale, w2_scale = layer.w13_weight_scale_fp32, layer.w2_weight_scale
+            if any(tensor.device.type != "cpu" or not tensor.is_contiguous() for tensor in (w13, w2, w13_scale, w2_scale)):
+                raise ValueError("O-MoE requires contiguous CPU checkpoint sources")
+            num_experts, hidden_size, fused_intermediate_size = w13.shape
+            intermediate_size = fused_intermediate_size // 2
+            if (tuple(w2.shape) != (num_experts, intermediate_size, hidden_size)
+                    or w13.dtype != torch.int8 or w2.dtype != torch.int8):
+                raise ValueError("O-MoE requires canonical symmetric W8A8 ND weights")
+            if w13_scale.dtype != torch.float32 or w2_scale.dtype != torch.float32:
+                raise ValueError("O-MoE channel scales must be converted to FP32 on CPU")
+            expert_layout = ExpertMemoryLayout(hidden_size, intermediate_size, alignment=EXPERT_ALIGNMENT)
+            if self.omoe_expert_layout is not None and (
+                expert_layout != self.omoe_expert_layout or num_experts != self.omoe_local_experts_per_layer
+            ):
+                raise ValueError("O-MoE currently requires uniform routed expert shapes")
+            self.omoe_expert_layout = expert_layout
+            self.omoe_local_experts_per_layer = num_experts
+            # Finalization runs inside load_model's DeviceMemoryProfiler.
+            # Count scales as resident model weights before sizing the shared
+            # arena; expert reloads copy only the much larger INT8 matrices.
+            layer.w13_weight_scale.data = w13_scale.view(num_experts, 2 * intermediate_size).to(self.load_stream.device)
+            layer.w2_weight_scale.data = w2_scale.view(num_experts, hidden_size).to(self.load_stream.device)
+            layer.w13_weight_scale_fp32 = layer.w13_weight_scale.data
+            scale_nbytes += (w13_scale.numel() + w2_scale.numel()) * w13_scale.element_size()
+            self.omoe_fused_cpu_weights[layer._omoe_layer_idx] = (w13, w2)
+        # Original O-MoE keeps two compact miss buffers outside the KV/expert
+        # arena. Allocate within load_model's profiler so their bytes are
+        # deducted before the shared arena is sized, including TP shards.
+        floors, _ = expert_residency_limits(
+            self.offload_config.offload_expert_limit, self.omoe_local_experts_per_layer,
+            len(self.moe_layers))
+        capacity = self.omoe_local_experts_per_layer - min(floors)
+        projection_bytes = round_up(hidden_size * intermediate_size, expert_layout.alignment)
+        buffer_bytes = capacity * 3 * projection_bytes
+        self.omoe_compute_buffers = tuple(
+            torch.empty(buffer_bytes, dtype=torch.uint8, device=self.load_stream.device)
+            for _ in range(2)
+        ) if capacity else ()
+        from vllm_ascend.expert_offload.expert_prefetch import ExpertDeviceTables
+
+        self.omoe_device_tables = ExpertDeviceTables(len(self.moe_layers), num_experts, self.load_stream.device)
+        logger.info("[O-MOE] fixed double compute buffers: capacity=%d per buffer, total=%d bytes",
+                    capacity, 2 * buffer_bytes)
+        logger.info(
+            "[O-MOE] CPU sources ready: layers=%d local_experts=%d expert_bytes=%d; resident scales=%d bytes",
+            len(self.moe_layers),
+            self.omoe_local_experts_per_layer,
+            self.omoe_expert_layout.extent_nbytes,
+            scale_nbytes,
+        )
+
+    def initialize_omoe_warmup_slots(self, first_block_id: int, page_bytes: int) -> None:
+        from vllm_ascend.expert_offload.expert_memory import fused_expert_views
+        from vllm_ascend.expert_offload.expert_prefetch import ExpertPageSlot
+
+        self.require_omoe_fused_sources()
+        if self.omoe_warmup_experts or self.omoe_warmup_slots:
+            raise RuntimeError("Release the previous expert window before installing another")
+        self.omoe_warmup_page_bytes = page_bytes
+        for slot_id in range(self.omoe_local_experts_per_layer):
+            block_id = first_block_id + slot_id * 3
+            slot = ExpertPageSlot(
+                slot_id, (block_id, block_id + 1, block_id + 2),
+                fused_expert_views(self.omoe_arena, block_id, page_bytes, self.omoe_expert_layout),
+            )
+            self.omoe_warmup_slots.append(slot)
+            self.omoe_warmup_free_slots.append(slot)
+
+    @property
+    def omoe_granted_expert_spans(self) -> tuple[tuple[int, int], ...]:
+        """Translate IDs only at the existing KV/state publication boundary."""
+        cache = getattr(self, "omoe_page_cache", None)
+        if cache is not None:
+            return tuple((block_id * cache.page_bytes, cache.page_bytes) for block_id in cache.granted_block_ids())
+        page_bytes = getattr(self, "omoe_warmup_page_bytes", 0)
+        return tuple((slot.block_ids[0] * page_bytes, 3 * page_bytes)
+                     for slot in getattr(self, "omoe_warmup_slots", ()))
+
+    def begin_omoe_profile(self, device):
+        """Bounded, temporary pool before the framework has sized the KV arena.
+
+        It spans the complete profile forward, then is retired before final
+        allocation. The worker excludes its bytes from activation accounting:
+        inference expert weights will be allocated inside the shared arena.
+        """
+        self.require_omoe_fused_sources()
+        if self.omoe_arena is not None or self.omoe_expert_layout is None:
+            raise RuntimeError("Invalid O-MoE profiling pool lifecycle")
+        from vllm.utils.math_utils import round_up
+
+        page_bytes = round_up(self.omoe_expert_layout.hidden_size * self.omoe_expert_layout.intermediate_size,
+                              self.omoe_expert_layout.alignment)
+        nbytes = self.omoe_local_experts_per_layer * 3 * page_bytes
+        self.omoe_arena = torch.empty(nbytes, dtype=torch.int8, device=device)
+        self.omoe_profile_active = True
+        self.initialize_omoe_warmup_slots(0, page_bytes)
+        logger.info("[O-MOE] temporary profile pool: %d bytes (included in profile peak)", nbytes)
+
+    def end_omoe_profile(self):
+        if not self.omoe_profile_active:
+            raise RuntimeError("O-MoE profile pool is not active")
+        self.release_omoe_window(0)
+        self.omoe_arena = None
+        self.omoe_profile_active = False
+
+    def get_omoe_pool_info(self) -> ExpertWorkerInfo:
+        arena_layout = self.omoe_arena_layout
+        if arena_layout is None or self.omoe_profile_active:
+            raise RuntimeError("Final O-MoE shared arena is not initialized")
+        result: ExpertWorkerInfo = {
+            "kind": "hierarchical", "num_blocks": arena_layout.num_blocks,
+            "allocator": arena_layout.allocator_wire_kwargs(),
+            "expert_nbytes": self.omoe_expert_layout.extent_nbytes,
+            "local_experts": self.omoe_local_experts_per_layer,
+        }
+        if arena_layout.cache_schemas:
+            result["cache_schemas"] = [cache_schema.to_dict() for cache_schema in arena_layout.cache_schemas]
+        return result
+
+    def require_omoe_fused_sources(self):
+        """Never interpret a retired W13 Parameter as a fused checkpoint."""
+        self.ensure_omoe_open()
+        if getattr(self, "omoe_cpu_weights_phase", "fused") != "fused":
+            raise RuntimeError("O-MoE CPU source handoff forbids returning to fused bootstrap weights")
+
+    def prepare_omoe_projection_sources(self) -> None:
+        """Convert CPU weights once, retiring each fused layer after publication.
+
+        The initialization entry owns lifecycle checks. A failed conversion aborts
+        worker startup; it cannot resume or return to fused warmup. W13 Parameters
+        become empty, so state_dict() is no longer a complete checkpoint export.
+        """
+        self.omoe_cpu_weights_phase = "splitting"
+        self.omoe_projection_cpu_weights = {}
+        num_experts = self.omoe_local_experts_per_layer
+        hidden_size, intermediate_size = self.omoe_expert_layout.hidden_size, self.omoe_expert_layout.intermediate_size
+        for layer in self.moe_layers:
+            layer_idx = layer._omoe_layer_idx
+            w13, w2 = self.omoe_fused_cpu_weights[layer_idx]
+            parameters = (layer.w13_weight, layer.w2_weight)
+            sources = (w13, w2)
+            shapes = ((num_experts, hidden_size, 2 * intermediate_size), (num_experts, intermediate_size, hidden_size))
+            dtypes = (torch.int8, torch.int8)
+            for parameter, source, shape, dtype in zip(parameters, sources, shapes, dtypes):
+                if (not isinstance(parameter, torch.nn.Parameter) or parameter.requires_grad
+                        or tuple(parameter.shape) != shape or tuple(source.shape) != shape
+                        or parameter.dtype != dtype or source.dtype != dtype
+                        or parameter.device.type != "cpu" or source.device.type != "cpu"
+                        or not parameter.is_contiguous() or not source.is_contiguous()
+                        or parameter.data_ptr() != source.data_ptr()):
+                    raise ValueError("O-MoE handoff requires the finalized canonical checkpoint Parameters")
+            try:
+                # Pack once for the NZ kernel: [N/32, K/16, 16, 32].
+                # These are format tile dimensions; inference copies the bytes unchanged.
+                projections = []
+                for projection in (w13[:, :, :intermediate_size], w2, w13[:, :, intermediate_size:]):
+                    _, k, n = projection.shape
+                    packed = torch.empty((num_experts, k, n), dtype=projection.dtype, device="cpu", pin_memory=True)
+                    packed.view(num_experts, n // 32, k // 16, 16, 32).copy_(
+                        projection.reshape(num_experts, k // 16, 16, n // 32, 32).permute(0, 3, 1, 2, 4)
+                    )
+                    projections.append(packed)
+                projections = tuple(projections)
+                if any(not tensor[0].is_contiguous() or not tensor.is_pinned() for tensor in projections):
+                    raise RuntimeError("O-MoE per-expert projection sources must be contiguous and pinned")
+                empty_fused_weight = torch.empty(0, dtype=w13.dtype, device="cpu")
+            except Exception:
+                logger.exception("[O-MOE] pinned projection source handoff failed at layer=%d", layer_idx)
+                raise
+            # Publish all projections before changing Parameters or retiring the
+            # fused source. A failed copy leaves this layer's original data intact.
+            self.omoe_projection_cpu_weights[layer_idx] = projections
+            layer.w2_weight.data = projections[1]
+            layer.w13_weight.data = empty_fused_weight
+            del self.omoe_fused_cpu_weights[layer_idx]
+            layer._omoe_cpu_source_phase = "split"
+            # Loop locals must not retain the old fused storage into the next layer.
+            del w13, w2, sources, source, projection, packed
+        self.omoe_cpu_weights_phase = "split"
+        logger.info(
+            "[O-MOE] final pinned split CPU expert sources: %d bytes; fused W13 storage retired layer by layer",
+            sum(tensor.numel() * tensor.element_size()
+                for tensors in self.omoe_projection_cpu_weights.values() for tensor in tensors),
+        )
+
+    def initialize_omoe_page_cache(self) -> "ExpertPageCache":
+        """Create the page cache during startup, after warmup retirement."""
+        from vllm_ascend.expert_offload.expert_prefetch import ExpertPageCache
+        from vllm_ascend.expert_offload.config import expert_residency_limits
+
+        cache = self.omoe_page_cache
+        if cache is not None:
+            return cache
+        self.require_omoe_fused_sources()
+        if (
+            not self.enable_omoe
+            or self.omoe_arena_layout is None
+            or self.omoe_profile_active
+            or self.omoe_warmup_slots
+            or self.omoe_warmup_experts
+        ):
+            raise RuntimeError("Retire all warmup expert ownership before installing projection grants")
+        self.prepare_omoe_projection_sources()
+        arena_layout = self.omoe_arena_layout
+        min_resident_experts_by_layer, resident_total = expert_residency_limits(
+            self.offload_config.offload_expert_limit, self.omoe_local_experts_per_layer,
+            len(self.moe_layers))
+        cache = ExpertPageCache(
+            arena=self.omoe_arena,
+            layout=self.omoe_expert_layout,
+            page_bytes=arena_layout.expert_page_bytes,
+            local_experts=self.omoe_local_experts_per_layer,
+            sources=self.omoe_projection_cpu_weights,
+            transport=self._get_h2d_transport(),
+            weight_layout="nz",
+            compute_buffers=self.omoe_compute_buffers,
+            device_tables=self.omoe_device_tables,
+            prediction_weight=self.offload_config.cache_router_weight,
+            resident_floor=dict(enumerate(min_resident_experts_by_layer)),
+            resident_total=resident_total,
+        )
+        self.omoe_page_cache = cache
+        self.omoe_prefetch_paused = True
+        return cache
+
+    def pause_omoe_prefetch(self):
+        self.omoe_prefetch_paused = True
+        handoffs = getattr(self, "omoe_prefetch_handoffs", None)
+        if handoffs is not None:
+            handoffs.cancel_all()
+        queue = getattr(self, "omoe_prefetch_queue", None)
+        if queue is not None:
+            queue.drain()
+
+    @property
+    def omoe_cache_delta_id(self) -> int:
+        # ExpertPageCache owns the worker's batch ID; warmup has no page cache.
+        cache = getattr(self, "omoe_page_cache", None)
+        return 0 if cache is None else cache.delta_id
+
+    def apply_cache_delta(self, delta: "ExpertCacheDelta") -> None:
+        """Install new expert pages; retire old pages after this model step.
+
+        Retired pages remain reserved in the scheduler until every worker has
+        returned from this execution. They cannot become this step's KV pages.
+        """
+        if delta.delta_id != self.omoe_cache_delta_id + 1:
+            raise RuntimeError("Expert cache delta must advance exactly one batch")
+        if self.omoe_pending_load_plan is not None:
+            raise RuntimeError("Previous expert policy has not been activated")
+        cache = self.omoe_page_cache
+        if cache is None:
+            raise RuntimeError("Initialize the O-MoE page cache before applying cache deltas")
+        self.pause_omoe_prefetch()
+        # This step still reads eviction targets. Retire them after model execution.
+        policy = delta.policy
+        load_plan = tuple(tuple(key) for key in policy["load_plan"])
+        if policy["prediction_weight"] != self.offload_config.cache_router_weight:
+            raise ValueError("Scheduler and worker prediction weights differ")
+        cache.install(delta.added_slots, delta.delta_id)
+        # Empty plans still wait for publication. activate_omoe_policy() is the
+        # only point that resumes optional transfers after the cache maps are ready.
+        self.omoe_pending_load_plan = load_plan
+        if any(cache.resident_floor.values()):
+            cache.initialize_residency(self.load_stream, initial_resident_counts=delta.initial_resident_counts)
+
+    def omoe_expert_snapshot(
+        self, delta_id: int, released_slots: tuple[int, ...] = (),
+    ) -> "ExpertCacheSnapshot":
+        """Observe this step before retiring experts and returning worker state."""
+        if getattr(self, "omoe_pending_load_plan", None) is not None:
+            raise RuntimeError("Expert policy cannot advance before cache-page installation")
+        self.pause_omoe_prefetch()
+        cache = self.initialize_omoe_page_cache()
+        snapshot = cache.snapshot(delta_id, incremental=True)
+        if released_slots:
+            # Record routing while this step's resident mappings still exist.
+            # Only surviving slots belong in the scheduler's next snapshot.
+            cache.release(released_slots, delta_id)
+            released = set(released_slots)
+            snapshot["slots"] = [slot for slot in snapshot["slots"] if slot["slot_id"] not in released]
+            snapshot["stats"] = dict(cache.stats)
+        return snapshot
+
+    def activate_omoe_policy(self, delta_id: int) -> None:
+        """Activate staged priorities only after cache-page publication succeeds."""
+        pending = getattr(self, "omoe_pending_load_plan", None)
+        if (
+            pending is None or delta_id != self.omoe_cache_delta_id
+        ):
+            raise RuntimeError("Expert policy activation is missing, stale or repeated")
+        if not self.omoe_prefetch_paused:
+            raise RuntimeError("Expert policy activation requires paused submissions")
+        plan = pending
+        cache = self.omoe_page_cache
+        self.omoe_cache_loads: dict[int, list[tuple[int, int]]] = {}
+        for key in plan:
+            self.omoe_cache_loads.setdefault(key[0], []).append(key)
+        stream = torch.npu.current_stream()
+        cache.prepare_device_weights(self.moe_layers, stream)
+        if plan:
+            self.load_stream.wait_event(stream.record_event())
+        self.omoe_pending_load_plan = None
+        self.omoe_prefetch_paused = False
+
+    def prefetch_omoe_cache_layer(self, layer_idx: int) -> None:
+        """Materialize this layer's growth targets on the prefetch path."""
+        keys = self.omoe_cache_loads.pop(layer_idx, ())
+        if not keys:
+            return
+        cache = self.omoe_page_cache
+        with torch.npu.stream(self.load_stream):
+            cache.load_cache_plan(keys, cache.delta_id, self.load_stream)
+            # Publish this layer's mapping with its own load-completion fence.
+            # Earlier layers can keep computing while these copies run.
+            cache.prepare_device_weights(self.moe_layers, self.load_stream)
+
+    def cancel_omoe_prefetch(self, ticket):
+        """Cancel a failed invocation, including an already queued admission."""
+        handoffs = getattr(self, "omoe_prefetch_handoffs", None)
+        if ticket is not None and handoffs is not None:
+            handoffs.cancel(ticket)
+
+    def submit_omoe_ready_prefetch(self, ready_prefetch):
+        """Enqueue only a complete handoff; never wait for future host work."""
+        if ready_prefetch is None:
+            return
+        handoffs = self.omoe_prefetch_handoffs
+        cache = self.omoe_page_cache
+        ticket = ready_prefetch.ticket
+        next_layer_idx, local_expert_ids, observation_revision = ready_prefetch.payload
+        # O-MoE prefetches every predicted miss. The fixed double buffer
+        # already has one row for each nonresident expert in this layer.
+        candidates = cache.missing_candidates(next_layer_idx, local_expert_ids)
+        if not candidates:
+            # Resident predictions already published their retention scores.
+            # No transfer needs a submission thread or a stream dependency.
+            handoffs.finish(ticket)
+            return
+
+        def prefetch_ready_experts():
+            try:
+                with torch.inference_mode(), torch.npu.device(self._prefetch_stream.device):
+                    if (
+                        self.omoe_prefetch_paused or ticket.delta_id != self.omoe_cache_delta_id
+                        or not handoffs.is_current(ticket)
+                    ):
+                        cache.record_stat("prefetch_handoff_cancelled")
+                        return
+                    if cache.observation_revision(next_layer_idx) != observation_revision:
+                        cache.record_stat("prefetch_handoff_stale_target")
+                        return
+                    # This event was already recorded after real loads,
+                    # descriptors and counts. It cannot wait for a future
+                    # callback or for the GMMs that should overlap this copy.
+                    with torch.npu.stream(self._prefetch_stream):
+                        self._prefetch_stream.wait_event(ready_prefetch.event)
+                        cache.prefetch(
+                            next_layer_idx, candidates, ticket.delta_id, self._prefetch_stream,
+                            observation_revision=observation_revision,
+                        )
+                    cache.record_stat("prefetch_handoff_submitted")
+            finally:
+                handoffs.finish(ticket)
+
+        try:
+            accepted = self.omoe_prefetch_queue.submit(prefetch_ready_experts)
+        except BaseException:
+            handoffs.cancel(ticket)
+            raise
+        if not accepted:
+            handoffs.cancel(ticket)
+            cache.record_stat("prefetch_handoff_skipped_queue")
+
+    def publish_omoe_compute_ready(self, ticket):
+        """Publish a fresh source-layer boundary inside Prepared's pin scope."""
+        if ticket is None:
+            return
+        handoffs = self.omoe_prefetch_handoffs
+        if (
+            self.omoe_prefetch_paused or ticket.delta_id != self.omoe_cache_delta_id
+            or not handoffs.is_current(ticket)
+        ):
+            handoffs.cancel(ticket)
+            return
+        event = torch.npu.current_stream().record_event()
+        self.omoe_page_cache.record_stat("prefetch_compute_ready")
+        self.submit_omoe_ready_prefetch(handoffs.compute_ready(ticket, event))
+
+    def start_omoe_prefetch_prediction(self, layer, hidden_states):
+        """Keep the original predictor; load its misses into the next compute buffer.
+
+        Request samples on the input's stream form a stable prediction snapshot,
+        even if later dispatch/MLP mutates its input. Learned prediction runs
+        on the background prefetch stream. Hash prediction uses the original
+        predictor on the caller's stream while its forward context is valid;
+        the worker only stages that stable IDs/scores snapshot. Scores are
+        speculative priorities, not route counts.
+        H2D is a separate predict_and_stage_experts admitted after this invocation's real experts and
+        metadata are ready. No predict_and_stage_experts waits for a future host-side admission.
+        """
+        from vllm_ascend.expert_offload.expert_prefetch import ExpertPrefetchHandoff, ExpertPrefetchQueue
+
+        queue = getattr(self, "omoe_prefetch_queue", None)
+        if queue is not None:
+            queue.check()
+        cache = getattr(self, "omoe_page_cache", None)
+        if cache is not None and not self.omoe_prefetch_paused:
+            # Capacity growth is mandatory, even when speculative prediction
+            # is disabled or unnecessary for the next layer.
+            self.prefetch_omoe_cache_layer(layer._omoe_layer_idx + 1)
+        if (
+            cache is None
+            or getattr(self, "omoe_prefetch_paused", True)
+            or not self.offload_config.expert_prefetch_enabled
+            or self._skip_prefill
+            or hidden_states is None
+            or not hidden_states.shape[0]
+        ):
+            return
+        layer_idx = layer._omoe_layer_idx
+        next_layer_idx = layer_idx + 1
+        if next_layer_idx >= len(self.moe_layers) or next_layer_idx >= len(self._gate_weights_npu):
+            return
+        if self._gate_weights_npu[next_layer_idx] is None:
+            return
+        # Shared residency is fixed during this model step. A complete layer
+        # cannot need a prefetch; real preparation still records its routes
+        # and consumes any preceding prediction hints before the snapshot.
+        if cache.is_fully_resident(next_layer_idx):
+            return
+        hash_routed = getattr(getattr(self.moe_layers[next_layer_idx], "gate", None), "tid2eid", None) is not None
+        # Request sampling bounds prediction work independently of the legacy
+        # device-slot threshold, including larger decode and prefill batches.
+        request_indices = None
+        max_requests = self.offload_config.expert_prefetch_max_requests
+        if max_requests > 1:
+            query_start_loc = get_forward_context().query_start_loc
+            if query_start_loc is None or query_start_loc.numel() <= 1:
+                return
+            # AllGather restores batch order. Sample the first token of each
+            # request's current chunk, not the first N flattened token rows.
+            request_indices = query_start_loc[:-1][:max_requests].long()
+            prediction_input = hidden_states.index_select(0, request_indices)
+        else:
+            prediction_input = hidden_states[:1].clone()
+        hash_snapshot = None
+        if hash_routed:
+            # Resolve token IDs on the caller thread with the same request
+            # indices as hidden states; forward_context is thread-local.
+            input_ids = get_forward_context().input_ids
+            if input_ids is None:
+                return
+            prediction_ids = (input_ids[:1] if request_indices is None else
+                              input_ids.index_select(0, request_indices))
+            predicted = self.predict_next_layer_experts_npu(
+                layer_idx, prediction_input, input_ids=prediction_ids)
+            if predicted is None:
+                return None  # No handoff or background work was created.
+            weights, ids = predicted
+            hash_snapshot = (weights.clone(), ids.clone())
+        if queue is None:
+            queue = ExpertPrefetchQueue()
+            self.omoe_prefetch_queue = queue
+        # This fence also covers both small hash-result clones. The closure
+        # retains them until its D2H completion event has been synchronized.
+        input_ready = torch.npu.current_stream().record_event()
+        delta_id = self.omoe_cache_delta_id
+        observation_revision = cache.observation_revision(next_layer_idx)
+        handoffs = getattr(self, "omoe_prefetch_handoffs", None)
+        if handoffs is None:
+            handoffs = ExpertPrefetchHandoff()
+            self.omoe_prefetch_handoffs = handoffs
+        ticket = handoffs.begin(delta_id, layer_idx)
+
+        def predict_and_stage_experts():
+            # A queued predict_and_stage_experts must not reuse staging after an earlier D2H failed.
+            queue.check()
+            # Own the snapshot until every prediction/D2H use completes. The
+            # pinned checkpoint sources outlive all submitted H2D operations.
+            with torch.inference_mode(), torch.npu.stream(self._prefetch_stream):
+                self._prefetch_stream.wait_event(input_ready)
+                try:
+                    predicted = (
+                        hash_snapshot
+                        if hash_routed
+                        else self.predict_next_layer_experts_npu(layer_idx, prediction_input)
+                    )
+                    if predicted is None:
+                        handoffs.finish(ticket)
+                        return
+                    topk_weights, topk_ids = predicted
+                    if (
+                        topk_weights.shape != topk_ids.shape or topk_ids.ndim != 2
+                        or topk_ids.shape[0] != prediction_input.shape[0] or topk_ids.dtype not in (torch.int32, torch.int64)
+                    ):
+                        raise ValueError("Original predictor returned unpaired expert IDs and scores")
+                    staging = getattr(self, "omoe_prediction_cpu_buffers", None)
+                    if staging is None or staging[0].shape[1] != topk_ids.shape[1]:
+                        shape = (max_requests, topk_ids.shape[1])
+                        staging = (
+                            torch.empty(shape, dtype=torch.int64, device="cpu", pin_memory=True),
+                            torch.empty(shape, dtype=torch.float32, device="cpu", pin_memory=True),
+                        )
+                        self.omoe_prediction_cpu_buffers = staging
+                    # The queue has one worker. It consumes both CPU lists after
+                    # the D2H fence below before another predict_and_stage_experts reuses these rows.
+                    staged = staging[0][:topk_ids.shape[0]]
+                    staged_scores = staging[1][:topk_weights.shape[0]]
+                    staged.copy_(topk_ids, non_blocking=True)
+                    staged_scores.copy_(topk_weights, non_blocking=True)
+                finally:
+                    prediction_done = self._prefetch_stream.record_event()
+                    prediction_done.synchronize()
+            global_ids = staged.reshape(-1).tolist()
+            global_scores = staged_scores.reshape(-1).tolist()
+            if (
+                self.omoe_prefetch_paused or delta_id != self.omoe_cache_delta_id
+                or not handoffs.is_current(ticket)
+            ):
+                handoffs.cancel(ticket)
+                cache.record_stat("prediction_cancelled")
+                return
+            if any(not 0 <= eid < self.omoe_local_experts_per_layer for eid in global_ids):
+                raise ValueError("Original predictor returned invalid global expert IDs")
+            if any(not isfinite(score) or not 0.0 <= score <= 1.0 for score in global_scores):
+                # Prediction is optional; real routing still loads required experts.
+                # Do not publish invalid scores into the shared residency policy.
+                cache.record_stat("prediction_invalid_scores")
+                handoffs.finish(ticket)
+                return
+            scores_by_expert = {}
+            for eid, score in zip(global_ids, global_scores, strict=True):
+                scores_by_expert[eid] = max(scores_by_expert.get(eid, 0.0), score)
+            # Merge requests before selecting this layer's nonresident experts.
+            local_expert_ids = list(scores_by_expert)
+            cache.record_stat("prediction_batches")
+            cache.record_stat("predicted_candidates", len(local_expert_ids))
+            # Retention hints cover resident predictions too; only misses
+            # need transfers into the separate compute buffer.
+            if not cache.publish_predictions(
+                next_layer_idx, local_expert_ids, delta_id,
+                scores=[scores_by_expert[eid] for eid in local_expert_ids], observation_revision=observation_revision,
+            ):
+                handoffs.finish(ticket)
+                return
+            # Publishing IDs does not occupy the queue waiting for compute.
+            # Whichever side arrives second submits a bounded H2D predict_and_stage_experts.
+            self.submit_omoe_ready_prefetch(
+                handoffs.prediction_ready(ticket, (next_layer_idx, local_expert_ids, observation_revision))
+            )
+
+        def predict_on_worker_device():
+            # This queue is dedicated to one worker. Keep its thread on that
+            # NPU instead of switching to and from the default for every predict_and_stage_experts.
+            if torch.npu.current_device() != self._prefetch_stream.device.index:
+                torch.npu.set_device(self._prefetch_stream.device)
+            try:
+                if (
+                    self.omoe_prefetch_paused or delta_id != self.omoe_cache_delta_id
+                    or not handoffs.is_current(ticket)
+                ):
+                    handoffs.cancel(ticket)
+                    cache.record_stat("prediction_cancelled")
+                    return
+                predict_and_stage_experts()
+            except BaseException:
+                handoffs.cancel(ticket)
+                raise
+
+        try:
+            accepted = queue.submit(predict_on_worker_device)
+        except BaseException:
+            handoffs.cancel(ticket)
+            raise
+        if not accepted:
+            # No prefetch stream has used the snapshot: dropping a rejected
+            # predict_and_stage_experts leaves only its ordinary creation-stream allocator lifetime.
+            handoffs.cancel(ticket)
+            cache.record_stat("prefetch_skipped_queue")
+            return None
+        return ticket
+
+    def attach_omoe_hierarchical_pool(self, arena, layout):
+        """Attach the final arena; warmup owns temporary deterministic grants."""
+        self.require_omoe_fused_sources()
+        if self.omoe_arena is not None or self.omoe_profile_active:
+            raise RuntimeError("Release profiling storage before attaching hierarchical pages")
+        if (self.omoe_expert_layout.extent_nbytes != layout.expert_extent_nbytes
+                or self.omoe_local_experts_per_layer != layout.local_experts_per_layer):
+            raise ValueError("Actual CPU expert checkpoint geometry differs from the hierarchical planner")
+        if arena.dtype != torch.int8 or arena.ndim != 1 or not arena.is_contiguous() or arena.numel() != layout.nbytes:
+            raise ValueError("Hierarchical arena must match the planned one-dimensional byte storage")
+        # No requests own the arena during warmup. The validated layout fits
+        # these consecutive slots after null Huge0; the controller retires
+        # them before admitting requests, so no free-space search is needed.
+        self.omoe_arena = arena
+        self.omoe_arena_layout = layout
+        self.initialize_omoe_warmup_slots(layout.huge_page_bytes // layout.expert_page_bytes, layout.expert_page_bytes)
+        logger.info(
+            "[O-MOE] hierarchical arena=%d Huge=%d expert_L2=%d KV=%d SSM=%s Conv=%s "
+            "null_Huge=0 expert_spans=%d projection_pages_per_span=%d",
+            layout.nbytes, layout.huge_page_bytes, layout.expert_page_bytes,
+            layout.kv_page_bytes, layout.ssm_page_bytes, layout.conv_page_bytes,
+            len(self.omoe_warmup_slots), layout.expert_span_pages,
+        )
+
+    def release_omoe_window(self, delta_id):
+        if delta_id != self.omoe_cache_delta_id:
+            raise RuntimeError("O-MoE release delta ID does not match the worker")
+        if any(slot.loading or slot.computing for slot in self.omoe_warmup_slots):
+            raise RuntimeError("O-MoE warmup still has an unsealed expert submission")
+        torch.npu.synchronize()
+        # Warmup's temporary block IDs are retired before the scheduler admits KV.
+        # Clear padding too, then discard views only after the device has finished.
+        for offset, nbytes in self.omoe_granted_expert_spans:
+            self.omoe_arena.narrow(0, offset, nbytes).zero_()
+        torch.npu.current_stream().synchronize()
+        self.omoe_warmup_experts.clear()
+        self.omoe_prepared_weights.clear()
+        self.omoe_pending_compute_refs.clear()
+        self.omoe_warmup_slots.clear()
+        self.omoe_warmup_free_slots.clear()
+        return {"released": True, "delta_id": delta_id}
+
+    def evict_omoe_warmup_expert(self, required_expert_keys):
+        for expert_key, slot in tuple(self.omoe_warmup_experts.items()):
+            if expert_key in required_expert_keys or slot.loading or slot.computing:
+                continue
+            for event in slot.pending_events():
+                event.synchronize()
+            slot.load_event = None
+            slot.compute_events.clear()
+            del self.omoe_warmup_experts[expert_key]
+            self.omoe_prepared_weights.clear()
+            return slot
+        raise RuntimeError("O-MoE expert working set exceeds the admitted shared window")
+
+    def ensure_experts(self, layer, required_ids):
+        """Prepare temporary warmup experts before the shared cache exists."""
+        self.require_omoe_fused_sources()
+        if not self.omoe_warmup_slots:
+            raise RuntimeError("O-MoE compute has no warmup expert blocks")
+        layer_idx = layer._omoe_layer_idx
+        required_expert_keys = [(layer_idx, expert_id) for expert_id in required_ids]
+        if len(required_expert_keys) > len(self.omoe_warmup_free_slots) + len(self.omoe_warmup_experts):
+            raise RuntimeError("O-MoE required experts exceed admitted capacity")
+        acquired_slots = []
+        try:
+            for expert_key in required_expert_keys:
+                if expert_key not in self.omoe_warmup_experts:
+                    slot = (
+                        self.omoe_warmup_free_slots.pop() if self.omoe_warmup_free_slots
+                        else self.evict_omoe_warmup_expert(set(required_expert_keys))
+                    )
+                    slot.key = expert_key
+                    slot.loading = True
+                    self.omoe_warmup_experts[expert_key] = slot
+                    source = self.omoe_fused_cpu_weights[layer_idx]
+                    with torch.npu.stream(self.load_stream):
+                        try:
+                            for dst, src in zip((slot.views.w13, slot.views.w2), source):
+                                dst.copy_(src[expert_key[1]], non_blocking=True)
+                        finally:
+                            slot.load_event = self.load_stream.record_event()
+                    slot.loading = False
+                    slot.load_event.synchronize()
+                    slot.load_event = None
+                    self.omoe_num_loads += 1
+                else:
+                    self.omoe_num_cache_hits += 1
+                slot = self.omoe_warmup_experts[expert_key]
+                slot.pending_events()
+                if slot.loading or slot.computing:
+                    raise RuntimeError("O-MoE warmup slot still has an unsealed submission")
+                slot.computing = True
+                acquired_slots.append(slot)
+                self.omoe_warmup_experts.move_to_end(expert_key)
+            return tuple(acquired_slots)
+        except BaseException:
+            event = torch.npu.current_stream().record_event()
+            for slot in acquired_slots:
+                slot.compute_events.append(event)
+                slot.computing = False
+            raise
+
+    def prepare_omoe_mlp(self, layer, mlp_input, *, prefetch_ticket=None):
+        self.ensure_omoe_open()
+        from vllm_ascend.ops.fused_moe.discrete_moe_mlp import (
+            DiscreteExpertWeights,
+            DiscreteMoEWeights,
+            prepare_discrete_moe_weights,
+        )
+
+        if mlp_input.group_list.ndim != 1 or mlp_input.group_list.dtype not in (torch.int32, torch.int64):
+            raise ValueError("O-MoE dispatch groups must be a one-dimensional integer tensor")
+        if mlp_input.group_list_type not in (0, 1):
+            raise ValueError("O-MoE supports cumulative/count expert groups only")
+        cache = getattr(self, "omoe_page_cache", None)
+        if cache is not None:
+            queue = getattr(self, "omoe_prefetch_queue", None)
+            if queue is not None:
+                queue.check()
+            if mlp_input.group_list.numel() != self.omoe_local_experts_per_layer:
+                raise ValueError("O-MoE dispatch groups must cover all TP experts")
+            stream = torch.npu.current_stream()
+            groups = mlp_input.group_list.to(dtype=torch.int64)
+            layer_idx = layer._omoe_layer_idx
+            # The first routed layer, or a caller without the prediction hook,
+            # still materializes its assigned growth before reading weights.
+            self.prefetch_omoe_cache_layer(layer_idx)
+            prepared = cache.prepare_device_experts(layer_idx, groups, mlp_input.group_list_type == 0, stream)
+            try:
+                # Pure TP routes every input row to a local expert. There is
+                # no EP capacity padding to trim using host-side route counts.
+                result = replace(
+                    mlp_input, weights=prepared,
+                    group_list=groups if mlp_input.group_list_type == 0 else groups.cumsum(0),
+                    group_list_type=0, fusion=False,
+                )
+                self.publish_omoe_compute_ready(prefetch_ticket)
+                return result, (layer_idx, prepared)
+            except BaseException:
+                self.cancel_omoe_prefetch(prefetch_ticket)
+                cache.release_device_compute(layer_idx, stream.record_event())
+                raise
+        # Warmup uses temporary fused weights before installing the shared pages.
+        dispatch_groups = mlp_input.group_list.to(device="cpu", dtype=torch.int64).tolist()
+        if mlp_input.group_list_type == 0:
+            token_counts = [
+                group_end - (dispatch_groups[expert_idx - 1] if expert_idx else 0)
+                for expert_idx, group_end in enumerate(dispatch_groups)
+            ]
+        else:
+            token_counts = dispatch_groups
+        if len(token_counts) != self.omoe_local_experts_per_layer or any(token_count < 0 for token_count in token_counts):
+            raise ValueError("O-MoE dispatch groups do not match TP expert order")
+        valid_rows = sum(token_counts)
+        if valid_rows > mlp_input.hidden_states.shape[0]:
+            raise ValueError("O-MoE dispatch counts exceed the grouped-row capacity")
+        active_expert_ids = [expert_id for expert_id, count in enumerate(token_counts) if count]
+        acquired_slots = self.ensure_experts(layer, active_expert_ids)
+        try:
+            weights_cache_key = (
+                layer._omoe_layer_idx,
+                # Expert IDs select scales; block IDs select stable weight views.
+                tuple((expert_id, slot.block_ids) for expert_id, slot in zip(active_expert_ids, acquired_slots)),
+            )
+            prepared_weights = self.omoe_prepared_weights.get(weights_cache_key)
+            if prepared_weights is None:
+                expert_weights = []
+                for expert_id, slot in zip(active_expert_ids, acquired_slots):
+                    # Scales follow the layer-local expert ID, never the
+                    # physical cache slot, which may hold a different expert.
+                    w13_scale = layer.w13_weight_scale_fp32[expert_id]
+                    w2_scale = layer.w2_weight_scale[expert_id]
+                    views = slot.views
+                    expert_weights.append(DiscreteExpertWeights(expert_id, views.w13, views.w2, w13_scale, w2_scale))
+                expert_layout = self.omoe_expert_layout
+                prepared_weights = prepare_discrete_moe_weights(
+                    DiscreteMoEWeights(tuple(expert_weights), expert_layout.hidden_size, expert_layout.intermediate_size, "nd"),
+                    device=mlp_input.hidden_states.device,
+                    tiling_source=next(iter(self.omoe_prepared_weights.values()), None),
+                )
+                # Keep one active pattern per layer; clearing every layer here
+                # would rebuild descriptors and tiling on every model traversal.
+                # In-flight descriptors retain their own completion references.
+                self.omoe_prepared_weights = {
+                    cached_key: cached_weights for cached_key, cached_weights in self.omoe_prepared_weights.items()
+                    if cached_key[0] != layer._omoe_layer_idx
+                }
+                self.omoe_prepared_weights[weights_cache_key] = prepared_weights
+            if mlp_input.group_list_type == 0 and len(active_expert_ids) == len(token_counts):
+                group_ends = mlp_input.group_list.to(dtype=torch.int64)
+            else:
+                # Counts are already on CPU for paging. Upload cumulative ends
+                # directly instead of launching another NPU cumsum each layer.
+                cumulative_token_counts = dispatch_groups if mlp_input.group_list_type == 0 else list(accumulate(token_counts))
+                group_ends = torch.tensor(
+                    [cumulative_token_counts[expert_id] for expert_id in active_expert_ids],
+                    dtype=torch.int64, device=mlp_input.hidden_states.device
+                )
+            result = replace(
+                mlp_input,
+                hidden_states=mlp_input.hidden_states[:valid_rows],
+                dynamic_scale=None if mlp_input.dynamic_scale is None else mlp_input.dynamic_scale[:valid_rows],
+                weights=prepared_weights,
+                group_list=group_ends,
+                group_list_type=0,
+                fusion=False,
+            )
+            # Never reuse Prepared.ready_event: a cached descriptor's fence
+            # predates this invocation's real loads and active-count tensor.
+            self.publish_omoe_compute_ready(prefetch_ticket)
+            return result, (acquired_slots, prepared_weights)
+        except BaseException:
+            self.cancel_omoe_prefetch(prefetch_ticket)
+            event = torch.npu.current_stream().record_event()
+            for slot in acquired_slots:
+                slot.compute_events.append(event)
+                slot.computing = False
+            raise
+
+    def release_omoe_compute(self, compute_state, event):
+        self.ensure_omoe_open()
+        cache = getattr(self, "omoe_page_cache", None)
+        if cache is not None:
+            layer_idx, _ = compute_state
+            cache.release_device_compute(layer_idx, event)
+            return
+        acquired_slots, prepared_weights = compute_state
+        for slot in acquired_slots:
+            slot.compute_events.append(event)
+            slot.computing = False
+        self.omoe_pending_compute_refs = [
+            (pending_event, pending_weights) for pending_event, pending_weights in self.omoe_pending_compute_refs
+            if not pending_event.query()
+        ]
+        self.omoe_pending_compute_refs.append((event, prepared_weights))
 
     def init_layer_cpu_buffers(self, layer, layer_moe_idx: int):
         """Allocate CPU weight + scale/offset buffers for one MoE layer.
@@ -612,6 +1536,11 @@ class ExpertOffloadManager:
         init, fp32 scale refresh, prefill pool creation, and gate weight
         registration.
         """
+        if self.enable_omoe:
+            self.finalize_omoe_weights()
+            if getattr(getattr(self, "offload_config", None), "expert_prefetch_enabled", False):
+                self.register_gate_weights(model)
+            return
         if not self.moe_layers:
             return
         # Barrier: ensure all deferred load_w13/load_w2/_load_scale_shard
@@ -1178,7 +2107,7 @@ class ExpertOffloadManager:
     #  Weight-load entry points (called by the safetensors loader)        #
     # ------------------------------------------------------------------ #
 
-    def register_gate_weights(self, _model):
+    def register_gate_weights(self, model):
         """Store an fp32 NPU copy of gate.weight for each MoE layer.
 
         Called from _finalize_offload() after all MoE layers are registered.
@@ -1191,6 +2120,15 @@ class ExpertOffloadManager:
         # model-agnostic (DeepSeek and Kimi K3 use different wrapper classes)
         # and keeps missing gates represented by None rather than shifting all
         # later layer indices.
+        if self.enable_omoe:
+            # Models with an external router, including MiniMax, create the
+            # gate beside FusedMoE instead of passing it to the MoE runner.
+            for module in model.modules():
+                experts = getattr(module, "experts", None)
+                routed_experts = getattr(experts, "routed_experts", None)
+                gate = getattr(module, "gate", None)
+                if routed_experts is not None and gate is not None and getattr(routed_experts, "gate", None) is None:
+                    routed_experts.gate = gate
         self._gate_weights_npu = []
         for layer in self.moe_layers:
             gate = getattr(layer, "gate", None)
@@ -2821,12 +3759,163 @@ class ExpertOffloadManager:
         """Wait for the load stream and retire backend copy descriptors."""
         self._get_h2d_transport().synchronize(self.load_stream)
 
+    def ensure_omoe_open(self) -> None:
+        if getattr(self, "omoe_closed", False):
+            raise RuntimeError("O-MoE manager is closed")
+
+    def retain_omoe_shutdown_resources(self):
+        """Snapshot contents that retirement may remove before a later error.
+
+        Keep each explicitly owned resource root until close commits. Warmup
+        window release can fail while clearing its pages, so snapshot
+        those contents separately. Background cache/handoff internals are not
+        inspected: joining the queue and their own release fences govern them.
+        """
+        resource_refs = tuple(getattr(self, name, None) for name in (
+            "omoe_fused_cpu_weights", "omoe_projection_cpu_weights", "omoe_page_cache",
+            "omoe_compute_buffers", "omoe_device_tables",
+            "omoe_cpu_weights_phase",
+            "omoe_arena", "omoe_weights_providers", "omoe_prefetch_queue",
+            "omoe_prefetch_handoffs", "omoe_prediction_cpu_buffers", "_gate_weights_npu", "moe_layers",
+            "w13_weights_cpu", "w2_weights_cpu", "scale_cpu_buffers",
+            "offset_cpu_buffers", "scale_bias_cpu_buffers", "_scale_shard_temp",
+            "_shared_h2d_sources", "_prefetch_layer_npu_event",
+            "_prefetch_log2phy_h", "_prefetch_log2phy_np", "_prefetch_stream",
+            "load_stream", "h2d_transport",
+        ))
+        return (
+            resource_refs,
+            tuple(getattr(self, "omoe_warmup_experts", {}).values()),
+            tuple(getattr(self, "omoe_prepared_weights", {}).values()),
+            tuple(getattr(self, "omoe_pending_compute_refs", ())),
+            tuple(getattr(self, "omoe_warmup_slots", ())),
+            tuple(getattr(self, "omoe_warmup_free_slots", ())),
+            getattr(self, "omoe_pending_load_plan", None),
+        )
+
+    def clear_omoe_closed_resources(self) -> None:
+        """Drop only this manager's resource roots while the NPU runtime lives.
+
+        Call only after submissions, copy/metadata/compute fences, ownership
+        validation, borrowed-byte zeroing and transport close all succeed.
+        Other owners (for example the model runner's KV arena or layers) keep
+        their own references. Layouts and counters remain useful diagnostics.
+        """
+        global _EXPERT_OFFLOAD_MANAGER
+
+        cache = getattr(self, "omoe_page_cache", None)
+        stats = getattr(cache, "stats", None)
+        if isinstance(stats, dict):
+            self.omoe_final_cache_stats = dict(stats)
+        for name in (
+            "omoe_fused_cpu_weights", "omoe_weights_providers", "omoe_warmup_experts",
+            "omoe_prepared_weights", "scale_cpu_buffers", "offset_cpu_buffers",
+            "scale_bias_cpu_buffers", "_scale_shard_temp",
+            "_shared_h2d_sources", "_prefetch_layer_npu_event",
+        ):
+            setattr(self, name, {})
+        for name in (
+            "omoe_pending_compute_refs", "omoe_warmup_slots", "omoe_warmup_free_slots",
+            "_gate_weights_npu", "w13_weights_cpu", "w2_weights_cpu",
+            "moe_layers",
+        ):
+            setattr(self, name, [])
+        self.omoe_projection_cpu_weights = None
+        self.omoe_cpu_weights_phase = "closed"
+        self.omoe_page_cache = None
+        self.omoe_compute_buffers = ()
+        self.omoe_device_tables = None
+        self.omoe_arena = None
+        self.omoe_prefetch_queue = None
+        self.omoe_prediction_cpu_buffers = None
+        self.omoe_prefetch_handoffs = None
+        self.omoe_profile_active = False
+        self._prefetch_log2phy_h = None
+        self._prefetch_log2phy_np = None
+        self._prefetch_stream = None
+        self.load_stream = None
+        if ExpertOffloadManager._instance is self:
+            ExpertOffloadManager._instance = None
+        if _EXPERT_OFFLOAD_MANAGER is self:
+            _EXPERT_OFFLOAD_MANAGER = None
+
     def close(self) -> None:
         """Release H2D backend resources; safe to call more than once."""
         transport = getattr(self, 'h2d_transport', None)
+        if not getattr(self, "enable_omoe", False):
+            if transport is not None:
+                transport.synchronize(self.load_stream)
+                transport.close()
+            return
+        if getattr(self, "omoe_closed", False):
+            if self.omoe_close_error is not None:
+                raise self.omoe_close_error
+            return
+        resource_guard = self.retain_omoe_shutdown_resources()
+        self.omoe_prefetch_paused = True
+        self.omoe_pending_load_plan = None
+        first_error = None
+
+        def cleanup(action):
+            nonlocal first_error
+            try:
+                action()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+
+        handoffs = getattr(self, "omoe_prefetch_handoffs", None)
+        if handoffs is not None:
+            cleanup(handoffs.cancel_all)
+        queue = getattr(self, "omoe_prefetch_queue", None)
+        if queue is not None:
+            # close joins every host job before rethrowing a sticky job error.
+            cleanup(queue.close)
+        prefetch_stream = getattr(self, "_prefetch_stream", None)
+        if prefetch_stream is not None:
+            cleanup(prefetch_stream.synchronize)
+        load_stream = getattr(self, "load_stream", None)
+        if load_stream is not None:
+            if transport is not None:
+                cleanup(lambda: transport.synchronize(load_stream))
+            else:
+                cleanup(load_stream.synchronize)
+        # Empty expert invocations still own device descriptor/tiling metadata.
+        # Neither an empty cache nor completed weight copies prove these safe.
+        compute_refs = tuple(getattr(self, "omoe_pending_compute_refs", ()))
+        prepared_refs = tuple(getattr(self, "omoe_prepared_weights", {}).values())
+        for event, _ in compute_refs:
+            cleanup(lambda event=event: event.synchronize())
+        for prepared in (*prepared_refs, *(prepared for _, prepared in compute_refs)):
+            cleanup(lambda prepared=prepared: prepared.ready_event.synchronize())
+        cache = getattr(self, "omoe_page_cache", None)
+        if cache is not None:
+            def release_owned_pages():
+                # Submission flags remain set if recording an event failed;
+                # snapshot/release must keep those slot references alive.
+                teardown = {"teardown": True} if any(getattr(cache, "resident_floor", {}).values()) else {}
+                snapshot = cache.snapshot(self.omoe_cache_delta_id, **teardown)
+                cache.release([slot["slot_id"] for slot in snapshot["slots"]],
+                              self.omoe_cache_delta_id, **teardown)
+
+            cleanup(release_owned_pages)
+            cleanup(cache.close_compute_buffers)
+        elif (
+            getattr(self, "omoe_warmup_slots", ())
+            or getattr(self, "omoe_warmup_experts", {})
+            or getattr(self, "omoe_granted_expert_spans", ())
+        ):
+            # Warmup uses the same slot submission flags and completion events.
+            cleanup(lambda: self.release_omoe_window(self.omoe_cache_delta_id))
         if transport is not None:
-            transport.synchronize(self.load_stream)
-            transport.close()
+            cleanup(transport.close)
+        if first_error is None:
+            cleanup(self.clear_omoe_closed_resources)
+        self.omoe_close_error = first_error
+        self.omoe_closed = True
+        if first_error is not None:
+            self.omoe_shutdown_resource_refs = resource_guard
+            raise first_error
 
     def _build_expert_h2d_tasks(self, layer, layer_idx, eid,
                                 slot) -> list[H2DCopyTask]:
@@ -3211,10 +4300,6 @@ class ExpertOffloadManager:
                                 flag,layer_idx, len(need_to_load), len(reusable_slots),
                                 sorted(need_to_load)[:20])
 
-            # (merge): rank all resident candidates once with
-            # choose_victims(count=len(need_to_load)) instead of calling
-            # choose_victim() per miss.
-            n_copies = 0
             planned_loads = []
             victims = None
             if self.cache_policy is not None:
@@ -3243,8 +4328,8 @@ class ExpertOffloadManager:
                         logger.info(
                             "[UPDATE-W] l=%d NO SLOTS: %d experts could not be loaded, "
                             "missed=%s",
-                            layer_idx, len(need_to_load) - n_copies,
-                            sorted(list(need_to_load))[n_copies:][:20])
+                            layer_idx, len(need_to_load) - len(planned_loads),
+                            sorted(list(need_to_load))[len(planned_loads):][:20])
                     break  # no free slots — should not happen in normal usage
 
                 # (merge): defer the copy. The H2D is submitted as one
@@ -3260,7 +4345,6 @@ class ExpertOffloadManager:
                 on_device.add(eid)
                 if slot in reusable_slots:
                     reusable_slots.remove(slot)
-                n_copies += 1
 
             # (merge): submit the batch first so the CPU-only stats
             # bookkeeping below overlaps the transfer, then synchronize
@@ -3319,7 +4403,7 @@ class ExpertOffloadManager:
                         psize=psize,
                         hit_post=stat_hit_post,
                         hit_pre=stat_hit_pre,
-                        loads=float(n_copies),
+                        loads=float(len(planned_loads)),
                         pf_loads=pf_loads,
                         pf_hit=pf_hit,
                         pf_waste=pf_waste,
@@ -3434,27 +4518,29 @@ class ExpertOffloadManager:
         self,
         layer_idx: int,
         hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Predict which experts layer layer_idx+1 will need, on NPU.
 
+        Callers select token rows or request samples before invoking this method.
         Runs entirely on the NPU so it can be captured in a CUDA/NPU graph.
         The returned tensors live on NPU.
 
         Two paths:
         - Hash-routed layers (first num_hash_layers): experts come from the
           tid2eid table indexed by token id (deterministic, 100% accurate).
-        - Learned layers (the rest): softmax + topk on the gate logits of the
-          first `expert_prefetch_tokens` token rows.
+        - Learned layers: gate scores + topk for each supplied token; O-MoE
+          sigmoid routing includes the layer's selection bias.
 
         Args:
             layer_idx: Current layer index.
-            hidden_states: [num_tokens, hidden_dim] NPU tensor.
+            hidden_states: [num_samples, hidden_dim] NPU tensor.
+            input_ids: Matching sampled token IDs for hash routing. If omitted,
+                use the first num_samples IDs from the caller's forward context.
 
         Returns:
-            (topk_weights, topk_ids), both [n_tok, topk] NPU tensors where
-            n_tok = min(expert_prefetch_tokens, forward rows), or None if
-            prediction is not possible. CHANGE: was "[1, topk], first token
-            only" — that stopped being true when expert_prefetch_tokens landed.
+            (topk_weights, topk_ids), both [num_samples, topk] NPU tensors,
+            or None if prediction is not possible.
         """
         next_idx = layer_idx + 1
         if next_idx >= len(self.moe_layers):
@@ -3475,53 +4561,39 @@ class ExpertOffloadManager:
         next_layer = self.moe_layers[next_idx]
         tid2eid = getattr(getattr(next_layer, "gate", None), "tid2eid", None)
         if tid2eid is not None:
-            input_ids = get_forward_context().input_ids
             if input_ids is None:
+                input_ids = get_forward_context().input_ids
+                if input_ids is None:
+                    return None
+            num_samples = min(hidden_states.shape[0], input_ids.shape[0])
+            if num_samples == 0:
                 return None
-            # n rows, was input_ids[:1]. min() against both the hidden
-            # rows and the context's id count: they agree on the decode path
-            n_tok = min(self.prefetch_tokens, hidden_states.shape[0],
-                        input_ids.shape[0])
-            if n_tok < 1:
-                return None
-            # [n_tok] on the tid2eid device -> index_select -> [n_tok, topk] int32.
-            tok_ids = input_ids[:n_tok].to(tid2eid.device).long()
-            topk_ids = tid2eid.index_select(0, tok_ids)
+            topk_ids = tid2eid.index_select(0, input_ids[:num_samples].to(tid2eid.device).long())
             # Selection does not depend on affinity for hash layers, so the
             # router weight is meaningless; uniform placeholders keep the
-            # [n_tok, topk] shape the caller expects. NOTE this leaves every hash
-            # candidate score-tied, so the single-card ranking in _update_weights
-            # falls back to insertion order for these layers — harmless, since
-            # tid2eid prediction is exact and any miss is equally worth fetching.
+            # [num_samples, topk] shape (cache_router_weight is optional).
             topk_weights = torch.full(
-                (n_tok, self.topk), 1.0 / self.topk,
+                topk_ids.shape, 1.0 / self.topk,
                 dtype=torch.float32, device=topk_ids.device,
             )
             return topk_weights, topk_ids
 
-        # Previous behavior: Predict from the first token only — one representative token's
-        # experts is enough for prefetch; others are handled reactively by
-        # update_weights(). prefetch_topk (= min(topk, expert_prefetch_num))
-        # caps how many experts are prefetched per layer — single-card uses 1
-        # (cheap, conservative); raise expert_prefetch_num for more coverage.
-        # New behavior TO BE CHECKED: first token may not be enough for MTP
-        # Changed to n rows, was hidden_states[:1]. The [:1] was an identity slice
-        # when written — without speculative decoding and at MAX_NUM_SEQS=1 the
-        # decode path carries exactly one token — and only became a one-in-N
-        # sample when MTP raised the forward to 1 + num_speculative_tokens rows.
-        # Rows always fit the pinned staging buffers, which are
-        # [offload_threshold, topk], because a prefetch is only triggered when
-        # num_tokens <= offload_threshold.
-        # Shape is fixed per captured graph, so this stays capture-safe.
-        # On-device prediction: [n_tok, hidden_dim] x [n_experts, hidden_dim]
-        n_tok = min(self.prefetch_tokens, hidden_states.shape[0])
-        router_logits = F.linear(hidden_states[:n_tok].float(), gate_w)
+        # Keep each sample's full top-k list. O-MoE merges the samples and
+        # skips resident experts before prefetching into the compute buffer.
+        router_logits = F.linear(hidden_states.float(), gate_w)
+        if self.enable_omoe and next_layer.scoring_func == "sigmoid":
+            probs = router_logits.sigmoid()
+            bias = next_layer.e_score_correction_bias
+            # Routing bias changes expert selection, not the returned scores.
+            scores = probs if bias is None else probs + bias
+            topk_ids = scores.topk(self.topk, dim=-1).indices
+            return probs.gather(-1, topk_ids), topk_ids
         probs = router_logits.softmax(dim=-1)
         topk_weights, topk_ids = probs.topk(self.topk, dim=-1)
         return topk_weights, topk_ids
 
     def trigger_next_layer_prefetch(self, layer,
-                        hidden_states: torch.Tensor | None = None) -> None:
+                        hidden_states: torch.Tensor | None = None) -> "ExpertPrefetchTicket | None":
         """Trigger next-layer expert prefetch after the GMM kernel submits.
 
         Graph-compatible (mirrors the reactive update_weights path — NO stream
@@ -3538,6 +4610,8 @@ class ExpertOffloadManager:
         of the tuple _stage_predicted_topk returns, and they are unpacked
         inside _dispatch_prefetch.
         """
+        if getattr(self, "enable_omoe", False):
+            return self.start_omoe_prefetch_prediction(layer, hidden_states)
         if not self.offload_config.expert_prefetch_enabled:
             return
         if self._skip_prefill:
@@ -3627,11 +4701,12 @@ class ExpertOffloadManager:
         log2phy_np, next_layer, next_idx), or None if prefetch isn't possible
         (last layer / missing gate weights / prediction failed)."""
         next_idx = layer_idx + 1
-        # TO BE CHECKED: was `>= len(self.moe_layers) - 1`, which excluded the LAST MoE
-        # layer from being prefetched for.
-        if next_idx >= len(self.moe_layers):
+        if hidden_states is None or not hidden_states.shape[0] or next_idx >= len(self.moe_layers):
             return None
-        predicted = self.predict_next_layer_experts_npu(layer_idx, hidden_states)
+        # Ordinary offload samples token rows; O-MoE samples request starts
+        # in start_omoe_prefetch_prediction. The shared predictor does not resample.
+        prediction_input = hidden_states[:self.prefetch_tokens]
+        predicted = self.predict_next_layer_experts_npu(layer_idx, prediction_input)
         if predicted is None:
             return None
         topk_weights, topk_ids = predicted

@@ -124,6 +124,7 @@ def set_ascend_forward_context(
     eplb_heat_collection_status: bool = False,
     dflash_verify_rows=(),
     dflash_topm_state=None,
+    query_start_loc: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -148,6 +149,7 @@ def set_ascend_forward_context(
         forward_context.dflash_topm_state = dflash_topm_state
         if dflash_topm_state is not None:
             dflash_topm_state.begin(forward_context)
+        forward_context.query_start_loc = query_start_loc
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 

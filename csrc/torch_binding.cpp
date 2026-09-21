@@ -641,6 +641,12 @@ at::Tensor npu_causal_conv1d_custom(
     int64_t  pad_slot_id,
     int64_t  run_mode)
 {
+    TORCH_CHECK(conv_state.dim() == 3 && conv_state.stride(0) > 0 &&
+                conv_state.stride(1) == conv_state.size(2) && conv_state.stride(2) == 1,
+                "Conv state requires contiguous rows and a positive leading stride");
+    // Torch strides are in elements. Preserve this address stride while
+    // each selected Conv state keeps its contiguous [state_len, dim] rows.
+    int64_t state_stride = conv_state.stride(0);
     EXEC_NPU_CMD(aclnnCausalConv1d,
                     x,
                     weight,
@@ -653,6 +659,7 @@ at::Tensor npu_causal_conv1d_custom(
                     activation_mode,
                     pad_slot_id,
                     run_mode,
+                    state_stride,
                     output
                 );
 

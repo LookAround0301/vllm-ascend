@@ -65,6 +65,7 @@ from vllm_ascend.ops.activation import SituActivationConfig
 from vllm_ascend.ops.fused_moe.moe_stage_contracts import (
     MoEAllGatherCombineMetadata,
     MoEAllToAllCombineMetadata,
+    MoEExpertProvider,
     MoEFusedExpertsInput,
     MoEMC2CombineMetadata,
     MoEMlpComputeInput,
@@ -152,6 +153,7 @@ def build_fused_experts_input(
     swiglu_beta: float | None = 0.0,
     num_local_experts: int | None = None,
     lora_context=None,
+    expert_provider: MoEExpertProvider | None = None,
 ) -> MoEFusedExpertsInput:
     if swiglu_limit is None:
         swiglu_limit = 0.0
@@ -162,14 +164,21 @@ def build_fused_experts_input(
     assert swiglu_limit is not None
     assert swiglu_alpha is not None
     assert swiglu_beta is not None
-    # Per-layer device-resident expert count. Auto-derived from w1 so callers
-    # don't need to pass it: w1's dim 0 (single tensor) or length (per-expert
-    # list) IS the number of experts the group_list must cover. Required for the
-    # AllGather decode path when num_device_experts varies per MoE layer — the
-    # shared moe_comm_method dispatcher can't track a per-layer count.
+    if expert_provider is not None:
+        if quant_type != QuantType.W8A8:
+            raise ValueError("Expert provider compute requires W8A8")
+        if log2phy is not None:
+            raise ValueError("Expert provider dispatch uses standard EP ownership, not resident-slot log2phy")
+    # Infer per-layer resident capacity only when the caller did not supply it.
+    # GMM accepts both [Tensor(E, K, N)] and E separate Tensor(K, N) entries;
+    # the former's list length is NOT its expert count. AllGather must route
+    # across E experts even when the shared dispatcher cached another layer's
+    # capacity. Explicit counts (including the provider's logical count) win.
     if num_local_experts is None:
-        num_local_experts = (len(w1) if isinstance(w1, (list, tuple))
-                             else w1.shape[0])
+        if isinstance(w1, (list, tuple)):
+            num_local_experts = w1[0].shape[0] if len(w1) == 1 and w1[0].ndim == 3 else len(w1)
+        else:
+            num_local_experts = w1.shape[0]
     return MoEFusedExpertsInput(
         hidden_states=hidden_states,
         topk_weights=topk_weights,
@@ -195,6 +204,7 @@ def build_fused_experts_input(
             pertoken_scale=pertoken_scale,
             num_local_experts=num_local_experts,
         ),
+        expert_provider=expert_provider,
         activation=activation,
         need_trans=need_trans,
         dynamic_eplb=dynamic_eplb,
@@ -277,6 +287,7 @@ __all__ = [
     "MoEAllGatherCombineMetadata",
     "MoEAllToAllCombineMetadata",
     "MoEFusedExpertsInput",
+    "MoEExpertProvider",
     "MoEMC2CombineMetadata",
     "MoEMlpComputeInput",
     "MoEPrepareOutput",
