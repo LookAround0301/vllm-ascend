@@ -295,6 +295,64 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         topk_weights = topk_weights.to(self.in_dtype)
 
         act_name = getattr(activation, "value", activation)
+        if getattr(layer, "enable_omoe", False):
+            if self.dynamic_eplb:
+                raise NotImplementedError("O-MoE uses standard EP ownership; dynamic EPLB is unsupported")
+            if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
+                raise NotImplementedError("O-MoE requires separated dispatch/MLP/combine, not FusedMC2/MegaMoE")
+            from vllm_ascend.expert_offload import ExpertOffloadManager
+
+            mgr = ExpertOffloadManager.get_instance()
+            if (
+                getattr(mgr, "omoe_arena_layout", None) is not None
+                and _EXTRA_CTX.moe_comm_type != MoECommType.ALLGATHER
+            ):
+                raise NotImplementedError("O-MoE online routing statistics require standard EP AllGather dispatch")
+            moe_comm_method = _EXTRA_CTX.moe_comm_method
+            assert moe_comm_method is not None, "Missing communication context"
+            ticket = None
+            try:
+                # Prediction can run before dispatch. Its H2D admission is
+                # bound to this invocation's provider, not a latest-layer ID.
+                # OFF retains the original post-GMM trigger below.
+                # Growth loads use this path even when prediction is disabled.
+                ticket = mgr.trigger_next_layer_prefetch(layer, x)
+                provider = (
+                    mgr.get_omoe_provider(layer, prefetch_ticket=ticket)
+                    if ticket is not None else mgr.get_omoe_provider(layer)
+                )
+                result = moe_comm_method.fused_experts(
+                    fused_experts_input=build_fused_experts_input(
+                        hidden_states=x,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        # No checkpoint tensors or old HBM buffers enter
+                        # compute. The provider supplies Prepared after dispatch.
+                        w1=[],
+                        w2=[],
+                        quant_type=self.quant_type,
+                        dynamic_eplb=False,
+                        expert_map=expert_map,
+                        global_redundant_expert_num=global_redundant_expert_num,
+                        mc2_mask=mc2_mask,
+                        apply_router_weight_on_input=apply_router_weight_on_input,
+                        log2phy=None,
+                        pertoken_scale=pertoken_scale,
+                        num_local_experts=layer.moe_config.num_local_experts,
+                        activation=activation,
+                        swiglu_limit=layer.swiglu_limit,
+                        swiglu_alpha=getattr(layer, "swiglu_alpha", 1.0),
+                        swiglu_beta=getattr(layer, "swiglu_beta", 0.0),
+                        expert_provider=provider,
+                    )
+                )
+                if zero_expert_num > 0 and zero_expert_type is not None:
+                    result.routed_out = result.routed_out + zero_expert_result
+                return result
+            except BaseException:
+                if ticket is not None:
+                    mgr.cancel_omoe_prefetch(ticket)
+                raise
         # Expert offload: incrementally page in needed experts, update log2phy
         use_prefill_pool = False
         prefill_slot = -1

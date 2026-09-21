@@ -92,6 +92,9 @@ else()
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_host/tiling/tiling_data.cpp)
 endif()
 
+list(REMOVE_ITEM VLLM_ASCEND_SRC
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/torch_binding_discrete.cpp)
+
 include_directories(
   ${pybind11_INCLUDE_DIRS}
   ${PYTHON_INCLUDE_PATH}
@@ -179,6 +182,30 @@ set(VLLM_ASCEND_C_COMMON_LIBS
   dl
   opapi
 )
+
+# Keep descriptor-addressed W8A8 separate from the existing custom-op binary.
+# This target can be built and loaded independently for NPU verification, and
+# normal plugin builds install it without duplicate Torch registrations.
+if(NOT SOC_VERSION MATCHES "^ascend910b")
+  message(WARNING "Discrete W8A8/O-MoE operators have only been validated on Ascend 910B; attempting to build for ${SOC_VERSION}.")
+endif()
+
+file(GLOB DISCRETE_MOE_KERNEL_FILES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gmm/discrete_moe_w8a8/op_kernel/*.cpp)
+ascendc_library(vllm_ascend_discrete_moe_kernels SHARED
+  ${DISCRETE_MOE_KERNEL_FILES})
+add_library(vllm_ascend_discrete_moe_C SHARED
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/torch_binding_discrete.cpp)
+# Use the installed CANN runtime declarations, including host registration.
+target_include_directories(vllm_ascend_discrete_moe_C BEFORE PRIVATE ${ASCEND_HOME_PATH}/include)
+target_link_directories(vllm_ascend_discrete_moe_C PRIVATE
+  ${TORCH_LIBRARY_DIRS} ${TORCH_NPU_PATH}/lib ${ASCEND_HOME_PATH}/lib64)
+target_link_libraries(vllm_ascend_discrete_moe_C PRIVATE
+  vllm_ascend_discrete_moe_kernels ${VLLM_ASCEND_C_COMMON_LIBS})
+target_link_options(vllm_ascend_discrete_moe_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib")
+add_dependencies(vllm_ascend_C vllm_ascend_discrete_moe_C)
+install(TARGETS vllm_ascend_discrete_moe_C vllm_ascend_discrete_moe_kernels
+  DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
   target_link_libraries(

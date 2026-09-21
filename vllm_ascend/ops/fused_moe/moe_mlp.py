@@ -32,6 +32,11 @@ from vllm_ascend.ops.activation import (
     AscendSwigluStepAndMul,
     SituActivationConfig,
 )
+from vllm_ascend.ops.fused_moe.discrete_moe_mlp import (
+    DiscreteMoEWeights,
+    PreparedDiscreteMoEWeights,
+    apply_discrete_moe_mlp,
+)
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
@@ -761,11 +766,43 @@ def unquant_apply_mlp(
     return hidden_states, None
 
 
+def _apply_prepared_discrete_mlp(mlp_compute_input: MoEMlpComputeInput) -> tuple[torch.Tensor, None]:
+    """An explicit standalone compute variant, not an offload-mode switch."""
+    if mlp_compute_input.quant.quant_type != QuantType.W8A8:
+        raise NotImplementedError("Discrete expert compute only supports W8A8")
+    activation = getattr(mlp_compute_input.activation, "value", mlp_compute_input.activation)
+    if activation not in ("silu", "swiglu"):
+        raise NotImplementedError("Discrete W8A8 requires the SiLU/SwiGLU activation")
+    if mlp_compute_input.swiglu_alpha != 1.0 or mlp_compute_input.swiglu_beta != 0.0:
+        raise NotImplementedError("Discrete W8A8 does not support modified SwiGLU alpha/beta")
+    if mlp_compute_input.need_trans or mlp_compute_input.dynamic_eplb:
+        raise NotImplementedError("Prepare discrete weight layout explicitly; do not enable transpose or dynamic EPLB")
+    if mlp_compute_input.lora_context is not None:
+        raise NotImplementedError("Discrete W8A8 does not support expert LoRA")
+    if mlp_compute_input.topk_scales is not None:
+        raise NotImplementedError("Discrete W8A8 expects routing scales to be handled outside the MLP")
+    output = apply_discrete_moe_mlp(
+        mlp_compute_input.weights,
+        mlp_compute_input.hidden_states,
+        mlp_compute_input.group_list,
+        group_list_type=mlp_compute_input.group_list_type,
+        dynamic_scale=mlp_compute_input.dynamic_scale,
+        swiglu_limit=mlp_compute_input.swiglu_limit,
+    )
+    return output, None
+
+
 def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     """
     Unified MoE MLP entry.
     Quant path is dispatched by DeviceOperator with explicit typed kernel flags.
+    Returns the existing (output, before_gmm2_event) pair in every branch;
+    standalone discrete compute does not expose an intermediate event.
     """
+    if isinstance(mlp_compute_input.weights, DiscreteMoEWeights):
+        raise ValueError("Call prepare_discrete_moe_weights before invoking the discrete MLP")
+    if isinstance(mlp_compute_input.weights, PreparedDiscreteMoEWeights):
+        return _apply_prepared_discrete_mlp(mlp_compute_input)
     hidden_states = mlp_compute_input.hidden_states
     group_list = mlp_compute_input.group_list
     group_list_type = mlp_compute_input.group_list_type

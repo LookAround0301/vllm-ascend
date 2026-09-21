@@ -78,6 +78,21 @@ class VllmEplbAdaptor:
         """
         VllmEplbAdaptor._registered_moe_layers.append(layer)
 
+    @staticmethod
+    def unregister_routed_layers(routed_layer_ids: set[int]) -> None:
+        """Retire only registrations owned by a successfully closed runner.
+
+        Registration also occurs with EPLB disabled. Holding these wrappers
+        after shutdown otherwise keeps their routed expert parameters alive.
+        The caller must first drain all model users; integer identities avoid
+        keeping another weight reference during subsequent allocator cleanup.
+        Preserve the list object used by existing adaptors and unrelated rows.
+        """
+        registry = VllmEplbAdaptor._registered_moe_layers
+        registry[:] = [
+            layer for layer in registry if id(getattr(layer, "routed_experts", None)) not in routed_layer_ids
+        ]
+
     def __init__(self, model, **args):
         super().__init__(**args)
         if hasattr(model, "language_model"):

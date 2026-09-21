@@ -36,11 +36,12 @@ public:
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
+        // Materializing this address view would detach writes from the shared arena.
         this->Input("convStates")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .FormatList({ge::FORMAT_ND})
-            .AutoContiguous();
+            .IgnoreContiguous();
         this->Input("queryStartLoc")
             .ParamType(OPTIONAL)
             .DataTypeList({ge::DT_INT32, ge::DT_INT64})
@@ -71,6 +72,7 @@ public:
         this->Attr("activationMode").AttrType(OPTIONAL).Int(0);
         this->Attr("padSlotId").AttrType(OPTIONAL).Int(-1);
         this->Attr("runMode").AttrType(OPTIONAL).Int(0);
+        this->Attr("stateStride").AttrType(OPTIONAL).Int(0);
 
         OpAICoreConfig aicoreConfig;
         aicoreConfig.DynamicCompileStaticFlag(true)

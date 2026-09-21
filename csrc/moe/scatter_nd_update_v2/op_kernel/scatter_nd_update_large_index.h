@@ -49,7 +49,6 @@ public:
         blockRemainLength_ = tiling.linearIndexTiling.blockRemainLength;
 
         scatterLength_ = tiling.scatterTiling.scatterLength;
-        ubLengthForUpdates_ = tiling.scatterTiling.ubLengthForUpdates;
         scatterTileNum_ = tiling.scatterTiling.scatterTileNum;
         scatterTileLength_ = tiling.scatterTiling.scatterTileLength;
         scatterTileTail_ = tiling.scatterTiling.scatterTileTail;
@@ -62,7 +61,9 @@ public:
     __aicore__ inline void InitBuffers(TPipe& pipe)
     {
         uint64_t indicesInt64Size = ((blockLength_ * indexDim_ * 2) + ALIGN_NUM - 1) & ~(ALIGN_NUM - 1);
-        uint64_t updateBufBytes = (ubLengthForUpdates_ * sizeof(T) + 31) & ~31ULL;
+        // Tiling reserves the INT64 coordinate buffer before sizing a tile;
+        // only the current update tile needs to coexist with those indices.
+        uint64_t updateBufBytes = (scatterTileLength_ * sizeof(T) + 31) & ~31ULL;
 
         pipe.InitBuffer(indicesBuf, indicesInt64Size * sizeof(int));
         pipe.InitBuffer(updateBuf, updateBufBytes);
@@ -97,7 +98,9 @@ public:
         for (uint64_t i = 0; i < copyRow; ++i) {
             int64_t linearIndex = ComputeLinearIndex(i);
             if (linearIndex >= startInt64_ && linearIndex < endInt64_) {
-                ScatterUpdate(i, linearIndex);
+                // Coordinates are local to this copied block, but updates
+                // retain their global row order across full and tail blocks.
+                ScatterUpdate(blockIdx * blockLength_ + i, linearIndex);
             }
         }
     }
@@ -166,7 +169,6 @@ private:
     uint64_t indicesMask_[8];
 
     uint64_t scatterLength_;
-    uint64_t ubLengthForUpdates_;
     uint64_t scatterTileNum_;
     uint64_t scatterTileLength_;
     uint64_t scatterTileTail_;

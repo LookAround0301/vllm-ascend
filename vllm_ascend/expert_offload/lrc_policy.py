@@ -1,10 +1,38 @@
 """Local-routing-consistency policy for expert offload decode paging."""
 
 from collections import deque
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Iterable
+from math import isfinite
+from operator import lt
+from typing import NamedTuple, TypeAlias, TypedDict
 
 import numpy as np
+
+ExpertKey: TypeAlias = tuple[int, int]  # (MoE layer index, expert ID)
+
+
+class RoutingObservation(TypedDict):
+    """One layer's cumulative route counts; count indices are local expert IDs."""
+
+    layer_idx: int
+    revision: int
+    counts: list[int]
+
+
+class ExpertPolicy(TypedDict):
+    """One shared-cache load plan executed by every TP worker."""
+
+    # Scores stay in the scheduler; workers only need explicit load targets.
+    load_plan: list[ExpertKey]
+    prediction_weight: float
+
+
+class RoutingObservationState(NamedTuple):
+    """Validated cumulative counts for one worker and one MoE layer."""
+
+    revision: int
+    counts: tuple[int, ...]
 
 
 @dataclass
@@ -187,7 +215,7 @@ class LRCExpertCachePolicy:
         state.ema += counts.astype(np.float32) * self._one_minus_beta
 
         active = np.flatnonzero(counts)
-        snapshot = tuple((int(eid), int(counts[eid])) for eid in active)
+        snapshot = tuple(zip(active.tolist(), counts[active].tolist()))
         state.recent_queue.append(snapshot)
         for eid, count in snapshot:
             state.freq[eid] += count
@@ -302,3 +330,115 @@ class LRCExpertCachePolicy:
     def _victim_key(self, layer_idx: int, expert_id: int) -> tuple[float, int, int]:
         state = self.layer_states[layer_idx]
         return (self.hotness(layer_idx, expert_id), state.last_used[expert_id], expert_id)
+
+
+class CoordinatedLRCPolicy:
+    """Online cross-layer residency for TP slices or disjoint EP experts.
+
+    This is not the offline O-MoE hotset prefix algorithm. It reuses the old
+    LRC's exact *within-layer* scoring and uses a positive layer-wide scale
+    for cross-layer comparisons. Router input is absent and its LRC term is
+    explicitly zero; next-layer predictions remain a separate fresh hint.
+
+    Workers report cumulative CPU dispatch counts and per-layer invocation
+    revisions. A freeze consumes only new counts, without another D2H or a
+    per-layer collective. If multiple invocations occur between freezes they
+    form one observation: recent_window/EMA/age count coordinated observations,
+    not individual tokens or hidden invocation order. An unchanged snapshot
+    never advances EMA, age, or the observation window.
+    """
+
+    def __init__(
+        self, *, layer_count: int, local_experts: int, worker_count: int,
+        topk: int, recent_window: int = 32, ema_beta: float = 0.9, recent_weight: float = 1.0,
+        ema_weight: float = 0.5, age_weight: float = 0.01,
+    ) -> None:
+        self.layer_count = layer_count
+        self.local_experts = local_experts
+        self.worker_count = worker_count
+        self.lrc = LRCExpertCachePolicy(
+            num_layers=layer_count, num_experts=local_experts,
+            cache_size=local_experts, topk=topk, recent_window=recent_window,
+            ema_beta=ema_beta, recent_weight=recent_weight,
+            ema_weight=ema_weight, router_weight=0.0,
+            age_weight=age_weight,
+        )
+        self._observations = tuple(
+            tuple(RoutingObservationState(0, (0,) * local_experts) for _ in range(layer_count))
+            for _ in range(worker_count)
+        )
+        self.priorities: dict[ExpertKey, float] = {
+            (layer, expert): 0.0 for layer in range(layer_count) for expert in range(local_experts)
+        }
+
+    def observe_snapshots(
+        self, observations_by_rank: Sequence[Sequence[RoutingObservation]],
+    ) -> dict[ExpertKey, float]:
+        """Check snapshot completeness and monotonicity before consuming deltas."""
+        if len(observations_by_rank) != self.worker_count:
+            raise ValueError("Online routing observations must cover every rank")
+        # Each rank stores (revision, cumulative expert counts) in layer order.
+        validated_observations: list[tuple[RoutingObservationState, ...]] = []
+        for rank, rank_observations in enumerate(observations_by_rank):
+            if len(rank_observations) != self.layer_count:
+                raise ValueError("Online routing observations must cover every layer")
+            observations_by_layer: dict[int, RoutingObservationState] = {}
+            for observation in rank_observations:
+                layer_idx = observation["layer_idx"]
+                if layer_idx >= self.layer_count or layer_idx in observations_by_layer:
+                    raise ValueError("Online routing observations have an unknown or duplicate layer")
+                revision = observation["revision"]
+                # Counts come from the worker's INT64 device table. Keep the
+                # completeness and regression checks before updating LRC state.
+                expert_counts = observation["counts"]
+                if len(expert_counts) != self.local_experts:
+                    raise ValueError("Online routing counts must cover every local expert")
+                previous_revision, previous_counts = self._observations[rank][layer_idx]
+                if (revision < previous_revision or any(map(lt, expert_counts, previous_counts))
+                        or (revision == previous_revision and tuple(expert_counts) != previous_counts)):
+                    raise ValueError("Online routing observations regressed or changed without an invocation")
+                observations_by_layer[layer_idx] = RoutingObservationState(revision, tuple(expert_counts))
+            validated_observations.append(
+                tuple(observations_by_layer[layer_idx] for layer_idx in range(self.layer_count)))
+        for layer_idx in range(self.layer_count):
+            if len({rank_observations[layer_idx].revision for rank_observations in validated_observations}) != 1:
+                raise ValueError("Online routing invocation revisions differ between workers")
+        # All shape, monotonicity and invocation checks precede any LRC update.
+        for layer_idx in range(self.layer_count):
+            if validated_observations[0][layer_idx].revision != self._observations[0][layer_idx].revision:
+                # TP workers report the same routes; count them once.
+                count_deltas = [
+                    new - old for new, old in zip(
+                        validated_observations[0][layer_idx].counts, self._observations[0][layer_idx].counts)
+                ]
+                self.lrc.observe_global_counts(layer_idx, count_deltas)
+        self._observations = tuple(validated_observations)
+        self._update_priorities()
+        return self.priorities
+
+    def _update_priorities(self) -> None:
+        for layer, state in enumerate(self.lrc.layer_states):
+            raw = self.lrc.hotness_array(layer).astype(np.float64)
+            heat = (self.lrc.recent_weight * sum(state.freq)
+                    + self.lrc.ema_weight * float(np.sum(state.ema, dtype=np.float64)))
+            age = max((state.step - last for last in state.last_used if last >= 0), default=0)
+            # Positive, shared scale preserves every within-layer comparison.
+            # max(abs(raw)) only guards float32 rounding in the original LRC.
+            scale = max(1.0, heat + self.lrc.age_weight * age, float(np.max(np.abs(raw))))
+            if not isfinite(scale) or not np.all(np.isfinite(raw)):
+                raise ValueError("Online LRC hotness overflowed its finite normalization scale")
+            for expert, priority in enumerate((raw / scale).tolist()):
+                self.priorities[layer, expert] = priority
+
+    def build_payload(
+        self, *, resident_keys: set[ExpertKey], load_limit: int, prediction_weight: float,
+    ) -> ExpertPolicy:
+        """Fill granted shared space by online score, identically on every TP worker."""
+        candidates = []
+        if load_limit:
+            candidates = [key for key in self.priorities if key not in resident_keys]
+            candidates.sort(key=lambda key: (-self.priorities[key], *key))
+        return {
+            "load_plan": candidates[:load_limit],
+            "prediction_weight": float(prediction_weight),
+        }

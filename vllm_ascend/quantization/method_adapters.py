@@ -17,6 +17,7 @@
 #
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 from vllm.distributed import get_tensor_model_parallel_rank
@@ -28,9 +29,64 @@ from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_ascend.distributed.parallel_state import get_mlp_tp_group, get_otp_group
+from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import mlp_tp_enable, oproj_tp_enable
 
 from .methods import AscendAttentionScheme, AscendLinearScheme, AscendMoEScheme, is_mx_quant_type
+
+
+@dataclass(frozen=True)
+class OMoECPUWeightSchema:
+    """Normal checkpoint shapes; no device expert allocation or slot capacity."""
+
+    local_experts: int
+    hidden_size: int
+    intermediate_size: int
+    checkpoint_dtype: torch.dtype
+
+
+def validate_omoe_cpu_weights(layer: torch.nn.Module) -> OMoECPUWeightSchema:
+    """Validate checkpoint or post-transpose CPU sources before any device move."""
+    schema = getattr(layer, "_omoe_cpu_weight_schema", None)
+    if not isinstance(schema, OMoECPUWeightSchema):
+        raise RuntimeError("O-MoE expert parameters require a CPU checkpoint schema")
+    e, h, i = schema.local_experts, schema.hidden_size, schema.intermediate_size
+    ready = getattr(layer, "_omoe_cpu_weights_ready", False)
+    shapes = {
+        "w13_weight": (e, h, 2 * i) if ready else (e, 2 * i, h),
+        "w2_weight": (e, i, h) if ready else (e, h, i),
+        "w13_weight_scale": (e, 2 * i) if ready else (e, 2 * i, 1),
+        "w13_weight_offset": (e, 2 * i) if ready else (e, 2 * i, 1),
+        "w2_weight_scale": (e, h) if ready else (e, h, 1),
+        "w2_weight_offset": (e, h) if ready else (e, h, 1),
+    }
+    for name, shape in shapes.items():
+        value = getattr(layer, name, None)
+        dtype = torch.int8 if name in ("w13_weight", "w2_weight") else schema.checkpoint_dtype
+        if ready and name.endswith("_scale"):
+            dtype = torch.float32
+        if not isinstance(value, torch.nn.Parameter):
+            raise RuntimeError(f"O-MoE requires checkpoint parameter {name}")
+        if value.device.type != "cpu" or value.dtype != dtype or tuple(value.shape) != shape:
+            raise RuntimeError(f"O-MoE {name} must remain CPU {dtype} with shape {shape}")
+        if not value.is_contiguous():
+            raise RuntimeError(f"O-MoE {name} must be contiguous")
+    return schema
+
+
+def _omoe_cpu_expert_config(layer: torch.nn.Module):
+    # Resolved per-engine configuration is available before RoutedExperts first
+    # creates weights. Runner flags are set too late to prevent that allocation.
+    from vllm_ascend.ascend_config import get_ascend_config
+
+    config = get_ascend_config()
+    if getattr(getattr(config, "omoe_config", None), "enabled", False) is not True:
+        return None
+    if "mtp" in getattr(layer, "layer_name", "").split("."):
+        return None
+    if config.expert_offload_config.h2d_backend != "torch":
+        raise NotImplementedError("O-MoE CPU checkpoint sources currently require h2d_backend='torch'")
+    return config
 
 
 class AscendLinearMethod(LinearMethodBase):
@@ -222,6 +278,43 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
+        config = _omoe_cpu_expert_config(layer)
+        if config is not None:
+            if getattr(self.quant_method, "quant_type", None) != QuantType.W8A8:
+                raise NotImplementedError("O-MoE CPU expert loading currently supports only W8A8")
+            if hasattr(layer, "_omoe_cpu_weight_schema"):
+                raise RuntimeError("O-MoE checkpoint parameters must be created exactly once")
+            if any(
+                type(value) is not int or value <= 0
+                for value in (num_experts, hidden_size, intermediate_size_per_partition)
+            ):
+                raise ValueError("O-MoE requires nonempty, positive checkpoint expert dimensions")
+            layer.enable_omoe = True
+            layer._omoe_cpu_weights_ready = False
+            layer._omoe_cpu_weight_schema = OMoECPUWeightSchema(
+                num_experts, hidden_size, intermediate_size_per_partition, params_dtype
+            )
+            # Keep full, nonzero standard-EP checkpoint shapes and the original
+            # loader. It remains responsible for global/local IDs and TP slices.
+            with torch.device("cpu"):
+                self._create_weight_parameters(
+                    layer, num_experts, hidden_size, intermediate_size_per_partition, params_dtype, **extra_weight_attrs
+                )
+            validate_omoe_cpu_weights(layer)
+            return
+        self._create_weight_parameters(
+            layer, num_experts, hidden_size, intermediate_size_per_partition, params_dtype, **extra_weight_attrs
+        )
+
+    def _create_weight_parameters(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
         weight_param = self.quant_method.get_weight(
             num_experts, intermediate_size_per_partition, hidden_size, params_dtype
         )
@@ -298,6 +391,33 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "enable_omoe", False) is True:
+            validate_omoe_cpu_weights(layer)
+            # The ND expert kernel implements symmetric W8A8 only. Validate
+            # all small quantization parameters before changing any storage;
+            # unsupported checkpoints must not be silently misinterpreted.
+            for name in ("w13_weight_offset", "w2_weight_offset"):
+                if torch.any(getattr(layer, name) != 0):
+                    raise NotImplementedError(f"O-MoE requires zero {name} for symmetric W8A8")
+            for name in ("w13_weight_scale", "w2_weight_scale"):
+                if not torch.isfinite(getattr(layer, name)).all():
+                    raise NotImplementedError(f"O-MoE requires finite {name} for W8A8")
+            if layer._omoe_cpu_weights_ready:
+                return
+            # The loader context patch keeps these parameters on CPU. Never
+            # invoke the original scheme's whole-layer NPU/NZ conversion.
+            layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
+            layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+            for name in ("w13_weight_scale", "w2_weight_scale"):
+                param = getattr(layer, name)
+                param.data = param.data.reshape(param.shape[0], -1).to(torch.float32)
+            for name in ("w13_weight_offset", "w2_weight_offset"):
+                param = getattr(layer, name)
+                param.data = param.data.reshape(param.shape[0], -1)
+            layer.w13_weight_scale_fp32 = layer.w13_weight_scale.data
+            layer._omoe_cpu_weights_ready = True
+            validate_omoe_cpu_weights(layer)
+            return
         if hasattr(self.quant_method, "process_weights_after_loading"):
             self.quant_method.process_weights_after_loading(layer)
 

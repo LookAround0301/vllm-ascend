@@ -1610,7 +1610,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             metadata.full_compress_sin.shape[0],
             metadata.full_compress_sin.shape[-1],
         )
-        return torch.ops._C_ascend.compressor_metadata(
+        result = torch.ops._C_ascend.compressor_metadata(
             full_compress_cos,
             full_compress_sin,
             metadata.query_start_loc,
@@ -1622,6 +1622,17 @@ class AscendDSAImpl(DSAAttentionImpl):
             metadata.num_compressed_tokens,
             metadata.num_reqs_actual,
         )
+        if getattr(metadata, "omoe_dsv4_physical", False):
+            from vllm_ascend.attention.dsv4_hierarchical_metadata import sanitize_dsv4_scatter_slots
+
+            # The input table is already cache-specific physical addressing.
+            # BLOCK_OFFSET emits separate INT32 ID/row components, without
+            # multiplying them. Widen and canonicalize before any scatter
+            # arithmetic; (-1, nonzero_row) is unsafe with Indexer's 64B view.
+            compress_cos, compress_sin, slots = result
+            slots = sanitize_dsv4_scatter_slots(slots)
+            return compress_cos, compress_sin, slots
+        return result
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # Attention impls are not walked by vllm's process_weights_after_loading

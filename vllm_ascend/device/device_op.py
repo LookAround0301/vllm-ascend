@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.triton_utils import HAS_TRITON
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device import utils as device_utils
 from vllm_ascend.device.mxfp_compat import (
     FLOAT8_E8M0FNU_DTYPE,
@@ -100,6 +101,25 @@ class BaseDeviceAdaptor:
                 head_size=head_size,
                 scale=scale,
                 is_prefill_no_cache=is_prefill_no_cache,
+            )
+
+
+        if (
+            getattr(attn_metadata, "omoe_paired_cache", False)
+            and kwargs.get("block_table") is not None
+            and key.numel() > (1 << 32)
+            and get_ascend_config().omoe_config.attention_layout == "bnsd"
+        ):
+            # Native TND is faster, but high KV offsets in the shared arena
+            # can overflow its 32-bit element addressing and corrupt attention
+            # output. attention_layout='bnsd' enables this workaround.
+            # Uncached prefill still uses TND because it reads current K/V.
+            from vllm_ascend.core.attention_page_views import paired_kv_attention
+
+            return paired_kv_attention(
+                query, key, value, attn_metadata, num_heads=num_heads,
+                num_kv_heads=num_key_value_heads, scale=scale, block_size=kwargs["block_size"],
+                current_key=current_key, current_value=current_value, attn_mask=kwargs["atten_mask"],
             )
 
         return torch_npu.npu_fused_infer_attention_score(

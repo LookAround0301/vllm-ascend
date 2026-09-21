@@ -597,6 +597,61 @@ __aicore__ inline void SASVectorBlock<SAST>::CopyInKv(int64_t &mte2Size, int64_t
         return;
     }
 
+    if constexpr (KV_LAYOUT_T == SAS_LAYOUT::PA_ND) {
+        if (keyOffset1 >= 0 && keyOffset2 >= 0) {
+            const int64_t pageRows = static_cast<int64_t>(constInfo.paCmpBlockSize);
+            const int64_t pageStride = static_cast<int64_t>(constInfo.cmpKvStride);
+            const int64_t headDim = static_cast<int64_t>(constInfo.headDim);
+            const int64_t rowStride = static_cast<int64_t>(constInfo.kvHeadNum) * headDim;
+            const int64_t blockElements = constInfo.sparseBlockSize * headDim;
+            const int64_t elementBytes = static_cast<int64_t>(sizeof(KV_T));
+            const int64_t maxGapElements = static_cast<int64_t>(INT32_MAX - 1) / elementBytes;
+            // S=1 and INT32 top-k bound these canonical page offsets in int64.
+            // Retain page padding and the original linear-table fallback order.
+            const int64_t canonicalOffset1 = (realS2Idx1 / pageRows) * pageStride +
+                                              (realS2Idx1 % pageRows) * rowStride;
+            const int64_t canonicalOffset2 = (realS2Idx2 / pageRows) * pageStride +
+                                              (realS2Idx2 % pageRows) * rowStride;
+            const int64_t canonicalDistance = canonicalOffset1 > canonicalOffset2 ?
+                                                  canonicalOffset1 - canonicalOffset2 :
+                                                  canonicalOffset2 - canonicalOffset1;
+            const bool canonicalPair = realS2Idx1 + constInfo.sparseBlockSize < s2IdLimit &&
+                                       realS2Idx2 + constInfo.sparseBlockSize < s2IdLimit &&
+                                       canonicalDistance >= blockElements &&
+                                       canonicalDistance - blockElements <= maxGapElements;
+            if (canonicalPair && canonicalOffset1 > canonicalOffset2) {
+                const int64_t firstIndex = realS2Idx1;
+                realS2Idx1 = realS2Idx2;
+                realS2Idx2 = firstIndex;
+                const int64_t firstOffset = keyOffset1;
+                keyOffset1 = keyOffset2;
+                keyOffset2 = firstOffset;
+            }
+            // Physical layout selects the DMA form, never the canonical order.
+            // Check direction and bounds before subtracting width or scaling.
+            if (canonicalPair && keyOffset2 >= keyOffset1) {
+                const int64_t physicalDistance = keyOffset2 - keyOffset1;
+                if (physicalDistance >= blockElements &&
+                    physicalDistance - blockElements <= maxGapElements) {
+                    DataCopyExtParams intriParams;
+                    intriParams.blockLen = blockElements * elementBytes;
+                    intriParams.blockCount = 2;
+                    intriParams.dstStride = 0;
+                    intriParams.srcStride = (physicalDistance - blockElements) * elementBytes;
+                    DataCopyPadExtParams<KV_T> padParams;
+                    DataCopyPad(kvMergUb_[mergeMte3Idx % 2 * INPUT2_BUFFER_OFFSET / sizeof(KV_T) +
+                                          (mte2Size - mte3Size) * constInfo.headDim],
+                                cmpKvGm_[keyOffset1], intriParams, padParams);
+                    mte2Size += 2 * constInfo.sparseBlockSize;
+                    return;
+                }
+            }
+            CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, keyOffset1, s2IdLimit, runInfo);
+            CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyOffset2, s2IdLimit, runInfo);
+            return;
+        }
+    }
+
     int64_t keySrcStride = 0;
     if constexpr (KV_LAYOUT_T == SAS_LAYOUT::PA_ND) {
         int64_t blkTableSrcStride =

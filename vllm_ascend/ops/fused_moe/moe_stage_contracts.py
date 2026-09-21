@@ -17,13 +17,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Protocol, TypeVar
 
 import numpy as np
 import torch
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_ascend.ops.activation import SituActivationConfig
+from vllm_ascend.ops.fused_moe.discrete_moe_mlp import DiscreteMoEWeights, PreparedDiscreteMoEWeights
 from vllm_ascend.ops.fused_moe.moe_stage_params import MoEQuantParams, MoERoutingParams
 
 TMoECombineMetadata = TypeVar("TMoECombineMetadata")
@@ -77,6 +78,9 @@ class MoEFusedExpertsInput:
     # ``Any`` avoids coupling the core contracts to the LoRA module; only the
     # unquant MLP path reads it, and only when a LoRA adapter is active.
     lora_context: Any = None
+    # Optional storage provider, resolved only AFTER ordinary token dispatch.
+    # It supplies a pinned Prepared payload; it never changes the router.
+    expert_provider: MoEExpertProvider | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +146,7 @@ class MoEMlpComputeInput:
     group_list_type: int
     dynamic_scale: torch.Tensor | None
     topk_scales: torch.Tensor | None
-    weights: MoEWeights
+    weights: MoEWeights | DiscreteMoEWeights | PreparedDiscreteMoEWeights
     quant: MoEQuantParams
     fusion: bool
     activation: str | MoEActivation | SituActivationConfig = "silu"
@@ -157,6 +161,27 @@ class MoEMlpComputeInput:
     lora_context: Any = None
 
 
+class MoEExpertProvider(Protocol):
+    """Layer-bound storage interface for separated dispatch/MLP/combine.
+
+    prepare_mlp preserves row order and owns active-group compaction, weight
+    readiness and every acquired lease. On failure it must protect/retire its
+    partial loads itself; no lease group has yet been transferred to compute.
+    It returns one complete working set or raises a clear capacity error.
+    For AllGather routing it may trim the documented valid token prefix;
+    comm restores a zero suffix to the original dispatch capacity for combine.
+
+    release_compute seals all returned compute pins with an event covering
+    the final MLP submission, even when compute raised. It must not reuse any
+    span before that event completes. A failed event recording leaves pins
+    live and fails the worker rather than authorizing unsafe reuse.
+    """
+
+    def prepare_mlp(self, mlp_input: MoEMlpComputeInput) -> tuple[MoEMlpComputeInput, object]: ...
+
+    def release_compute(self, lease_group: object, event: Any) -> None: ...
+
+
 __all__ = [
     "MoEPrepareOutput",
     "MoEWeights",
@@ -167,5 +192,6 @@ __all__ = [
     "MoEAllToAllCombineMetadata",
     "MoETokenDispatchOutput",
     "MoEMlpComputeInput",
+    "MoEExpertProvider",
     "TMoECombineMetadata",
 ]

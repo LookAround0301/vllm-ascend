@@ -102,6 +102,23 @@ class AscendConfig:
             self.decode_stats_enabled, self.decode_stats_csv,
             self.decode_stats_path, self.decode_stats_flush_every,
             self.decode_stats_flush_seconds)
+        from vllm.version import __version__ as VLLM_VERSION
+        from vllm_ascend.expert_offload.config import resolve_omoe_config
+
+        self.omoe_config = resolve_omoe_config(
+            vllm_config,
+            self.expert_offload_config,
+            enabled_by_env=ascend_envs.VLLM_ASCEND_ENABLE_O_MOE,
+            vllm_version=VLLM_VERSION,
+        )
+        if self.omoe_config.enabled:
+            if any(
+                self.eplb_config.config.get(key)
+                for key in ("dynamic_eplb", "expert_map_path", "expert_map_record_path", "num_redundant_experts")
+            ):
+                raise ValueError(
+                    "O-MoE requires standard EP ownership: dynamic/static EPLB and redundancy are unsupported."
+                )
 
         self.scheduler_config = SchedulerConfig(
             additional_config,
@@ -997,6 +1014,8 @@ class ExpertOffloadConfig:
 
     _defaults = {
         "expert_offload": False,
+        # Maximum off-device experts per later MoE layer across EP ranks; 0 keeps all resident.
+        "offload_expert_limit": 0,
         "num_device_experts": 32,
         "num_device_layers": 2,
         "expert_map_path": None,
@@ -1013,6 +1032,8 @@ class ExpertOffloadConfig:
         "expert_prefetch_num": 2,
         # How many token rows of the forward the next-layer predictor runs on
         "expert_prefetch_tokens": 1,
+        # O-MoE: sample one token from each of the first N requests.
+        "expert_prefetch_max_requests": 1,
         "shard_per_rank": True,
         "enable_multi_card": False,
         "hot_expert_preload": False,
@@ -1112,6 +1133,9 @@ class ExpertOffloadConfig:
         return val if isinstance(val, list) else [val]
 
     def _validate_config(self):
+        limit = self.config["offload_expert_limit"]
+        if type(limit) is not int or limit < 0:
+            raise ValueError("offload_expert_limit must be a non-negative integer")
         if self.expert_map_path is not None:
             logger.info("The expert_map is %s", self.expert_map_path)
             if not self.expert_map_path.endswith(".json"):
@@ -1203,8 +1227,11 @@ class ExpertOffloadConfig:
                 f"got {self.config['expert_prefetch_tokens']} instead")
         if not isinstance(self.config["enable_multi_card"], bool):
             raise TypeError("enable_multi_card must be a boolean")
-        if not isinstance(self.config["enable_multi_card"], bool):
-            raise TypeError("enable_multi_card must be a boolean")
+        max_requests = self.config["expert_prefetch_max_requests"]
+        if type(max_requests) is not int:
+            raise TypeError("expert_prefetch_max_requests must be an integer")
+        if max_requests < 1:
+            raise ValueError("expert_prefetch_max_requests must >= 1")
         if self.config["h2d_backend"] not in ("torch", "memfabric"):
             raise ValueError(
                 "h2d_backend must be either 'torch' or 'memfabric'")
