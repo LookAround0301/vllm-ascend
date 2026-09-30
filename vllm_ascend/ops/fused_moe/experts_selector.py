@@ -22,9 +22,113 @@ import torch.nn.functional as F
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.dflash_topm_state import try_activation_route
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
+
+
+def dynamic_pruning_unsorted(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    thresholds: torch.Tensor,
+    log2phy: torch.Tensor | None = None,
+    debug: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Drop weak top-k experts. Invalid logical id is -1 (not Omni's 512)."""
+    invalid_id = -1
+
+    topk_weight_sorted, sorted_indices = torch.sort(
+        topk_weights, dim=1, descending=True)
+    topk_id_sorted = torch.gather(topk_ids, dim=1, index=sorted_indices)
+    topk_weight_sum = torch.sum(topk_weight_sorted, dim=1, keepdim=True)
+    thr = thresholds.to(device=topk_weight_sorted.device,
+                        dtype=topk_weight_sorted.dtype)
+    if thr.numel() != topk_weights.shape[1]:
+        raise ValueError(
+            f"experts_pruning_threshold length {thr.numel()} "
+            f"!= top_k {topk_weights.shape[1]}")
+
+    weak_mask = topk_weight_sorted < topk_weight_sum * thr
+
+    if log2phy is not None:
+        valid_mask = topk_id_sorted >= 0
+        safe_ids = topk_id_sorted.clamp(min=0).long()
+
+        physical_ids = log2phy[safe_ids]
+
+        miss_mask = valid_mask & (physical_ids < 0)
+        prune_mask = weak_mask & miss_mask
+    else:
+        prune_mask = weak_mask
+
+    debug_tensor = None
+    if debug and log2phy is not None:
+        invalid_ids = torch.full_like(topk_id_sorted, -1)
+        remaining_miss_mask = miss_mask & ~prune_mask
+        debug_tensor = torch.stack(
+            [
+                # [0] 剪枝前所有miss路由
+                torch.where(
+                    miss_mask,
+                    topk_id_sorted,
+                    invalid_ids,
+                ),
+                # [1] 被剪掉的路由
+                torch.where(
+                    prune_mask,
+                    topk_id_sorted,
+                    invalid_ids,
+                ),
+                # [2] 剪枝后仍保留、仍需H2D的miss路由
+                torch.where(
+                    remaining_miss_mask,
+                    topk_id_sorted,
+                    invalid_ids,
+                ),
+            ],
+            dim=0,
+        )
+
+    new_topk_weights = topk_weight_sorted.masked_fill(prune_mask, 0)
+    new_topk_ids = topk_id_sorted.masked_fill(prune_mask, invalid_id)
+    return new_topk_weights, new_topk_ids.to(topk_ids.dtype), debug_tensor
+
+
+_prune_thr_npu = None
+
+
+def maybe_prune_topk_experts(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    log2phy: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    try:
+        cfg = get_ascend_config().expert_offload_config
+    except RuntimeError:
+        return topk_weights, topk_ids, None
+
+    if not cfg.experts_pruning_enabled:
+        return topk_weights, topk_ids, None
+
+    global _prune_thr_npu
+    if (_prune_thr_npu is None
+            or _prune_thr_npu.device != topk_weights.device
+            or _prune_thr_npu.dtype != topk_weights.dtype
+            or _prune_thr_npu.numel() != len(cfg.experts_pruning_threshold)):
+        _prune_thr_npu = torch.tensor(
+            cfg.experts_pruning_threshold,
+            device=topk_weights.device,
+            dtype=topk_weights.dtype,
+        )
+    return dynamic_pruning_unsorted(
+        topk_weights,
+        topk_ids,
+        _prune_thr_npu,
+        log2phy=log2phy,
+        debug=cfg.experts_pruning_debug,
+    )
 
 
 def select_experts(
@@ -68,6 +172,14 @@ def select_experts(
         topk_weights: router weights of shape (num_tokens, top_k).
         topk_ids: selected expert IDs of shape (num_tokens, top_k).
     """
+    context = get_forward_context()
+    topm_pair = try_activation_route(
+        context, router_logits, hidden_states, top_k, renormalize,
+        scoring_func, e_score_correction_bias, routed_scaling_factor,
+        custom_routing_function, tid2eid, mix_placement, topk_group,
+        num_expert_group,
+    )
+
     is_support_npu_moe_gating_top_k = check_npu_moe_gating_top_k(
         hidden_states=hidden_states,
         top_k=top_k,
@@ -78,7 +190,9 @@ def select_experts(
         custom_routing_function=custom_routing_function,
     )
 
-    if is_support_npu_moe_gating_top_k:
+    if topm_pair is not None:
+        topk_weights, topk_ids = topm_pair
+    elif is_support_npu_moe_gating_top_k:
         topk_weights, topk_ids = _select_experts_with_fusion_ops(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -129,6 +243,8 @@ def select_experts(
         topk_ids = torch.cat([topk_ids, pad_shared_expert_ids], dim=1)
         topk_weights = torch.cat([topk_weights, pad_shared_expert_weights], dim=1)
 
+    if topm_pair is not None:
+        context.dflash_topm_state.record_selection(context, topk_weights, topk_ids)
     return topk_weights, topk_ids
 
 
@@ -187,12 +303,25 @@ def plan_expert_substitutions(
     upper = boundary * (1 + expert_substitution_threshold)
     lower = boundary * (1 - expert_substitution_threshold)
 
-    selected_scores = selection_scores.gather(1, topk_ids.long())
-    low_confidence = selected_scores < upper.unsqueeze(1)
-    in_cache = log2phy[topk_ids.long()] >= 0
+    # 剪枝后的-1不是有效专家，不能参与gather、log2phy索引和替换。
+    valid_routes = (
+        (topk_ids >= 0)
+        & (topk_ids < num_experts)
+    )
+
+    # gather不接受-1；log2phy[-1]还会错误读取最后一个专家。
+    safe_ids = topk_ids.clamp(
+        min=0,
+        max=num_experts - 1,
+    ).long()
+
+    selected_scores = selection_scores.gather(1, safe_ids)
+    low_confidence = (selected_scores < upper.unsqueeze(1)) & valid_routes
+    in_cache = valid_routes & (log2phy[safe_ids] >= 0)
+
     cached_experts = set(torch.where(log2phy >= 0)[0].tolist())
     references: dict[int, list[tuple[int, int]]] = {}
-    for token_idx, position in (~in_cache).nonzero(as_tuple=False).tolist():
+    for token_idx, position in (valid_routes & ~in_cache).nonzero(as_tuple=False).tolist():
         source_id = int(topk_ids[token_idx, position])
         referenced[source_id] = True
         references.setdefault(source_id, []).append((token_idx, position))
@@ -297,7 +426,7 @@ def substitute_experts_device(
     scoring_func: str = "softmax",
     e_score_correction_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """ device-resident mirror of ``substitute_experts``.
+    """Device-resident mirror of ``substitute_experts``.
 
     Same rule as the host planner — replace a non-resident, low-confidence
     routed expert with a resident one whose score falls inside the importance
@@ -357,11 +486,15 @@ def substitute_experts_device(
     upper = boundary * (1.0 + expert_substitution_threshold)
     lower = boundary * (1.0 - expert_substitution_threshold)
 
-    ids_long = topk_ids.long()
-    ids_flat = ids_long.reshape(-1)
-    selected = scores.gather(1, ids_long)                          # [n, k]
-    low_confidence = selected < upper                              # [n, k]
-    miss = log2phy.gather(0, ids_flat).reshape(n_tokens, top_k) < 0
+    # Pruning uses -1 as its invalid route ID. Clamp before gather/scatter and
+    # keep a separate mask so invalid routes never participate in substitution.
+    valid_routes = (topk_ids >= 0) & (topk_ids < num_experts)
+    safe_ids = topk_ids.clamp(min=0, max=num_experts - 1).long()
+    ids_flat = safe_ids.reshape(-1)
+    selected = scores.gather(1, safe_ids)                          # [n, k]
+    low_confidence = (selected < upper) & valid_routes             # [n, k]
+    miss = valid_routes & (
+        log2phy.gather(0, ids_flat).reshape(n_tokens, top_k) < 0)
 
     def _any_per_source(flag: torch.Tensor) -> torch.Tensor:
         """[n, k] bool -> [n, k] bool: True where this position's SOURCE
@@ -378,9 +511,9 @@ def substitute_experts_device(
     eligible = miss & low_confidence & ~_any_per_source(miss & ~low_confidence)
 
     resident = (log2phy >= 0).unsqueeze(0)                         # [1, E]
-    chosen = torch.zeros_like(scores, dtype=torch.bool)
-    chosen.scatter_(1, ids_long,
-                    torch.ones_like(ids_long, dtype=torch.bool))
+    chosen_count = torch.zeros_like(scores, dtype=torch.float32)
+    chosen_count.scatter_add_(1, safe_ids, valid_routes.to(torch.float32))
+    chosen = chosen_count > 0
     in_band = (scores >= lower) & (scores <= boundary)
     candidate = in_band & resident & ~chosen                       # [n, E]
     candidate_scores = scores.masked_fill(~candidate, float("-inf"))
@@ -425,6 +558,13 @@ def substitute_experts_host_(scores, topk_ids, log2phy, threshold, gt_out,
     scalars rather than whole-array numpy calls: ~2x faster on the A3 host CPU,
     where each numpy call costs more than the arithmetic it performs. Results
     are identical either way (verified on 120k random cases).
+
+    ``topk_ids`` may contain -1 when expert pruning is enabled
+    (dynamic_pruning_unsorted runs BEFORE substitution in
+    ExpertOffloadManager.update_weights). A -1 route is already dropped by
+    _map_logical_ids_to_phy, so it is neither a miss nor a candidate-blocker
+    here; substituting one would refund the H2D transfer pruning saved for a
+    route whose weight is 0.
     """
     n, top_k = topk_ids.shape
     num_experts = scores.shape[1]
@@ -435,7 +575,13 @@ def substitute_experts_host_(scores, topk_ids, log2phy, threshold, gt_out,
     if n == 1 and resident_ids is not None:
         return _substitute_one_row_(scores[0], topk_ids, log2phy, threshold,
                                     resident_ids, top_k)
-    miss = log2phy[topk_ids] < 0
+    # Expert pruning writes -1 into topk_ids before this callback runs, and numpy WRAPS negative
+    # indices, so log2phy[-1] silently read log2phy[num_experts - 1]: a
+    # pruned, zero-weight route was reported as a miss and substituted back
+    # onto a resident expert, undoing the H2D saving pruning had just made.
+    valid_routes = (topk_ids >= 0) & (topk_ids < num_experts)
+    safe_ids = np.clip(topk_ids, 0, num_experts - 1)
+    miss = valid_routes & (log2phy[safe_ids] < 0)
     if not miss.any():
         return 0
     # boundary = (k+1)-th largest biased score per row, clamped at 0. Selection
@@ -445,14 +591,21 @@ def substitute_experts_host_(scores, topk_ids, log2phy, threshold, gt_out,
     boundary = np.maximum(boundary, np.float32(0.0))
     upper = boundary * np.float32(1.0 + threshold)
     lower = boundary * np.float32(1.0 - threshold)
-    selected = np.take_along_axis(scores, topk_ids, axis=1)
-    low_confidence = selected < upper[:, None]
+    # gather with safe_ids, then AND with valid_routes. With the raw
+    # ids, take_along_axis returned the LAST column's score for a pruned
+    # position, which could make it look low-confidence.
+    selected = np.take_along_axis(scores, safe_ids, axis=1)
+    low_confidence = (selected < upper[:, None]) & valid_routes
     if n == 1:
         # one row: every source expert has exactly one reference (top-k ids
         # are distinct), so the per-source "any" is the identity
         eligible = miss & low_confidence
     else:
-        ids_flat = topk_ids.reshape(-1)
+        # same_source is built from safe_ids, not topk_ids. Every
+        # pruned position used to compare equal to every other pruned
+        # position, aliasing them into one fake "source expert -1" and
+        # breaking per-source atomicity. Clamping makes them alias expert 0 instead
+        ids_flat = safe_ids.reshape(-1)
         same_source = ids_flat[:, None] == ids_flat[None, :]
 
         def _any_per_source(flag):
@@ -473,7 +626,12 @@ def substitute_experts_host_(scores, topk_ids, log2phy, threshold, gt_out,
         row = scores[r]
         # candidates: resident, inside [lower, boundary], not already chosen
         cand = (row >= lower[r]) & (row <= boundary[r]) & resident
-        cand[topk_ids[r]] = False
+        # A -1 in the row cleared cand[num_experts - 1], permanently barring the highest-numbered
+        # expert from ever being substituted TO on any step where something
+        # was pruned. Exclude only the ids this row really routes to —
+        # the device version's chosen_count scatter_add is weighted by
+        # valid_routes for the same reason.
+        cand[safe_ids[r][valid_routes[r]]] = False
         cand_ids = np.flatnonzero(cand)
         if cand_ids.size == 0:
             continue
@@ -498,7 +656,15 @@ def _substitute_one_row_(row, topk_ids, log2phy, threshold, resident_ids,
     ids0 = topk_ids[0]
     ids_list = ids0.tolist()
     l2p = log2phy
-    miss_pos = [i for i in range(top_k) if l2p[ids_list[i]] < 0]
+    # Expert pruning writes -1 into topk_ids before this runs, 
+    # and l2p[-1] wraps to log2phy[num_experts - 1] in numpy,
+    # so whenever the highest-numbered expert happened to be
+    # non-resident, a pruned zero-weight route was reported as a miss and
+    # substituted back onto a resident expert, refunding the H2D transfer
+    # pruning had just saved. Mirrors the valid_routes mask in
+    # substitute_experts_device.
+    miss_pos = [i for i in range(top_k)
+                if ids_list[i] >= 0 and l2p[ids_list[i]] < 0]
     if not miss_pos:
         return 0
     boundary = float(-np.partition(-row, top_k)[top_k])

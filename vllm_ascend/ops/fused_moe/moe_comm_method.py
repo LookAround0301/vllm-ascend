@@ -149,10 +149,11 @@ class MoECommMethod(ABC):
         assert moe_comm_method is not None, "Missing communication context"
 
         before_dispatch_evt = torch.npu.current_stream().record_event()
-        routed_topk_ids = fused_experts_input.topk_ids
-        if fused_experts_input.routing.log2phy is not None:
-            routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]
-            routed_topk_ids = routed_topk_ids.clamp(min=0)  # safety: unmapped -> 0
+        routed_topk_ids = _map_logical_ids_to_phy(
+            fused_experts_input.topk_ids,
+            fused_experts_input.routing.log2phy,
+            fused_experts_input.routing.num_local_experts,
+        )
 
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
@@ -197,6 +198,28 @@ class MoECommMethod(ABC):
     def _get_prepare_finalize(self) -> PrepareAndFinalize:
         raise NotImplementedError("_get_prepare_finalize function not implemented.")
 
+
+def _map_logical_ids_to_phy(topk_ids, log2phy, num_local_experts):
+    invalid_phy = int(num_local_experts)
+
+    if log2phy is None:
+        valid = topk_ids >= 0
+        return torch.where(
+            valid, topk_ids,
+            topk_ids.new_full(topk_ids.shape, invalid_phy))
+    logical_valid = (
+        (topk_ids >= 0) & (topk_ids < log2phy.numel())
+    )
+
+    safe_ids = topk_ids.clamp(
+        min=0,
+        max=log2phy.numel() - 1,
+    ).long()
+
+    phy = log2phy[safe_ids]
+    mapped_valid = logical_valid & (phy >= 0)
+
+    return torch.where(mapped_valid, phy, phy.new_full(phy.shape, invalid_phy))
 
 class AllGatherCommImpl(MoECommMethod):
     """This implementation is the same as NativeAllGatherCommImpl,
@@ -451,9 +474,11 @@ class FusedMC2CommImpl(MoECommMethod):
         )
 
         # Apply log2phy if needed
-        topk_ids = fused_experts_input.topk_ids
-        if fused_experts_input.routing.log2phy is not None:
-            topk_ids = fused_experts_input.routing.log2phy[topk_ids]
+        topk_ids = _map_logical_ids_to_phy(
+            fused_experts_input.topk_ids,
+            fused_experts_input.routing.log2phy,
+            fused_experts_input.routing.num_local_experts,
+        )
 
         expert_tokens = None
         if get_ascend_config().enable_fused_mc2 == 1:

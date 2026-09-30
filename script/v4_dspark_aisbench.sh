@@ -18,16 +18,16 @@ set -uo pipefail
 # ═════════════════════════════════ EDIT HERE ═════════════════════════════════
 
 # ── what to serve ────────────────────────────────────────────────────────────
-MODEL="${MODEL:-/mnt/nvme1n1_data/yangliu_y00567052/llms/DeepSeek-V4-Flash-DSpark-w4a8-test}"
-SERVED_NAME="${SERVED_NAME:-A3-deepseekv4-flash-w4a8-dspark}"
+MODEL="${MODEL:-}"
+SERVED_NAME="${SERVED_NAME:-}"
 TOKENIZER="${TOKENIZER:-"${MODEL}"}"
-DATASETS_CACHE="${DATASETS_CACHE:-/mnt/nvme1n1_data/yangliu_y00567052/keyi/benchmarks}"
+DATASETS_CACHE="${DATASETS_CACHE:-}"
 
 # ── context / generation length ──────────────────────────────────────────────
 # MAX_MODEL_LEN = served context (empty = checkpoint's own); MAX_OUTPUT_LEN
 # overrides every preset's max_out. Capped to CTX - PROMPT_RESERVE: a request
 # over the context is rejected mid-pass.
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-70000}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 MAX_OUTPUT_LEN="${MAX_OUTPUT_LEN:-}"
 
 # ── placement ────────────────────────────────────────────────────────────────
@@ -63,7 +63,7 @@ EXPERT_PREDICTOR_CKPT="${EXPERT_PREDICTOR_CKPT:-}"
 
 # ── measurement ──────────────────────────────────────────────────────────────
 DECODE_STATS="${DECODE_STATS:-1}"        # 0 = no summary, no CSV: TPOT baselines only
-CSV="${CSV:-1}"                          # also emit the per-step .csv
+CSV="${CSV:-0}"                          # also emit the per-step .csv
 # ms the compute stream is BLOCKED at the prefetch join — what prefetch COSTS.
 # Adds device events, so NOT a TPOT baseline.
 EXPERT_PREFETCH_WAIT_TIMING="${EXPERT_PREFETCH_WAIT_TIMING:-0}"
@@ -108,12 +108,12 @@ ALLOW_UNSAFE="${ALLOW_UNSAFE:-0}"        # every guard below becomes a warning
 PRESETS="
 gsm8k    | gsm8k_gen_0_shot_cot_chat_prompt   | 0.0 |      | 16384 |    | 1 | oss | 90.8 (base 8-shot EM)
 gpqa     | gpqa_gen_0_shot_cot_chat_prompt    | 0.6 | 0.95 | 65536 |    | 1 | oss | 71.2 (GPQA-D Pass@1)
-mmlu_pro | mmlu_pro_gen_0_shot_str            | 0.0 | 0.95 | 32768 | 98 | 1 | oss | 83.0 (MMLU-Pro EM)
-aime2025 | aime2025_gen_0_shot_chat_prompt    | 0.0 |      | 16384 |    | 1 | oss | n/a (all 30, integer EM)
-math500  | math500_gen_0_shot_cot_chat_prompt | 0.0 |      | 16384 | 80 | 1 | oss | n/a (MATH-500 pass@1)
-lcb      | livecodebench_0_shot_chat_v6       | 0.0 |      | 16384 | 30 | 1 | hf:livecodebench/code_generation_lite | n/a (LCB v6 pass@1)
-mgsm     | mgsm_gen_0_shot_cot_chat_prompt    | 0.0 |      | 16384 |132 | 1 | hf:juletxara/mgsm@f52417ca77bd71e9888ddc29f92587660725d2b4 | n/a (12 x 11 languages)
-mrcr     | mrcr_32k_gen                       | 0.0 |      | 8192  | 40 | 1 | hfcli:openai/mrcr:MRCR | n/a (8needle, 32k bin; official temp is 1.0)
+mmlu_pro | mmlu_pro_gen_0_shot_str            | 0.6 | 0.95 | 32768 | 98 | 1 | oss | 83.0 (MMLU-Pro EM)
+aime2025 | aime2025_gen_0_shot_chat_prompt    | 1.0 |      | 16384 |    | 1 | oss | n/a (all 30, integer EM)
+math500  | math500_gen_0_shot_cot_chat_prompt | 1.0 |      | 16384 | 80 | 1 | oss | n/a (MATH-500 pass@1)
+lcb      | livecodebench_0_shot_chat_v6       | 1.0 |      | 16384 | 30 | 1 | hf:livecodebench/code_generation_lite | n/a (LCB v6 pass@1)
+mgsm     | mgsm_gen_0_shot_cot_chat_prompt    | 1.0 |      | 16384 |132 | 1 | hf:juletxara/mgsm@f52417ca77bd71e9888ddc29f92587660725d2b4 | n/a (12 x 11 languages)
+mrcr     | mrcr_32k_gen                       | 1.0 |      | 8192  | 40 | 1 | hfcli:openai/mrcr:MRCR | n/a (8needle, 32k bin; official temp is 1.0)
 "
 
 # ══════════════════════════ DO NOT EDIT BELOW THIS LINE ══════════════════════

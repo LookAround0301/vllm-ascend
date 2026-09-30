@@ -559,7 +559,6 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
 
-        topk_weights = topk_weights.to(x.dtype)
 
         # Expert offload: incrementally page in needed experts, update log2phy.
         # Mirrors AscendW8A8DynamicFusedMoEMethod.apply and
@@ -622,6 +621,7 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                     layer_idx = 0
                 prefill_slot = layer_idx % len(mgr._prefill_w13)
 
+        topk_weights = topk_weights.to(x.dtype)
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         if use_prefill_pool:
             # Prefill pool holds all experts; swap weight references to the

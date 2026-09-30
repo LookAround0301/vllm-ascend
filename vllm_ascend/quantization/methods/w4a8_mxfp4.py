@@ -232,9 +232,6 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
 
-        if x.dtype not in [torch.float8_e4m3fn]:
-            topk_weights = topk_weights.to(x.dtype)
-
         # Expert offload: incrementally page in needed experts and update
         # log2phy. Multi-card decode uses dynamic MC2 placement, while
         # multi-card prefill loads this rank's EP shard into the prefill pool.
@@ -291,6 +288,9 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                 except ValueError:
                     layer_idx = 0
                 prefill_slot = layer_idx % len(mgr._prefill_w13)
+
+        if x.dtype not in [torch.float8_e4m3fn]:
+            topk_weights = topk_weights.to(x.dtype)
 
         moe_comm_method = forward_context.moe_comm_method
         if use_prefill_pool:
