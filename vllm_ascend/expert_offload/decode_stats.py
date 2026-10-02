@@ -23,8 +23,7 @@ from statistics import median
 from vllm.logger import logger
 
 # Metric table. Adding a row here propagates automatically to the printed
-# summary AND to the CSV header (07_csv_export.md §3) — do not inline these
-# names at use sites.
+# summary AND to the CSV header:
 #   key      : series name
 #   label    : printed label
 #   source   : per-layer value it reduces; None for a run-level series
@@ -76,6 +75,11 @@ _LEGEND = (
     "|A| resident    — the subset of |P| already cached, so not transferred",
     "|N| transferred — the subset of |P| actually copied H2D this step",
     "combined forms are set ops: |N&G| intersection, |N-G| difference",
+    "|G| with pruning on it is POST-prune (the pre-prune ids are overwritten",
+    "    in place), so hit_pre/hit_post/pred_acc rise and pred_prec falls",
+    "|G| with activation routing on it is the POOL-CONSTRAINED selection,",
+    "    not the unconstrained top-k the expert predictor was trained against",
+    "subst counts unique SOURCE experts redirected, not routed positions",
 )
 
 # watchdog cadence. Not a snapshot interval
@@ -101,6 +105,34 @@ class DecodeStatsCollector:
     per step, and the run summary is avg/median/min/max over that per-step
     series. min/max therefore read as "worst step / best step", which is the
     only reading that stays meaningful once layers are averaged out.
+
+    What this collector does NOT know, and cannot detect from its inputs:
+
+    * Whether expert pruning was enabled. If it was, the |G| handed to
+      record_layer is the POST-prune routed set — pruning rewrites topk_ids in
+      place, so the router's own selection no longer exists anywhere by the
+      time these numbers are computed. hit_post / hit_pre / pred_acc are all
+      measured against a demand set from which the misses have been removed, so
+      a rising hit rate across two runs may be pruning getting more aggressive
+      rather than paging getting better. Read `loads` and `pf_wait` for that:
+      they count real transfers and real stalls.
+    * That pred_acc (recall) and pred_prec (precision) move in OPPOSITE
+      directions under pruning. Precision falls unconditionally; recall tends
+      to rise but its sign is configuration-dependent. Neither alone says
+      anything about the predictor — compare heads at a fixed
+      experts_pruning_threshold and read the pair.
+    * Whether anchor-union activation routing was enabled. If it was, |G| is
+      the pool-constrained selection and the expert predictor is graded against
+      a target distribution it was not trained on — so pred_prec and pf_useful
+      fall, and pf_waste rises, for reasons unrelated to the head.
+    * Whether padded rows are in the sample. Under activation routing padded
+      rows keep role 0, which keeps them out of the candidate pool but does not
+      mask their scores, so they route to a full top-k and their demand is
+      inside |G| and `loads`. The SINGLE-CARD paging path applies no pad mask;
+      only the multi-card callback drops pad rows (mc2_mask_h).
+
+    _build_decode_stats_header in the model runner is where the run's feature
+    flags get into the archived summary; keep the two in step.
     """
 
     def __init__(self, csv_enabled=False, out_path=None, flush_every=200,
@@ -246,6 +278,15 @@ class DecodeStatsCollector:
         walks layers 0..L-1 once per decode forward, so the next appearance of an
         already-seen layer starts a new step. Hash layers participate in the
         boundary but contribute no values.
+
+        ``gsize`` and ``hit_pre`` arrive as 0.0 rather than None when the
+        caller's routed set is empty, so those two land as real samples and pull
+        both means down. With expert pruning enabled that needs every route in
+        the layer to be both weak and non-resident, which an aggressive
+        experts_pruning_threshold can produce. There is no dedicated counter for
+        it — check [EXPERT-PRUNE-LAYER-JSON]'s pruned_routes against num_tokens
+        (available under experts_pruning_debug) if a run's gsize mean looks too
+        low to explain.
         """
         if not self.collecting:
             return

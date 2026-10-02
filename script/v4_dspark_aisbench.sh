@@ -62,7 +62,7 @@ EXPERT_PREDICTOR="${EXPERT_PREDICTOR:-fate}"
 EXPERT_PREDICTOR_CKPT="${EXPERT_PREDICTOR_CKPT:-}"
 
 # ── measurement ──────────────────────────────────────────────────────────────
-DECODE_STATS="${DECODE_STATS:-1}"        # 0 = no summary, no CSV: TPOT baselines only
+DECODE_STATS="${DECODE_STATS:-0}"        # 0 = no summary, no CSV: TPOT baselines only
 CSV="${CSV:-0}"                          # also emit the per-step .csv
 # ms the compute stream is BLOCKED at the prefetch join — what prefetch COSTS.
 # Adds device events, so NOT a TPOT baseline.

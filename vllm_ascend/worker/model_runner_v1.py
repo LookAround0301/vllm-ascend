@@ -2951,10 +2951,30 @@ class NPUModelRunner(GPUModelRunner):
                 f"spec={'%s(k=%d)' % (getattr(spec, 'method', 'spec'), self.num_spec_tokens) if spec else 'off'}")
         except Exception:
             pass
+        # Activation routing re-scopes |G| and grades the expert predictor
+        # against a target distribution it was not trained on, so the archived
+        # summary has to say whether it was on. Own try block: dflash_topm_state
+        # is independent of the offload manager and either may be absent.
+        try:
+            topm = getattr(self, "dflash_topm_state", None)
+            if topm is not None and getattr(topm, "backend", "baseline") != "baseline":
+                lines.append(
+                    f"act_route: backend={topm.backend} "
+                    f"verify_block={topm.verify_block_size} "
+                    f"protected_rows={topm.protected_rows} "
+                    f"suffix_pool_top_k={topm.suffix_pool_top_k} "
+                    f"route_top_k={topm.route_top_k}")
+            else:
+                lines.append("act_route: off (baseline routing)")
+        except Exception:
+            pass
         manager = getattr(self, "offload_manager", None)
         if manager is not None:
             try:
                 config = manager.offload_config
+                # added the prune= field. Pruning changes what |G|
+                # means, so hit_post / hit_pre / pred_acc / pred_prec below are
+                # not comparable with a run where this reads 'off'.
                 lines.append(
                     f"offload  : device_experts={manager.num_device_experts}"
                     f"/{manager.num_total_experts} topk={manager.topk} "
@@ -2962,6 +2982,7 @@ class NPUModelRunner(GPUModelRunner):
                     f"policy={'lrc' if config.cache_policy_enabled else 'off'} "
                     f"prefetch={'on(num=%d)' % config.expert_prefetch_num if config.expert_prefetch_enabled else 'off'} "
                     f"subst={'on(%.3f)' % config.expert_substitution_threshold if config.expert_substitution_enabled else 'off'} "
+                    f"prune={'on%s' % (tuple(config.experts_pruning_threshold),) if config.experts_pruning_enabled else 'off'} "
                     f"multi_card={config.enable_multi_card} "
                     f"debug={config.moe_offload_debug}")
                 # the decode/prefill split is decided on MoE token ROWS, and
@@ -2978,6 +2999,13 @@ class NPUModelRunner(GPUModelRunner):
                     f"(seqs={self.max_num_reqs} x {per_req} x dp={dp_size}) "
                     f"threshold={manager.offload_threshold} -> "
                     f"{'paging' if paging else 'PREFILL-POOL (no statistics)'}")
+
+                if config.experts_pruning_enabled:
+                    lines.append(
+                        "caveat   : pruning on — |G| is post-prune, so "
+                        "hit_post/hit_pre rise mechanically and pred_acc tends "
+                        "up while pred_prec falls; read loads and pf_wait for "
+                        "the real H2D saving")
                 if not paging:
                     logger.warning_once(
                         "[DECODE-STATS] moe token rows/step=%d exceeds "

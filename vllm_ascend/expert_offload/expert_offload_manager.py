@@ -3155,7 +3155,7 @@ class ExpertOffloadManager:
         if (do_substitution and topk_ids_gt_h is not None
                 and subst_scores_h is not None):
             # (host path): decide the substitution
-            n_subst = substitute_experts_host_(
+            substitute_experts_host_(
                 subst_scores_h.numpy(),
                 topk_ids_h.numpy(),
                 log2phy_np,
@@ -3167,8 +3167,16 @@ class ExpertOffloadManager:
                 self._log_expert_substitution(
                     layer_idx, topk_ids_gt_h, topk_ids_h)
             if stats is not None:
-                gt_ids = set(topk_ids_gt_h.reshape(-1).tolist())
-                subst_count = float(n_subst)
+                # filter the -1 sentinel. maybe_prune_topk_experts
+                # writes -1 into topk_ids before topk_ids_gt_h is filled
+                gt_ids = {e for e in topk_ids_gt_h.reshape(-1).tolist()
+                          if 0 <= e < self.num_total_experts}
+                # The label is "substituted experts", and substitution is atomic per SOURCE
+                # expert — a source is redirected in all of its rows or none —
+                # so the unique source count is the meaningful unit
+                changed = topk_ids_gt_h != topk_ids_h
+                subst_count = float(len(
+                    {e for e in topk_ids_gt_h[changed].tolist() if e >= 0}))
         # substitution already happened on the NPU before this callback
         # was launched, so all that remains is reading two [n, topk] int32
         # pinned buffers
@@ -3178,8 +3186,12 @@ class ExpertOffloadManager:
                 self._log_expert_substitution(
                     layer_idx, topk_ids_gt_h, topk_ids_h)
             if stats is not None:
-                gt_ids = set(topk_ids_gt_h.reshape(-1).tolist())
-                subst_count = float((topk_ids_gt_h != topk_ids_h).sum())
+                # same -1 filter as the host arm above.
+                gt_ids = {e for e in topk_ids_gt_h.reshape(-1).tolist()
+                          if 0 <= e < self.num_total_experts}
+                changed = topk_ids_gt_h != topk_ids_h
+                subst_count = float(len(
+                    {e for e in topk_ids_gt_h[changed].tolist() if e >= 0}))
         with torch_npu.npu.stream(self.load_stream):
             # Hotness observation only on the reactive (non-prefetch) H2D path
             # with LRC policy enabled.
@@ -3236,11 +3248,15 @@ class ExpertOffloadManager:
 
             already_there = needed & on_device              # for cache_stats / debug
 
-            # both hit-rate numerators must be taken HERE — the load loop
+            # Both hit-rate numerators must be taken HERE — the load loop
             # below mutates on_device. `needed` is the post-substitution routed
             # set; gt_set is what the router originally selected (identical when
             # substitution is off, which is what makes the two series equal in
             # that case, exactly).
+            #
+            # NOTE (expert pruning): "what the router originally selected" is no
+            # longer accurate — pruning overwrote it in place, and the pre-prune
+            # ids are not recoverable here
             stat_hit_post = stat_hit_pre = None
             gt_set = None
             if stats is not None and not is_prefetch:
