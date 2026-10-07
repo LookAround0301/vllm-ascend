@@ -6,6 +6,8 @@
 #    source env_a5_0260.sh                     # REQUIRED, in this same shell
 #    CARD=2 PORT=1161 TASKS=gpqa RUN=perf MTP=1 ./v4_target_aisbench.sh
 #    TASKS="lcb mgsm" RUN=acc EXPERT_SUBSTITUTION=1 ./...   # the substitution A/B
+#    MTP=2 ACT_ROUTE=1 ./...                    # upstream anchor-union routing A/B
+#    EXPERTS_PRUNING=1 EXPERTS_PRUNING_THRESHOLD='[0,0,0,0.16,0.165,0.17]' ./...
 #    CARD=12,13 DP=2 ENABLE_MULTI_CARD=1 PORT=7081 ./...
 #    DRY_RUN=1 ...                             # print the plan, launch nothing
 #
@@ -50,6 +52,36 @@ ENABLE_MULTI_CARD="${ENABLE_MULTI_CARD:-0}"       # must move together with DP >
 EXPERT_SUBSTITUTION="${EXPERT_SUBSTITUTION:-0}"   # CHANGES ROUTING — see FINDINGS
 EXPERT_SUBSTITUTION_THRESHOLD="${EXPERT_SUBSTITUTION_THRESHOLD:-}"  # empty = engine default
 REMOE_GATE="${REMOE_GATE:-}"             # fine-tuned router gates, swapped in at load
+
+# ── expert pruning — UPSTREAM FEATURE, default OFF ───────────────────────────
+# Drops a route that is weak AND non-resident: id -> -1, weight -> 0, and the
+# remaining mixture weights are NOT renormalised. It runs inside update_weights
+# before substitution, so it needs OFFLOAD=1, and it is SINGLE-CARD only
+# (update_weights_multi_card never calls maybe_prune_topk_experts).
+# THRESHOLD is RANK-INDEXED over top_k: entry i is tested against rank i of the
+# weight-sorted row as `weight < row_sum * thr[i]`, so thr[0]=0 keeps the
+# strongest expert unprunable. The engine default is all zeros, which prunes
+# NOTHING — see the guard below.
+EXPERTS_PRUNING="${EXPERTS_PRUNING:-0}"            # CHANGES ROUTING — see FINDINGS
+EXPERTS_PRUNING_THRESHOLD="${EXPERTS_PRUNING_THRESHOLD:-[0.0, 0.01, 0.02, 0.05, 0.09, 0.14]}"  # JSON list, len == topk; empty = engine default
+EXPERTS_PRUNING_DEBUG="${EXPERTS_PRUNING_DEBUG:-0}"  # per-layer-per-step JSON: NOT a timing baseline
+
+# ── anchor-union activation routing — UPSTREAM FEATURE, default OFF ──────────
+# The rows of a DSpark verify block share one expert pool: anchor rows keep
+# their own top-k, suffix rows are masked to the batch-wide union of the pool.
+# Needs MTP=2 (dspark; every other drafter is rejected at startup) and
+# --no-async-scheduling, which is added to the serve argv automatically below.
+# LEAVE THE TUNING KNOBS EMPTY. The engine derives verify_block_size from the
+# verify query length, fused_rows from it plus the 512 prefill bucket, and
+# expected_router_layers from the model config — and writing a value EXPLICITLY
+# SUPPRESSES that derivation for that field (user_keys always wins), even when
+# the value equals the default.
+ACT_ROUTE="${ACT_ROUTE:-0}"                        # CHANGES ROUTING — see FINDINGS
+ACT_ROUTE_BACKEND="${ACT_ROUTE_BACKEND:-anchor_union_fused_native}"  # or anchor_union_reference
+ACT_ROUTE_VERIFY_BLOCK="${ACT_ROUTE_VERIFY_BLOCK:-}"       # empty = derived (must equal 1+NUM_SPEC_TOKENS)
+ACT_ROUTE_PROTECTED_ROWS="${ACT_ROUTE_PROTECTED_ROWS:-}"   # empty = engine default 3
+ACT_ROUTE_SUFFIX_POOL_TOP_K="${ACT_ROUTE_SUFFIX_POOL_TOP_K:-}"   # empty = engine default 2
+ACT_ROUTE_FUSED_ROWS="${ACT_ROUTE_FUSED_ROWS:-}"           # JSON list; empty = derived [verify_block,512]
 
 # ── prefetch ─────────────────────────────────────────────────────────────────
 # ORTHOGONAL: _TOKENS = rows the predictor runs on (candidates), _NUM = how many
@@ -227,6 +259,85 @@ fi
   || die "EXPERT_PREFETCH_WAIT_TIMING=1 needs OFFLOAD=1 and PREFETCH=1: no prefetch, no join to time"
 [[ "${EXPERT_PREFETCH_WAIT_TIMING}" == "0" || "${DECODE_STATS}" == "1" ]] \
   || die "EXPERT_PREFETCH_WAIT_TIMING=1 needs DECODE_STATS=1: pf_wait is reported there."
+
+# ── expert pruning (upstream) ────────────────────────────────────────────────
+[[ "${EXPERTS_PRUNING}" =~ ^[01]$ ]]       || die "EXPERTS_PRUNING must be 0 or 1"
+[[ "${EXPERTS_PRUNING_DEBUG}" =~ ^[01]$ ]] || die "EXPERTS_PRUNING_DEBUG must be 0 or 1"
+PRUNE_THR_LEN=0; PRUNE_THR_ALLZERO=1; PRUNE_THR_OK=ok
+if [[ -n "${EXPERTS_PRUNING_THRESHOLD}" ]]; then
+  read -r PRUNE_THR_LEN PRUNE_THR_ALLZERO PRUNE_THR_OK <<<"$(python3 - "${EXPERTS_PRUNING_THRESHOLD}" <<'PY'
+import json, sys
+try:
+    v = json.loads(sys.argv[1])
+except Exception:
+    print("0 1 not-json"); raise SystemExit
+bad = (not isinstance(v, list) or not v
+       or any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in v))
+if bad:
+    print("0 1 not-a-number-list"); raise SystemExit
+if any(x < 0 for x in v):
+    print(f"{len(v)} 0 negative"); raise SystemExit
+print(f"{len(v)} {int(all(x == 0 for x in v))} ok")
+PY
+)"
+  [[ "${PRUNE_THR_OK}" == ok ]] || die "EXPERTS_PRUNING_THRESHOLD invalid (${PRUNE_THR_OK}): a non-empty
+       JSON list of numbers >= 0, e.g. '[0,0,0,0.16,0.165,0.17]'. AscendConfig rejects anything else."
+  (( PRUNE_THR_LEN == TOPK )) || die "EXPERTS_PRUNING_THRESHOLD has ${PRUNE_THR_LEN} entries but
+       top_k=${TOPK}: dynamic_pruning_unsorted raises on the FIRST decode forward, i.e. after the
+       full model load and health check, mid-pass."
+fi
+if [[ "${EXPERTS_PRUNING}" == "1" ]]; then
+  [[ "${OFFLOAD}" == "1" ]] || die "EXPERTS_PRUNING=1 needs OFFLOAD=1: pruning rides inside
+       update_weights, and with OFFLOAD=0 that block is never emitted."
+  [[ "${ENABLE_MULTI_CARD}" != "1" ]] || guard "EXPERTS_PRUNING=1 with ENABLE_MULTI_CARD=1:
+       update_weights_multi_card never calls maybe_prune_topk_experts, so pruning is a NO-OP on the
+       multi-card path and this run is identical to EXPERTS_PRUNING=0."
+  if [[ -z "${EXPERTS_PRUNING_THRESHOLD}" ]]; then
+    guard "EXPERTS_PRUNING=1 with no EXPERTS_PRUNING_THRESHOLD: the engine default is [0,...] and
+       weak_mask is 'weight < row_sum * 0', which is never true — this run prunes NOTHING and is
+       identical to EXPERTS_PRUNING=0. Set a rank-indexed list, e.g. '[0,0,0,0.16,0.165,0.17]'."
+  elif (( PRUNE_THR_ALLZERO )); then
+    guard "EXPERTS_PRUNING_THRESHOLD is all zeros: weak_mask is never true, so this run prunes
+       NOTHING and is identical to EXPERTS_PRUNING=0."
+  fi
+fi
+
+# ── anchor-union activation routing (upstream) ───────────────────────────────
+[[ "${ACT_ROUTE}" =~ ^[01]$ ]] || die "ACT_ROUTE must be 0 or 1"
+[[ "${ACT_ROUTE_BACKEND}" =~ ^(anchor_union_fused_native|anchor_union_reference)$ ]] \
+  || die "ACT_ROUTE_BACKEND must be anchor_union_fused_native or anchor_union_reference
+       (baseline routing is ACT_ROUTE=0; 'anchor_union_topm' passes AscendConfig validation and is
+       then REJECTED by DFlashTopMState as an unvalidated prototype)"
+VERIFY_BLOCK=$(( 1 + NUM_SPEC_TOKENS ))     # == the engine's uniform_decode_query_len under dspark
+if [[ "${ACT_ROUTE}" == "1" ]]; then
+  [[ "${MTP}" == "2" ]] || die "ACT_ROUTE=1 needs MTP=2 (dspark): validate_activation_routing accepts
+       only dflash/dspark and raises at startup for anything else, MTP=0 and MTP=1 included."
+  [[ -z "${ACT_ROUTE_VERIFY_BLOCK}" || "${ACT_ROUTE_VERIFY_BLOCK}" == "${VERIFY_BLOCK}" ]] \
+    || die "ACT_ROUTE_VERIFY_BLOCK=${ACT_ROUTE_VERIFY_BLOCK} != 1+NUM_SPEC_TOKENS=${VERIFY_BLOCK}:
+       validate_activation_routing forces verify_block_size to equal the target query length. Leave
+       it empty and the engine derives it."
+  (( VERIFY_BLOCK >= 2 )) || die "ACT_ROUTE=1 needs verify_block_size >= 2, i.e. NUM_SPEC_TOKENS >= 1"
+  if [[ -n "${ACT_ROUTE_PROTECTED_ROWS}" ]]; then
+    [[ "${ACT_ROUTE_PROTECTED_ROWS}" =~ ^[1-9][0-9]*$ ]] \
+      || die "ACT_ROUTE_PROTECTED_ROWS must be a positive integer"
+    (( ACT_ROUTE_PROTECTED_ROWS <= VERIFY_BLOCK )) \
+      || die "ACT_ROUTE_PROTECTED_ROWS=${ACT_ROUTE_PROTECTED_ROWS} > verify_block_size=${VERIFY_BLOCK}:
+       DFlashTopMState requires protected_rows in [1, verify_block_size] and raises at startup."
+  else
+    (( VERIFY_BLOCK >= 3 )) || die "the engine default protected_rows=3 exceeds the derived
+       verify_block_size=${VERIFY_BLOCK}, and DFlashTopMState raises at startup. Set
+       ACT_ROUTE_PROTECTED_ROWS <= ${VERIFY_BLOCK}, or raise NUM_SPEC_TOKENS."
+  fi
+  if [[ -n "${ACT_ROUTE_SUFFIX_POOL_TOP_K}" ]]; then
+    [[ "${ACT_ROUTE_SUFFIX_POOL_TOP_K}" =~ ^[1-9][0-9]*$ ]] \
+      || die "ACT_ROUTE_SUFFIX_POOL_TOP_K must be a positive integer"
+    (( ACT_ROUTE_SUFFIX_POOL_TOP_K <= TOPK )) \
+      || die "ACT_ROUTE_SUFFIX_POOL_TOP_K=${ACT_ROUTE_SUFFIX_POOL_TOP_K} > top_k=${TOPK}:
+       DFlashTopMState requires suffix_pool_top_k in [1, route_top_k]."
+  fi
+  [[ -z "${ACT_ROUTE_FUSED_ROWS}" || "${ACT_ROUTE_FUSED_ROWS}" == \[*\] ]] \
+    || die "ACT_ROUTE_FUSED_ROWS must be a JSON list of positive ints, e.g. '[1,2,3,4,5,6,512]'"
+fi
 # A gate fine-tuned on the QuaRot build is silently wrong on any other basis;
 # only the w4a8 build declares optional.quarot, so that file is the tell.
 if [[ -n "${REMOE_GATE}" ]]; then
@@ -496,11 +607,71 @@ reap() {
   SERVE_PID=""; SERVE_PGID=""; SERVE_SID=""; return 0
 }
 
+# Both upstream features announce themselves from inside the paging host
+# callback / the routing hook, i.e. only once a DECODE forward has run — so
+# neither can be checked at /health time the way the prefetch keys are. Called
+# from report_stats, which the traps also reach.
+report_features() {
+  local _pn
+  if [[ "${EXPERTS_PRUNING}" == "1" ]]; then
+    grep -o '\[EXPERT-PRUNE\] entered NPU pruning path:.*$' "${SERVE_LOG}" 2>/dev/null \
+      | sort -u | sed 's/^/[prune]  /'
+    grep -q '\[EXPERT-PRUNE\] entered NPU pruning path' "${SERVE_LOG}" 2>/dev/null || \
+      echo "[prune]  WARNING: no '[EXPERT-PRUNE] entered NPU pruning path' — pruning NEVER RAN. The
+         key was swallowed, OFFLOAD was off, or no decode step reached the paging path."
+    if [[ "${EXPERTS_PRUNING_DEBUG}" == "1" ]]; then
+      _pn="$(grep -c '\[EXPERT-PRUNE-LAYER-JSON\]' "${SERVE_LOG}" 2>/dev/null)"
+      echo "[prune]  [EXPERT-PRUNE-LAYER-JSON] records: ${_pn:-0}"
+      # pruned_routes counts POSITIONS; saved_h2d_count counts experts that
+      # actually left the demand set. prune_mask has no per-source atomicity, so
+      # a pruned position whose expert survives in another MoE row still pays
+      # its H2D — this ratio is how much of the pruning bought a transfer.
+      python3 - "${SERVE_LOG}" 2>/dev/null <<'PY' | sed 's/^/[prune]  /'
+import json, sys
+tag = "[EXPERT-PRUNE-LAYER-JSON] "
+pruned = saved = miss = rows = 0
+for line in open(sys.argv[1], errors="ignore"):
+    if tag not in line:
+        continue
+    try:
+        d = json.loads(line.split(tag, 1)[1].strip())
+    except Exception:
+        continue
+    pruned += d.get("pruned_routes", 0)
+    saved += d.get("saved_h2d_count", 0)
+    miss += d.get("miss_routes", 0)
+    rows += 1
+if rows:
+    ratio = f"{saved / pruned:.3f}" if pruned else "n/a (nothing pruned)"
+    print(f"layer-records={rows} miss_routes={miss} pruned_routes={pruned} "
+          f"saved_h2d_count={saved} saved/pruned={ratio}")
+    if pruned and saved / pruned < 0.8:
+        print("saved/pruned < 0.8: those pruned positions whose expert is still "
+              "paged in for another MoE row lost mixture mass and saved no transfer.")
+PY
+    fi
+  fi
+  if [[ "${ACT_ROUTE}" == "1" ]]; then
+    grep -o '\[ACTIVATION-ROUTING\].*$' "${SERVE_LOG}" 2>/dev/null | sort -u | sed 's/^/[actrt]  /'
+    if ! grep -q '\[ACTIVATION-ROUTING\].*eligible=True' "${SERVE_LOG}" 2>/dev/null; then
+      echo "[actrt]  WARNING: no contract line with eligible=True — try_activation_route rejected every
+         forward and routing stayed BASELINE. The contract line above names the fields it saw."
+    elif [[ "${ACT_ROUTE_BACKEND}" == anchor_union_fused_native ]] \
+         && ! grep -q '\[ACTIVATION-ROUTING\].*fused=True' "${SERVE_LOG}" 2>/dev/null; then
+      echo "[actrt]  WARNING: eligible but fused=False everywhere — supports_fused_route() rejected the
+         row count (not in fused_rows) or the dspark contract, so every layer took the slower
+         reference backend. Routing is correct; the throughput number is not the fused one."
+    fi
+  fi
+  return 0
+}
+
 # Called from the happy path AND the traps, so an interrupted run still surfaces
 # its artefacts. Idempotent.
 report_stats() {
   (( STATS_REPORTED )) && return 0
   STATS_REPORTED=1
+  report_features          # both upstream features only log once decode has run
   [[ "${DECODE_STATS}" == "1" ]] || return 0
   echo "────────────────────────────────────────────────────────────"
   local pat _n _f
@@ -662,11 +833,32 @@ if [[ "${OFFLOAD}" == "1" ]]; then
     [[ -n "${EXPERT_SUBSTITUTION_THRESHOLD}" ]] && \
       p+=",\"expert_substitution_threshold\":${EXPERT_SUBSTITUTION_THRESHOLD}"
   fi
+  # Pruning: the threshold is the whole feature — with the engine default of
+  # [0,...] the enable flag alone prunes nothing (guarded above).
+  if [[ "${EXPERTS_PRUNING}" == "1" ]]; then
+    p+=",\"experts_pruning_enabled\":true"
+    [[ -n "${EXPERTS_PRUNING_THRESHOLD}" ]] && \
+      p+=",\"experts_pruning_threshold\":${EXPERTS_PRUNING_THRESHOLD}"
+    [[ "${EXPERTS_PRUNING_DEBUG}" == "1" ]] && p+=",\"experts_pruning_debug\":true"
+  fi
   [[ "${ENABLE_MULTI_CARD}" == "1" ]] && p+=",\"enable_multi_card\":true"
   p+=",\"moe_offload_debug\":false"     # per-layer host-callback trace: invalid for timing
   ADDL_PARTS+=( "\"expert_offload_config\":{${p}}" )
 fi
 [[ -n "${REMOE_GATE}" ]] && ADDL_PARTS+=( "\"moe_gate_override_path\":\"${REMOE_GATE}\"" )
+# activation_routing is a SEPARATE top-level section with its own CLOSED key set
+# (ActivationRoutingConfig raises on an unknown key). Only `enabled` + `backend`
+# are emitted by default: every other field is left unwritten so the engine's
+# dspark derivation fills it, which is what the PR means by "needs no hand-tuned
+# values in the common case".
+if [[ "${ACT_ROUTE}" == "1" ]]; then
+  a="\"enabled\":true,\"backend\":\"${ACT_ROUTE_BACKEND}\""
+  [[ -n "${ACT_ROUTE_VERIFY_BLOCK}" ]]      && a+=",\"verify_block_size\":${ACT_ROUTE_VERIFY_BLOCK}"
+  [[ -n "${ACT_ROUTE_PROTECTED_ROWS}" ]]    && a+=",\"protected_rows\":${ACT_ROUTE_PROTECTED_ROWS}"
+  [[ -n "${ACT_ROUTE_SUFFIX_POOL_TOP_K}" ]] && a+=",\"suffix_pool_top_k\":${ACT_ROUTE_SUFFIX_POOL_TOP_K}"
+  [[ -n "${ACT_ROUTE_FUSED_ROWS}" ]]        && a+=",\"fused_rows\":${ACT_ROUTE_FUSED_ROWS}"
+  ADDL_PARTS+=( "\"activation_routing\":{${a}}" )
+fi
 if [[ "${DECODE_STATS}" == "1" ]]; then
   ADDL_PARTS+=( "\"decode_stats_path\":\"${STATS_DIR}\"" \
                 "\"decode_stats_flush_every\":${STATS_FLUSH_EVERY}" \
@@ -700,6 +892,10 @@ SERVE=( vllm serve "${MODEL}" --host 0.0.0.0 --port "${PORT}"
         --enable-chunked-prefill --aggregate-engine-logging
         --safetensors-load-strategy prefetch --api-server-count "${API_SERVER_COUNT}" )
 [[ -n "${MAX_MODEL_LEN}" ]] && SERVE+=( --max-model-len "${MAX_MODEL_LEN}" )
+# validate_activation_routing raises on use_async_scheduling, so the flag is
+# forced rather than left to the build's default. It is a SECOND changed
+# variable in the A/B — see the note printed with the plan.
+[[ "${ACT_ROUTE}" == "1" ]] && SERVE+=( --no-async-scheduling )
 if (( GRAPH_ON )); then
   SERVE+=( --compilation-config \
     "{\"cudagraph_mode\":\"${CUDAGRAPH_MODE}\",\"cudagraph_capture_sizes\":[${CAPTURE_SIZES}]}" )
@@ -736,6 +932,12 @@ echo "  serve   : ${SERVED_NAME} on :${PORT} (card ${CARD}) dp=${DP} ep=${EP_SIZ
 echo "  spec    : ${SPEC_METHOD:-off} num_spec_tokens=${NUM_SPEC_TOKENS} decode_tokens=${DECODE_TOKENS} moe_rows=${MOE_ROWS} (x dp=${DP})"
 echo "  offload : ${OFFLOAD} experts=${NUM_DEVICE_EXPERTS} layers=${NUM_DEVICE_LAYERS} multi_card=${ENABLE_MULTI_CARD} subst=${EXPERT_SUBSTITUTION}${EXPERT_SUBSTITUTION_THRESHOLD:+/${EXPERT_SUBSTITUTION_THRESHOLD}}"
 echo "  prefetch: ${PREFETCH} num=${EXPERT_PREFETCH_NUM} tokens=${EXPERT_PREFETCH_TOKENS} predictor=${EXPERT_PREDICTOR} wait_timing=${EXPERT_PREFETCH_WAIT_TIMING}"
+echo "  prune   : ${EXPERTS_PRUNING} thr=${EXPERTS_PRUNING_THRESHOLD:-engine default [0,..] = prunes nothing} debug=${EXPERTS_PRUNING_DEBUG}"
+if [[ "${ACT_ROUTE}" == "1" ]]; then
+  echo "  actroute: 1 backend=${ACT_ROUTE_BACKEND} verify_block=${ACT_ROUTE_VERIFY_BLOCK:-derived(${VERIFY_BLOCK})} protected=${ACT_ROUTE_PROTECTED_ROWS:-default(3)} suffix_pool=${ACT_ROUTE_SUFFIX_POOL_TOP_K:-default(2)} fused_rows=${ACT_ROUTE_FUSED_ROWS:-derived([${VERIFY_BLOCK},512])}"
+else
+  echo "  actroute: 0 (baseline routing — every verify-block row keeps its own top-k)"
+fi
 [[ "${EXPERT_PREDICTOR}" != fate ]] && echo "            ckpt=${EXPERT_PREDICTOR_CKPT}"
 echo "  gate    : ${REMOE_GATE:-off (base router)}"
 echo "  client  : run=${RUN} mode=${MODE} tasks=${TASK_LIST} perf_prompts=${PERF_PROMPTS} avg_n=${AVG_N:-preset}"
@@ -765,6 +967,29 @@ fi
             for reasons unrelated to its cost. Only meaningful under graph capture."; }
 [[ "${EXPERT_SUBSTITUTION}" == "1" ]] && \
   echo "  note    : substitution ON — it CHANGES ROUTING. Not comparable to a run without it."
+[[ "${EXPERTS_PRUNING}" == "1" ]] && {
+  echo "  note    : pruning ON — it CHANGES ROUTING and DESTROYS mixture weight (a pruned route's
+            weight becomes 0 with no renormalisation). It also changes what the decode statistics
+            MEAN, not just their value: |G| becomes post-prune, so hit_pre/hit_post rise because
+            pruning deletes misses and only misses."
+  [[ "${EXPERTS_PRUNING_DEBUG}" == "1" ]] && \
+    echo "  warn    : EXPERTS_PRUNING_DEBUG=1 logs one JSON record per MoE layer per decode step from
+            inside the paging host callback — serve.log grows fast and TPOT here is NOT a baseline."; }
+[[ "${ACT_ROUTE}" == "1" ]] && {
+  echo "  note    : activation routing ON — suffix rows of each verify block are masked to the block's
+            expert pool, so it CHANGES ROUTING. It also moves the expert predictor's target: the head
+            was trained against the unconstrained top-k, so pf_waste rises and pred_prec falls without
+            the head changing."
+  echo "  note    : --no-async-scheduling is FORCED by this feature, so it is a SECOND changed variable.
+            If async scheduling is on by default in this build, take the ACT_ROUTE=0 baseline with
+            --no-async-scheduling too, or the comparison carries both changes."
+  [[ "${ACT_ROUTE_BACKEND}" == anchor_union_reference ]] && \
+    echo "  warn    : anchor_union_reference is the DEBUG backend — byte-identical routing, much slower.
+            Accuracy parity only, never a throughput number."; }
+[[ "${EXPERTS_PRUNING}" == "1" && "${ACT_ROUTE}" == "1" ]] && \
+  echo "  note    : both upstream features ON — their effects are SUB-ADDITIVE (activation routing
+            shrinks the activated set, which leaves pruning fewer non-resident routes to drop). Take
+            the three single-feature runs before reading the combination."
 
 if [[ "${OFFLOAD}" == "1" ]]; then
   echo "  thresh  : offload_threshold=${THR} MoE rows (${NDE_MIN}/${TOPK}); floor = moe_rows*topk = ${NDE_FLOOR}"
@@ -801,6 +1026,32 @@ if [[ "${OFFLOAD}" == "1" ]]; then
   fi
 fi
 
+# supports_fused_route() takes the fused kernel ONLY when the forward's row count
+# is literally in fused_rows; any other size silently takes the reference
+# backend. The derived list is [verify_block, 512], and a steady-state uniform
+# decode always pads to verify_block, so the smaller captures are the ones to
+# know about.
+if [[ "${ACT_ROUTE}" == "1" && "${ACT_ROUTE_BACKEND}" == anchor_union_fused_native ]]; then
+  _fr="${ACT_ROUTE_FUSED_ROWS:-[${VERIFY_BLOCK},512]}"
+  echo "  fused   : fused_rows=${_fr}; the fused kernel runs only at those exact row counts"
+  if (( GRAPH_ON )); then
+    _nofuse=""
+    for _s in ${CAPTURE_SIZES//,/ }; do
+      [[ ",$(tr -d '[] ' <<<"${_fr}")," == *",${_s},"* ]] || _nofuse+="${_s} "
+    done
+    [[ -n "${_nofuse}" ]] && echo "  warn    : capture size(s) ${_nofuse%% } are not in fused_rows — those
+            replays take the slower reference backend. Harmless when decode always pads to
+            ${VERIFY_BLOCK}; widen ACT_ROUTE_FUSED_ROWS if a smaller size is actually replayed."
+  fi
+  # the fused path's dspark contract, which route() falls back from silently.
+  _nre="$(cfg n_routed_experts)"; _sf="$(cfg scoring_func)"
+  [[ "${_nre}" == 256 && "${TOPK}" == 6 && "${_sf}" == sqrtsoftplus ]] \
+    || echo "  warn    : cannot confirm the fused dspark contract (wants n_routed_experts=256 top_k=6
+            scoring_func=sqrtsoftplus; config.json reads ${_nre:-?}/${TOPK}/${_sf:-?}).
+            supports_fused_route() would return False and every layer takes the reference backend —
+            the post-run [ACTIVATION-ROUTING] line settles it with fused=True/False."
+fi
+
 for t in ${TASK_LIST}; do
   preset "${t}"
   echo "     - ${t}  ${P_DS}  temp=${P_TEMP} max_out=${P_MAXOUT}${P_CLAMP} acc_prompts=${P_ACC} perf_prompts=$(( P_PERF * P_PARTS )) avg@n=${P_AVGN}  published(non-think): ${P_REF}"
@@ -810,6 +1061,9 @@ echo "  hf_home : ${HF_HOME}  (lcb builds its dataset cache here, not in ${DATAS
 echo "  repro   : $(for v in CARD PORT DP MTP NUM_SPEC_TOKENS OFFLOAD NUM_DEVICE_EXPERTS NUM_DEVICE_LAYERS \
       ENABLE_MULTI_CARD PREFETCH EXPERT_PREFETCH_NUM EXPERT_PREFETCH_TOKENS EXPERT_PREFETCH_WAIT_TIMING \
       EXPERT_PREDICTOR EXPERT_PREDICTOR_CKPT EXPERT_SUBSTITUTION EXPERT_SUBSTITUTION_THRESHOLD REMOE_GATE \
+      EXPERTS_PRUNING EXPERTS_PRUNING_THRESHOLD EXPERTS_PRUNING_DEBUG \
+      ACT_ROUTE ACT_ROUTE_BACKEND ACT_ROUTE_VERIFY_BLOCK ACT_ROUTE_PROTECTED_ROWS \
+      ACT_ROUTE_SUFFIX_POOL_TOP_K ACT_ROUTE_FUSED_ROWS \
       ENFORCE_EAGER MAX_MODEL_LEN MAX_OUTPUT_LEN DECODE_STATS CSV TASKS RUN THINK THINK_EFFORT NUM_PROMPTS PERF_PROMPTS AVG_N MODEL
    do printf '%s=%q ' "${v}" "${!v-}"; done)$0"
 echo "────────────────────────────────────────────────────────────"
@@ -1007,6 +1261,15 @@ if [[ "${SKIP_SERVE}" != "1" ]]; then
     { grep -q '\[PREFETCH-WAIT\] timing enabled' "${SERVE_LOG}" \
       || guard "no '[PREFETCH-WAIT] timing enabled' in the log — the key was not applied and this run
        measures no stall."; }
+  # validate_activation_routing logs this from __init__ and raises on any
+  # contract violation, so its ABSENCE on a healthy server means the section was
+  # never resolved: missing, enabled=false, or a non-dspark drafter.
+  if [[ "${ACT_ROUTE}" == "1" ]]; then
+    grep -o 'Activation routing enabled:.*$' "${SERVE_LOG}" | sort -u | sed 's/^/  actroute: /'
+    grep -q 'Activation routing enabled:' "${SERVE_LOG}" \
+      || guard "no 'Activation routing enabled:' in the log — resolve_activation_routing_config
+       returned None, so every routing hook stayed inert and this run is BASELINE routing."
+  fi
   if grep -q '\[DECODE-STATS\] config:' "${SERVE_LOG}"; then
     grep -o '\[DECODE-STATS\] \(config\|topology\|armed\|decode\):.*$' "${SERVE_LOG}" | sort -u | sed 's/^/  stats   : /'
     grep -q '\[DECODE-STATS\] armed' "${SERVE_LOG}" || \
@@ -1147,6 +1410,45 @@ exit "${rc}"
 #  A REMOE GATE ON THE WRONG BASIS DOES NOT CRASH: QuaRot's R1 is absorbed into
 #  mlp.gate, so same shapes, same norms, every check passes — the model just stops
 #  emitting EOS and every prompt runs to max_out_len.
+#
+#  EXPERT PRUNING IS ALL IN THE THRESHOLD. experts_pruning_enabled on its own does
+#  nothing: the engine default experts_pruning_threshold is [0,...] and weak_mask is
+#  `weight < row_sum * thr[rank]`, never true at 0 — so the flag alone gives a run
+#  byte-identical to pruning off, with a healthy log and a plausible summary. The
+#  list is RANK-INDEXED over top_k and its length must EQUAL top_k, or
+#  dynamic_pruning_unsorted raises on the first decode forward, i.e. after the model
+#  load and the health check. thr[0]=0 is what keeps the strongest expert unprunable.
+#  Pruning also only prunes a route that is weak AND non-resident, and a prefetched
+#  expert is already resident when it runs — so it removes only demand prefetch
+#  MISSED, which is why hit_pre/hit_post/pred_acc all rise under it and are not
+#  comparable with a non-pruning run. It is single-card only: multi-card never calls
+#  it. And prune_mask has no per-source atomicity, so a position pruned in one MoE
+#  row whose expert survives in another still pays its H2D — EXPERTS_PRUNING_DEBUG=1
+#  prints pruned_routes and saved_h2d_count, and their ratio is how much of the
+#  pruning actually bought a transfer.
+#
+#  ACTIVATION ROUTING HAS THREE SILENT FALLBACKS, ALL OF THEM "HEALTHY". (1) The
+#  section is a CLOSED key set and needs BOTH enabled:true and a non-baseline
+#  backend; miss either and resolve_activation_routing_config returns None and every
+#  hook is inert. (2) try_activation_route's eligibility gate is long (roles present,
+#  row count match, num_experts/top_k/scoring_func match, renormalize, no tid2eid,
+#  no mix_placement, topk_group and num_expert_group in (None,1)) and failing ANY
+#  field just returns None — baseline routing, no error. (3) supports_fused_route
+#  needs the row count LITERALLY in fused_rows plus the full dspark contract (fp32
+#  [N,256], top_k 6, sqrtsoftplus, scale 1.5, bias present); miss it and the slower
+#  reference backend runs instead, with identical output. The one line that settles
+#  all three is [ACTIVATION-ROUTING] ... eligible=<bool> fused=<bool>, which this
+#  script prints after the run. Leave verify_block_size / fused_rows /
+#  expected_router_layers EMPTY: writing a field lands it in user_keys and SUPPRESSES
+#  the engine's derivation for it, even when the value equals the default. It also
+#  forces --no-async-scheduling, so an ACT_ROUTE A/B changes TWO variables unless the
+#  baseline carries that flag too.
+#
+#  PADDED ROWS ARE STILL FULLY ROUTED under activation routing: prepare() sizes the
+#  roles buffer to num_tokens_padded and writes roles only inside the scheduled
+#  verify segments, so padding keeps role 0 — which keeps it out of the candidate
+#  pool but does NOT mask it, and the single-card paging path has no pad filter. As
+#  activation routing bites, padding's share of |G| and of `loads` grows.
 #
 #  ALSO SILENT: multi-card records no per-layer cache statistics; draft MoE layers
 #  are excluded from offload by a layer-NAME test; ais_bench exits 0 when the engine
