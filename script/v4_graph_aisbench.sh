@@ -120,8 +120,8 @@ CACHE_ROUTER_WEIGHT="${CACHE_ROUTER_WEIGHT:-}"
 CACHE_AGE_WEIGHT="${CACHE_AGE_WEIGHT:-}"
 
 # ── decode statistics (TOP-LEVEL additional_config keys) ─────────────────────
-DECODE_STATS="${DECODE_STATS:-1}"
-CSV="${CSV:-1}"
+DECODE_STATS="${DECODE_STATS:-0}"
+CSV="${CSV:-0}"
 CSV_PATH="${CSV_PATH:-}"                 # empty = OUT_DIR/stats
 STATS_FLUSH_EVERY="${STATS_FLUSH_EVERY:-100}"
 STATS_FLUSH_SECONDS="${STATS_FLUSH_SECONDS:-30}"

@@ -612,6 +612,12 @@ class ExpertPredictorDriver:
             # finds nothing to wait on and pages on demand.
             self._pending.pop(target_idx, None)
             mgr._note_cb_failure("expert predictor launch")
+            return  # nothing staged; skip the early dispatch below.
+        # (mode2_har only): dispatch the planning callback HERE, behind the
+        # head on the prefetch stream, instead of at the top of update_weights(target)
+        if (self.layer_delta == 0 and _EXTRA_CTX.capturing
+                and not mgr.enable_multi_card):
+            self.finish(target_idx)
 
     def finish(self, target_idx: int, ready_event=None) -> None:
         """Consume the predict and enter the shared prefetch execution path.

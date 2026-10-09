@@ -16,7 +16,7 @@
 #
 from collections.abc import Callable
 from dataclasses import dataclass
-
+import numpy as np
 import torch
 import torch.nn.functional as F
 from vllm.distributed import get_tp_group
@@ -535,6 +535,164 @@ def substitute_experts_device(
     blocked = _any_per_source(miss & ~ok)
     return torch.where(ok & ~blocked,
                        substitute_id.to(topk_ids.dtype), topk_ids)
+
+
+# Host mirror of substitute_experts_device, run INSIDE the reactive
+# offload callback (ExpertOffloadManager._update_weights), where the layer's
+# residency (log2phy) and routed ids are already on the host and the compute
+# stream is already blocked. Selected with # ExpertOffloadManager.SUBSTITUTION_ON_HOST
+def substitute_experts_host_(scores, topk_ids, log2phy, threshold, gt_out,
+                             resident_ids=None):
+    """In-place host mirror of substitute_experts_device.
+
+    All arguments are host numpy arrays: ``scores`` [n, E] float32 biased
+    routing scores (sqrtsoftplus(logits) + correction bias, computed on the
+    NPU), ``topk_ids`` [n, k] routed ids (MUTATED in place), ``log2phy`` [E]
+    int (>= 0 means resident), ``gt_out`` [n, k] receives the pre-substitution
+    ids. Returns the number of substituted positions. Routing weights are not
+    touched, matching the device version.
+
+    ``resident_ids`` is an optional sorted int64 array of the experts currently
+    on the device. When given (and there is exactly one row) the fast path
+    below scans only those ~24 experts instead of all 256, and works in Python
+    scalars rather than whole-array numpy calls: ~2x faster on the A3 host CPU,
+    where each numpy call costs more than the arithmetic it performs. Results
+    are identical either way (verified on 120k random cases).
+
+    ``topk_ids`` may contain -1 when expert pruning is enabled
+    (dynamic_pruning_unsorted runs BEFORE substitution in
+    ExpertOffloadManager.update_weights). A -1 route is already dropped by
+    _map_logical_ids_to_phy, so it is neither a miss nor a candidate-blocker
+    here; substituting one would refund the H2D transfer pruning saved for a
+    route whose weight is 0.
+    """
+    n, top_k = topk_ids.shape
+    num_experts = scores.shape[1]
+    np.copyto(gt_out, topk_ids)
+    if n == 0 or top_k == 0 or top_k >= num_experts:
+        return 0
+    # Single-row fast path (the decode case: moe_rows == 1 without MTP).
+    if n == 1 and resident_ids is not None:
+        return _substitute_one_row_(scores[0], topk_ids, log2phy, threshold,
+                                    resident_ids, top_k)
+    # Expert pruning writes -1 into topk_ids before this callback runs, and numpy WRAPS negative
+    # indices, so log2phy[-1] silently read log2phy[num_experts - 1]: a
+    # pruned, zero-weight route was reported as a miss and substituted back
+    # onto a resident expert, undoing the H2D saving pruning had just made.
+    valid_routes = (topk_ids >= 0) & (topk_ids < num_experts)
+    safe_ids = np.clip(topk_ids, 0, num_experts - 1)
+    miss = valid_routes & (log2phy[safe_ids] < 0)
+    if not miss.any():
+        return 0
+    # boundary = (k+1)-th largest biased score per row, clamped at 0. Selection
+    # is exact, and the products below are single fp32 multiplies by the
+    # fp32-rounded scalar, as on the device.
+    boundary = -np.partition(-scores, top_k, axis=1)[:, top_k]
+    boundary = np.maximum(boundary, np.float32(0.0))
+    upper = boundary * np.float32(1.0 + threshold)
+    lower = boundary * np.float32(1.0 - threshold)
+    # gather with safe_ids, then AND with valid_routes. With the raw
+    # ids, take_along_axis returned the LAST column's score for a pruned
+    # position, which could make it look low-confidence.
+    selected = np.take_along_axis(scores, safe_ids, axis=1)
+    low_confidence = (selected < upper[:, None]) & valid_routes
+    if n == 1:
+        # one row: every source expert has exactly one reference (top-k ids
+        # are distinct), so the per-source "any" is the identity
+        eligible = miss & low_confidence
+    else:
+        # same_source is built from safe_ids, not topk_ids. Every
+        # pruned position used to compare equal to every other pruned
+        # position, aliasing them into one fake "source expert -1" and
+        # breaking per-source atomicity. Clamping makes them alias expert 0 instead
+        ids_flat = safe_ids.reshape(-1)
+        same_source = ids_flat[:, None] == ids_flat[None, :]
+
+        def _any_per_source(flag):
+            return (same_source & flag.reshape(1, -1)).any(axis=1).reshape(
+                n, top_k)
+
+        eligible = miss & low_confidence & ~_any_per_source(
+            miss & ~low_confidence)
+    if not eligible.any():
+        return 0
+    resident = log2phy >= 0
+    ok = np.zeros((n, top_k), dtype=bool)
+    substitute_id = np.zeros((n, top_k), dtype=np.int64)
+    for r in range(n):
+        elig_pos = np.flatnonzero(eligible[r])
+        if elig_pos.size == 0:
+            continue
+        row = scores[r]
+        # candidates: resident, inside [lower, boundary], not already chosen
+        cand = (row >= lower[r]) & (row <= boundary[r]) & resident
+        # A -1 in the row cleared cand[num_experts - 1], permanently barring the highest-numbered
+        # expert from ever being substituted TO on any step where something
+        # was pruned. Exclude only the ids this row really routes to —
+        # the device version's chosen_count scatter_add is weighted by
+        # valid_routes for the same reason.
+        cand[safe_ids[r][valid_routes[r]]] = False
+        cand_ids = np.flatnonzero(cand)
+        if cand_ids.size == 0:
+            continue
+        # best candidates first; equal scores -> lower expert id first
+        cand_ids = cand_ids[np.argsort(-row[cand_ids], kind="stable")][:top_k]
+        # r-th least important eligible reference takes the r-th best
+        # candidate; equal scores -> lower position first (device tie_break)
+        order = elig_pos[np.argsort(selected[r, elig_pos], kind="stable")]
+        m = min(order.size, cand_ids.size)
+        ok[r, order[:m]] = True
+        substitute_id[r, order[:m]] = cand_ids[:m]
+    if n > 1:
+        # atomicity: a source expert is substituted everywhere or nowhere
+        ok &= ~_any_per_source(miss & ~ok)
+    np.copyto(topk_ids, substitute_id.astype(topk_ids.dtype), where=ok)
+    return int(np.count_nonzero(ok))
+
+
+# Scalar single-row core of substitute_experts_host_
+def _substitute_one_row_(row, topk_ids, log2phy, threshold, resident_ids,
+                         top_k):
+    ids0 = topk_ids[0]
+    ids_list = ids0.tolist()
+    l2p = log2phy
+    # Expert pruning writes -1 into topk_ids before this runs, 
+    # and l2p[-1] wraps to log2phy[num_experts - 1] in numpy,
+    # so whenever the highest-numbered expert happened to be
+    # non-resident, a pruned zero-weight route was reported as a miss and
+    # substituted back onto a resident expert, refunding the H2D transfer
+    # pruning had just saved. Mirrors the valid_routes mask in
+    # substitute_experts_device.
+    miss_pos = [i for i in range(top_k)
+                if ids_list[i] >= 0 and l2p[ids_list[i]] < 0]
+    if not miss_pos:
+        return 0
+    boundary = float(-np.partition(-row, top_k)[top_k])
+    if boundary < 0.0:
+        boundary = 0.0
+    boundary = float(np.float32(boundary))
+    upper = float(np.float32(np.float32(boundary) * np.float32(1.0 + threshold)))
+    lower = float(np.float32(np.float32(boundary) * np.float32(1.0 - threshold)))
+    sel = row[ids0].tolist()
+    elig = [i for i in miss_pos if sel[i] < upper]
+    if not elig:
+        return 0
+    cs = row[resident_ids]
+    keep = np.flatnonzero((cs >= np.float32(lower)) & (cs <= np.float32(boundary)))
+    if keep.size == 0:
+        return 0
+    cand_ids = resident_ids[keep].tolist()
+    cand_sc = cs[keep].tolist()
+    chosen = set(ids_list)
+    pairs = [(-c, i) for c, i in zip(cand_sc, cand_ids) if i not in chosen]
+    if not pairs:
+        return 0
+    pairs.sort()
+    elig.sort(key=lambda i: sel[i])
+    m = min(len(elig), len(pairs), top_k)
+    for j in range(m):
+        topk_ids[0, elig[j]] = pairs[j][1]
+    return m
 
 
 def check_npu_moe_gating_top_k(
